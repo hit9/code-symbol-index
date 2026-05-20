@@ -27,7 +27,19 @@ type-aware rename safety or full semantic call graph accuracy.
 
 ## Install
 
-For local development:
+Install the CLI as a uv tool:
+
+```bash
+uv tool install code-symbol-index
+```
+
+Or install from a local checkout:
+
+```bash
+uv tool install .
+```
+
+For local development with editable imports and tests:
 
 ```bash
 uv venv .venv
