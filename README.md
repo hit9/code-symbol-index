@@ -71,6 +71,7 @@ Search symbols:
 
 ```bash
 code-symbol-index search Tool --root /path/to/repo --limit 20
+code-symbol-index search Tool Agent Runner --root /path/to/repo
 ```
 
 Inspect one symbol:
@@ -94,6 +95,7 @@ code-symbol-index index --root /path/to/repo
 code-symbol-index status --root /path/to/repo
 code-symbol-index status --root /path/to/repo --check
 code-symbol-index search Tool --root /path/to/repo
+code-symbol-index search Tool Agent Runner --root /path/to/repo
 code-symbol-index inspect Tool --root /path/to/repo
 code-symbol-index outline src/app.py --root /path/to/repo
 code-symbol-index refs Tool --root /path/to/repo --limit 20 --offset 0
@@ -131,6 +133,25 @@ symbols:
     language: python
 ```
 
+For multiple search queries:
+
+```text
+queries:
+  - Tool
+  - Agent
+count: 2
+
+symbols:
+  - id: python:class:Tool:nanocode.py:1284:1330
+    name: Tool
+    kind: class
+    file: nanocode.py
+    range: 1284:1330
+    signature: class Tool:
+    score: exact
+    matched_query: Tool
+```
+
 Inspect returns bounded source with stable 0-based line ranges:
 
 ```text
@@ -160,10 +181,10 @@ range: 0:9060
 count: 142
 
 outline:
-  class Tool 1284:1330 class Tool:
-    function cli_args 1289:1292 def cli_args(cls, args):
-    function tool_schema 1312:1325 def tool_schema(cls):
-  function main 9023:9060 def main(argv=None):
+1284:1330 | class Tool:
+1289:1292 |     def cli_args(cls, args):
+1312:1325 |     def tool_schema(cls):
+9023:9060 | def main(argv=None):
 ```
 
 Status is fast by default and does not scan the directory:
@@ -213,13 +234,17 @@ All line ranges are `start:end`, 0-based, with `end` exclusive.
 import code_symbol_index as csi
 
 csi.index("/path/to/repo")
+csi.update(["src/app.py", "src/lib.py"], root="/path/to/repo")
 
 print(csi.status_text("/path/to/repo"))
 print(csi.search_text("Tool", root="/path/to/repo"))
 print(csi.inspect_text("Tool", root="/path/to/repo"))
 print(csi.outline_text("src/app.py", root="/path/to/repo"))
 
-symbols = csi.search("Tool", root="/path/to/repo")
+symbols = csi.search("Tool", root="/path/to/repo", format="object")
+symbols = csi.search(["Tool", "Agent", "Runner"], root="/path/to/repo")
+search_payload = csi.search("Tool", root="/path/to/repo", format="json")
+search_text = csi.search("Tool", root="/path/to/repo", format="text")
 inspection = csi.inspect("Tool", root="/path/to/repo")
 references = csi.refs("Tool", root="/path/to/repo", limit=20, offset=0)
 ```
@@ -228,6 +253,7 @@ For repeated queries, reuse a repository handle:
 
 ```python
 repo = csi.Repository("/path/to/repo")
+repo.update(["src/app.py"])
 print(repo.search_text("Tool"))
 print(repo.inspect_text("Tool"))
 print(repo.outline_text("src/app.py"))
@@ -235,7 +261,19 @@ print(repo.outline_text("src/app.py"))
 
 Queries require an existing index. Run `code-symbol-index index` or
 `code_symbol_index.index()` first. Queries do not sync automatically unless
-called with `--sync` or `sync=True`.
+called with `--sync` or `sync=True`. After external file edits, call
+`code_symbol_index.update(paths, root=...)` or `Repository.update(paths)` to
+refresh only those files; deleted or newly ignored paths are removed from the
+index.
+
+Top-level query APIs accept `format="object" | "text" | "json"`:
+
+- `object` returns Python dataclasses/lists and is the default.
+- `text` returns the same readable format as the `*_text` helpers.
+- `json` returns JSON-safe Python dict/list data.
+
+`search` accepts one query or a list of symbol names/prefixes. Multiple queries
+are OR-ed, are not regexes, and share one total `limit`.
 
 ## Development
 
@@ -245,3 +283,44 @@ make check
 make smoke
 make clean
 ```
+
+## Python API List
+
+Index lifecycle:
+
+- `index(root=".", *, language=None) -> Repository`
+- `update(paths, *, root=".", language=None) -> Repository`
+- `clean(root=".") -> None`
+- `status(root=".", *, language=None, db_path=None, check=False, format="object") -> IndexStatus | str | dict`
+- `status_text(root=".", *, language=None, db_path=None, check=False) -> str`
+
+Queries:
+
+- `search(query: str | list[str], *, root=".", kind=None, language=None, limit=20, sync=False, format="object") -> list[Symbol] | str | list[dict]`
+- `search_text(query: str | list[str], *, root=".", kind=None, language=None, limit=20, sync=False) -> str`
+- `inspect(query, *, root=".", kind=None, language=None, limit=20, sync=False, format="object", ...) -> Inspection | str | dict`
+- `inspect_text(query, *, root=".", kind=None, language=None, sync=False, ...) -> str`
+- `refs(query, *, root=".", kind=None, language=None, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
+- `impls(query, *, root=".", kind=None, language=None, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
+- `outline(path, *, root=".", max_symbols=200, sync=False, format="object") -> Page | str | dict`
+- `outline_text(path, *, root=".", max_symbols=200, sync=False) -> str`
+
+Repository handle:
+
+- `Repository(root=".", *, languages=None, include=None, exclude=None, db_path=None)`
+- `Repository.refresh() -> Repository`
+- `Repository.update(paths=None) -> Repository`
+- `Repository.search(...)`, `search_text(...)`
+- `Repository.inspect(...)`, `inspect_text(...)`
+- `Repository.refs(...)`, `impls(...)`
+- `Repository.outline(...)`, `outline_text(...)`
+- `Repository.clean() -> None`
+
+Data classes:
+
+- `Symbol`
+- `Reference`
+- `Page`
+- `Inspection`
+- `InspectOptions`
+- `IndexStatus`

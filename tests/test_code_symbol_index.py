@@ -122,6 +122,34 @@ def test_repository_uses_disk_index_and_refreshes_changed_files(tmp_path: Path) 
     assert repo.search("second_name")
 
 
+def test_top_level_update_refreshes_only_given_paths(tmp_path: Path) -> None:
+    changed = tmp_path / "changed.py"
+    unchanged = tmp_path / "unchanged.py"
+    changed.write_text("def old_name():\n    pass\n", encoding="utf-8")
+    unchanged.write_text("def stable_name():\n    pass\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    changed.write_text("def new_name():\n    pass\n", encoding="utf-8")
+    unchanged.write_text("def stale_on_disk():\n    pass\n", encoding="utf-8")
+    code_symbol_index.update([changed], root=tmp_path)
+
+    assert not code_symbol_index.search("old_name", root=tmp_path)
+    assert code_symbol_index.search("new_name", root=tmp_path)
+    assert code_symbol_index.search("stable_name", root=tmp_path)
+    assert not code_symbol_index.search("stale_on_disk", root=tmp_path)
+
+
+def test_top_level_update_removes_deleted_paths(tmp_path: Path) -> None:
+    source = tmp_path / "gone.py"
+    source.write_text("def removed_name():\n    pass\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    source.unlink()
+    code_symbol_index.update(source, root=tmp_path)
+
+    assert not code_symbol_index.search("removed_name", root=tmp_path)
+
+
 def test_repository_skips_unchanged_files(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "app.py").write_text("def unchanged_name():\n    pass\n", encoding="utf-8")
     repo = Repository(tmp_path, create_index=True).refresh()
@@ -344,6 +372,31 @@ def test_top_level_api_search_limit_defaults_to_twenty(tmp_path: Path) -> None:
     assert len(code_symbol_index.search("target", root=tmp_path, limit=3)) == 3
 
 
+def test_top_level_api_search_accepts_multiple_queries(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        "class Tool:\n"
+        "    pass\n"
+        "\n"
+        "class Agent:\n"
+        "    pass\n"
+        "\n"
+        "class ToolRunner:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+
+    symbols = code_symbol_index.search(["Agent", "Tool"], root=tmp_path)
+    output = code_symbol_index.search_text(["Agent", "Tool"], root=tmp_path)
+
+    assert [symbol.name for symbol in symbols[:2]] == ["Agent", "Tool"]
+    assert "queries:\n" in output
+    assert "  - Agent" in output
+    assert "  - Tool" in output
+    assert "matched_query: Agent" in output
+    assert "matched_query: Tool" in output
+
+
 def test_top_level_api_search_text_is_llm_friendly(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("def target_tool():\n    pass\n", encoding="utf-8")
     code_symbol_index.index(tmp_path)
@@ -357,6 +410,37 @@ def test_top_level_api_search_text_is_llm_friendly(tmp_path: Path) -> None:
     assert "range: 0:2" in output
     assert "score: prefix" in output
     assert "source:" not in output
+
+
+def test_top_level_api_format_parameter(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("def target_tool():\n    return 1\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    search_text = code_symbol_index.search("target", root=tmp_path, format="text")
+    search_json = code_symbol_index.search("target", root=tmp_path, format="json")
+    inspect_text = code_symbol_index.inspect("target_tool", root=tmp_path, format="text")
+    outline_json = code_symbol_index.outline("app.py", root=tmp_path, format="json")
+    status_text = code_symbol_index.status(tmp_path, format="text")
+    status_json = code_symbol_index.status(tmp_path, format="json")
+
+    assert isinstance(code_symbol_index.search("target", root=tmp_path), list)
+    assert "query: target" in search_text
+    assert search_json[0]["name"] == "target_tool"
+    assert search_json[0]["path"] == "app.py"
+    assert search_json[0]["range"]["start"]["line"] == 0
+    assert "source:" in inspect_text
+    assert outline_json["items"][0]["name"] == "target_tool"
+    assert "index:\n" in status_text
+    assert status_json["status"] == "ready"
+
+
+def test_top_level_api_rejects_unknown_format(tmp_path: Path) -> None:
+    try:
+        code_symbol_index.search("target", root=tmp_path, format="yaml")
+    except ValueError as exc:
+        assert "format must be one of" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
 
 
 def test_outline_text_returns_file_structure_without_source_or_ids(tmp_path: Path) -> None:
@@ -380,11 +464,40 @@ def main(argv=None):
     assert "range: 0:6" in output
     assert "count: 3" in output
     assert "outline:" in output
-    assert "  class Tool 0:3 class Tool:" in output
-    assert "    function cli_args 1:3 def cli_args(cls, args):" in output
-    assert "  function main 4:6 def main(argv=None):" in output
+    assert "0:3 | class Tool:" in output
+    assert "1:3 |     def cli_args(cls, args):" in output
+    assert "4:6 | def main(argv=None):" in output
     assert "id:" not in output
     assert "source:" not in output
+
+
+def test_outline_text_uses_indexed_signatures_when_file_changes(tmp_path: Path) -> None:
+    source = tmp_path / "app.py"
+    source.write_text(
+        "def first():\n"
+        "    return 1\n"
+        "\n"
+        "def second():\n"
+        "    return 2\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+    source.write_text(
+        "# changed after indexing\n"
+        "# this line should not be used as a signature\n"
+        "def first():\n"
+        "    return 1\n"
+        "\n"
+        "def second():\n"
+        "    return 2\n",
+        encoding="utf-8",
+    )
+
+    output = code_symbol_index.outline_text("app.py", root=tmp_path)
+
+    assert "| def first():" in output
+    assert "| def second():" in output
+    assert "changed after indexing" not in output
 
 
 def test_inspect_text_outputs_llm_friendly_source(tmp_path: Path) -> None:
@@ -451,6 +564,31 @@ def test_cli_search_outputs_text_by_default_and_json_with_flag(tmp_path: Path, c
     assert output[0]["column"] == 5
     assert raw_json.startswith("[\n")
     assert '"range"' not in raw_json
+
+
+def test_cli_search_accepts_multiple_queries(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(
+        "class Tool:\n"
+        "    pass\n"
+        "\n"
+        "class Agent:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["search", "Tool", "Agent", "--root", str(tmp_path), "--language", "python"])
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "queries:\n" in output
+    assert "  - Tool" in output
+    assert "  - Agent" in output
+    assert "name: Tool" in output
+    assert "name: Agent" in output
+    assert "matched_query: Tool" in output
+    assert "matched_query: Agent" in output
 
 
 def test_cli_search_limit_defaults_to_twenty_and_accepts_option(tmp_path: Path, capsys) -> None:
@@ -622,8 +760,8 @@ def main(argv=None):
     assert text_exit == 0
     assert "file: app.py" in text_output
     assert "outline:" in text_output
-    assert "  class Tool 0:3 class Tool:" in text_output
-    assert "    function cli_args 1:3 def cli_args(cls, args):" in text_output
+    assert "0:3 | class Tool:" in text_output
+    assert "1:3 |     def cli_args(cls, args):" in text_output
     assert "id:" not in text_output
     assert "source:" not in text_output
     assert json_exit == 0
@@ -796,6 +934,13 @@ def test_api_requires_existing_index(tmp_path: Path) -> None:
 
     try:
         code_symbol_index.search("missing_index_target", root=tmp_path)
+    except IndexNotFoundError:
+        pass
+    else:
+        raise AssertionError("expected IndexNotFoundError")
+
+    try:
+        code_symbol_index.update([tmp_path / "app.py"], root=tmp_path)
     except IndexNotFoundError:
         pass
     else:
