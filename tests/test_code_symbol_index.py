@@ -779,6 +779,18 @@ def test_cli_keyboard_interrupt_returns_130(monkeypatch, capsys) -> None:
     assert "interrupted" in captured.err
 
 
+def test_cli_version(capsys) -> None:
+    try:
+        main(["--version"])
+    except SystemExit as exc:
+        assert exc.code == 0
+    else:
+        raise AssertionError("expected argparse version action to exit")
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == f"code-symbol-index {code_symbol_index.__version__}"
+
+
 def test_api_requires_existing_index(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("def missing_index_target():\n    pass\n", encoding="utf-8")
 

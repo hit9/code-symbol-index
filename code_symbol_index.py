@@ -21,6 +21,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
+__version__ = "0.1.0"
 SCHEMA_VERSION = 3
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -2907,6 +2908,7 @@ def _non_negative_int(value: str) -> int:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="code-symbol-index")
+    parser.add_argument("--version", action="version", version=f"code-symbol-index {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     search = subparsers.add_parser("search", help="Search symbols in a codebase.")
@@ -3089,6 +3091,7 @@ __all__ = [
     "Symbol",
     "SymbolNotFoundError",
     "UnsupportedLanguageError",
+    "__version__",
     "best_symbol",
     "build_arg_parser",
     "clean",
