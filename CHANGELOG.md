@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4 - 2026-05-20
+
+### Added
+
+- Added stable progress callbacks for `Repository.refresh()` and `Repository.update()`.
+
 ## 0.1.3 - 2026-05-20
 
 ### Added

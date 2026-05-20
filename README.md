@@ -265,6 +265,19 @@ print(repo.inspect_text("Tool"))
 print(repo.outline_text("src/app.py"))
 ```
 
+Refresh and update accept an optional progress callback:
+
+```python
+def on_progress(event, *, done=0, total=0, path=None):
+    print(event, done, total, path)
+
+repo = csi.Repository("/path/to/repo", progress=on_progress)
+repo.refresh()
+repo.update(["src/app.py"], progress=on_progress)
+```
+
+Stable progress events are `scan`, `start`, `file`, and `finish`.
+
 Queries require an existing index. Run `code-symbol-index index` or
 `code_symbol_index.index()` first. Queries do not sync automatically unless
 called with `--sync` or `sync=True`. After external file edits, call
@@ -295,8 +308,8 @@ make clean
 
 Index lifecycle:
 
-- `index(root=".", *, language=None) -> Repository`
-- `update(paths, *, root=".", language=None) -> Repository`
+- `index(root=".", *, language=None, progress=None) -> Repository`
+- `update(paths, *, root=".", language=None, progress=None) -> Repository`
 - `clean(root=".") -> None`
 - `status(root=".", *, language=None, db_path=None, check=False, format="object") -> IndexStatus | str | dict`
 - `status_text(root=".", *, language=None, db_path=None, check=False) -> str`
@@ -315,8 +328,8 @@ Queries:
 Repository handle:
 
 - `Repository(root=".", *, languages=None, include=None, exclude=None, db_path=None)`
-- `Repository.refresh() -> Repository`
-- `Repository.update(paths=None) -> Repository`
+- `Repository.refresh(*, progress=None) -> Repository`
+- `Repository.update(paths=None, *, progress=None) -> Repository`
 - `Repository.search(...)`, `search_text(...)`
 - `Repository.inspect(...)`, `inspect_text(...)`
 - `Repository.refs(...)`, `impls(...)`

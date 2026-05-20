@@ -150,6 +150,61 @@ def test_top_level_update_removes_deleted_paths(tmp_path: Path) -> None:
     assert not code_symbol_index.search("removed_name", root=tmp_path)
 
 
+def test_repository_refresh_progress_callback(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(code_symbol_index, "MAX_WORKERS", 1)
+    (tmp_path / "alpha.py").write_text("def alpha():\n    pass\n", encoding="utf-8")
+    (tmp_path / "beta.py").write_text("def beta():\n    pass\n", encoding="utf-8")
+    events: list[tuple[str, int, int, str | None]] = []
+
+    def record(event: str, *, done: int = 0, total: int = 0, path: str | None = None) -> None:
+        events.append((event, done, total, path))
+
+    repo = Repository(tmp_path, create_index=True, progress=record).refresh()
+
+    assert repo.search("alpha")
+    assert events[0] == ("scan", 0, 0, None)
+    assert ("start", 0, 2, None) in events
+    file_events = [item for item in events if item[0] == "file"]
+    assert [done for _, done, _, _ in file_events] == [1, 2]
+    assert {total for _, _, total, _ in file_events} == {2}
+    assert {path for _, _, _, path in file_events} == {"alpha.py", "beta.py"}
+    assert events[-1] == ("finish", 2, 2, None)
+    assert {event for event, _, _, _ in events} == {"scan", "start", "file", "finish"}
+
+
+def test_repository_update_progress_callback_can_be_per_call(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(code_symbol_index, "MAX_WORKERS", 1)
+    source = tmp_path / "app.py"
+    source.write_text("def before():\n    pass\n", encoding="utf-8")
+    repo = Repository(tmp_path, create_index=True).refresh()
+    source.write_text("def after():\n    pass\n", encoding="utf-8")
+    events: list[tuple[str, int, int, str | None]] = []
+
+    def record(event: str, *, done: int = 0, total: int = 0, path: str | None = None) -> None:
+        events.append((event, done, total, path))
+
+    repo.update([source], progress=record)
+
+    assert repo.search("after")
+    assert not repo.search("before")
+    assert events == [
+        ("start", 0, 1, None),
+        ("file", 1, 1, "app.py"),
+        ("finish", 1, 1, None),
+    ]
+
+
+def test_progress_callback_errors_do_not_break_refresh(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("def resilient():\n    pass\n", encoding="utf-8")
+
+    def broken(event: str, *, done: int = 0, total: int = 0, path: str | None = None) -> None:
+        raise RuntimeError(event)
+
+    repo = Repository(tmp_path, create_index=True, progress=broken).refresh()
+
+    assert repo.search("resilient")
+
+
 def test_repository_skips_unchanged_files(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "app.py").write_text("def unchanged_name():\n    pass\n", encoding="utf-8")
     repo = Repository(tmp_path, create_index=True).refresh()
@@ -828,7 +883,7 @@ def test_cli_progress_goes_to_stderr(tmp_path: Path, capsys) -> None:
     assert exit_code == 0
     assert json.loads(captured.out)["root"] == str(tmp_path.resolve())
     assert "indexing" in captured.err
-    assert "writing index" in captured.err
+    assert "writing index" not in captured.err
 
 
 def test_cli_index_command_refreshes_disk_index(tmp_path: Path, capsys) -> None:
@@ -842,7 +897,7 @@ def test_cli_index_command_refreshes_disk_index(tmp_path: Path, capsys) -> None:
     assert payload["root"] == str(tmp_path.resolve())
     assert (tmp_path / ".code-symbol-index" / "index.sqlite").exists()
     assert "indexing" in captured.err
-    assert "writing index" in captured.err
+    assert "writing index" not in captured.err
 
 
 def test_status_reports_missing_ready_and_stale(tmp_path: Path) -> None:

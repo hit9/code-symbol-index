@@ -21,7 +21,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 SCHEMA_VERSION = 3
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -44,6 +44,7 @@ DEFAULT_MAX_OUTLINE_SYMBOLS = 200
 MAX_INSPECT_CANDIDATES = 20
 SYMBOL_QUERY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
 API_FORMATS = ("object", "text", "json")
+_DEFAULT_PROGRESS = object()
 
 DEFAULT_EXCLUDES = (
     ".git/**",
@@ -741,12 +742,12 @@ class Repository(CodeIndex):
         )
         self.progress = progress
 
-    def refresh(self) -> Repository:
+    def refresh(self, *, progress: Any = _DEFAULT_PROGRESS) -> Repository:
+        progress_callback = self.progress if progress is _DEFAULT_PROGRESS else progress
         if self.storage.schema_version() != SCHEMA_VERSION:
             self.storage.reset_schema()
 
-        if self.progress is not None:
-            self.progress("scan", done=0, total=0)
+        _emit_progress(progress_callback, "scan", done=0, total=0)
         current_files: dict[str, tuple[Path, int, int]] = {}
         paths = list(self._iter_indexable_files())
         for path in paths:
@@ -767,41 +768,42 @@ class Repository(CodeIndex):
             to_index.append(path)
 
         total = len(to_index)
-        if self.progress is not None:
-            self.progress("start", done=0, total=total)
-        indexed_results = self._parse_files(to_index, include_references=False)
+        _emit_progress(progress_callback, "start", done=0, total=total)
+        indexed_results = self._parse_files(to_index, include_references=False, progress=progress_callback)
         self.storage.replace_files(
             deleted_paths=deleted,
             indexed_files=indexed_results,
             schema_version=SCHEMA_VERSION,
-            progress=self.progress,
         )
-        if self.progress is not None:
-            self.progress("finish", done=total, total=total)
+        _emit_progress(progress_callback, "finish", done=total, total=total)
         return self
 
-    def build(self) -> Repository:
+    def build(self, *, progress: Any = _DEFAULT_PROGRESS) -> Repository:
+        progress_callback = self.progress if progress is _DEFAULT_PROGRESS else progress
         self.storage.clear()
         paths = list(self._iter_indexable_files())
         total = len(paths)
-        if self.progress is not None:
-            self.progress("start", done=0, total=total)
-        indexed_results = self._parse_files(paths, include_references=False)
+        _emit_progress(progress_callback, "start", done=0, total=total)
+        indexed_results = self._parse_files(paths, include_references=False, progress=progress_callback)
         self.storage.replace_files(
             deleted_paths=(),
             indexed_files=indexed_results,
             schema_version=SCHEMA_VERSION,
-            progress=self.progress,
         )
-        if self.progress is not None:
-            self.progress("finish", done=total, total=total)
+        _emit_progress(progress_callback, "finish", done=total, total=total)
         return self
 
-    def update(self, paths: str | Path | Iterable[str | Path] | None = None) -> Repository:
+    def update(
+        self,
+        paths: str | Path | Iterable[str | Path] | None = None,
+        *,
+        progress: Any = _DEFAULT_PROGRESS,
+    ) -> Repository:
+        progress_callback = self.progress if progress is _DEFAULT_PROGRESS else progress
         if paths is None:
-            return self.refresh()
+            return self.refresh(progress=progress_callback)
         if self.storage.schema_version() != SCHEMA_VERSION:
-            return self.refresh()
+            return self.refresh(progress=progress_callback)
 
         relative_paths = list(dict.fromkeys(self._relative_path(path) for path in _coerce_paths(paths)))
         to_index = [
@@ -810,20 +812,23 @@ class Repository(CodeIndex):
             if (self.root / path).is_file() and self._should_index(path)
         ]
         total = len(to_index)
-        if self.progress is not None:
-            self.progress("start", done=0, total=total)
-        indexed_results = self._parse_files(to_index, include_references=False)
+        _emit_progress(progress_callback, "start", done=0, total=total)
+        indexed_results = self._parse_files(to_index, include_references=False, progress=progress_callback)
         self.storage.replace_files(
             deleted_paths=relative_paths,
             indexed_files=indexed_results,
             schema_version=SCHEMA_VERSION,
-            progress=self.progress,
         )
-        if self.progress is not None:
-            self.progress("finish", done=total, total=total)
+        _emit_progress(progress_callback, "finish", done=total, total=total)
         return self
 
-    def _parse_files(self, paths: list[Path], *, include_references: bool = True) -> list[_IndexedFile]:
+    def _parse_files(
+        self,
+        paths: list[Path],
+        *,
+        include_references: bool = True,
+        progress: Any | None = None,
+    ) -> list[_IndexedFile]:
         if not paths:
             return []
         if len(paths) == 1 or MAX_WORKERS <= 1:
@@ -832,8 +837,7 @@ class Repository(CodeIndex):
                 result = _parse_file(self.root, path, self.languages, include_references=include_references)
                 if result is not None:
                     results.append(result)
-                if self.progress is not None:
-                    self.progress("tick", done=done, total=len(paths))
+                _emit_progress(progress, "file", done=done, total=len(paths), path=path.as_posix())
             return results
 
         results: list[_IndexedFile] = []
@@ -851,8 +855,8 @@ class Repository(CodeIndex):
                     result = None
                 if result is not None:
                     results.append(result)
-                if self.progress is not None:
-                    self.progress("tick", done=done, total=len(paths))
+                path = future_to_path[future]
+                _emit_progress(progress, "file", done=done, total=len(paths), path=path.as_posix())
         except KeyboardInterrupt:
             for future in future_to_path:
                 future.cancel()
@@ -1198,8 +1202,9 @@ def index(
     root: str | Path = ".",
     *,
     language: str | None = None,
+    progress: Any | None = None,
 ) -> Repository:
-    repo = Repository(root, languages=_languages_filter(language), create_index=True)
+    repo = Repository(root, languages=_languages_filter(language), progress=progress, create_index=True)
     return repo.refresh()
 
 
@@ -1208,8 +1213,9 @@ def update(
     *,
     root: str | Path = ".",
     language: str | None = None,
+    progress: Any | None = None,
 ) -> Repository:
-    repo = Repository(root, languages=_languages_filter(language))
+    repo = Repository(root, languages=_languages_filter(language), progress=progress)
     return repo.update(paths)
 
 
@@ -1811,6 +1817,22 @@ def _validate_api_format(format: str) -> str:
     if format not in API_FORMATS:
         raise ValueError(f"format must be one of: {', '.join(API_FORMATS)}")
     return format
+
+
+def _emit_progress(
+    progress: Any | None,
+    event: str,
+    *,
+    done: int = 0,
+    total: int = 0,
+    path: str | None = None,
+) -> None:
+    if progress is None:
+        return
+    try:
+        progress(event, done=done, total=total, path=path)
+    except Exception:
+        return
 
 
 def _coerce_queries(query: str | Iterable[str]) -> tuple[str, ...]:
@@ -3017,40 +3039,22 @@ class _CliProgress:
         self.stream = stream
         self.visible = False
 
-    def __call__(self, event: str, *, done: int, total: int) -> None:
+    def __call__(
+        self,
+        event: str,
+        *,
+        done: int = 0,
+        total: int = 0,
+        path: str | None = None,
+    ) -> None:
         stream = self.stream if self.stream is not None else sys.stderr
         if event == "scan":
             stream.write("\rscanning files...")
             stream.flush()
             self.visible = True
             return
-        if event == "delete_start":
-            stream.write("\rremoving stale index entries...")
-            stream.flush()
-            self.visible = True
-            return
-        if event == "delete_finish":
-            stream.write("\rremoved stale index entries")
-            stream.flush()
-            self.visible = True
-            return
-        if event == "write_start":
-            stream.write("\r" + _progress_line(done, total, label="writing index", unit="rows"))
-            stream.flush()
-            self.visible = True
-            return
-        if event == "write_tick":
-            stream.write("\r" + _progress_line(done, total, label="writing index", unit="rows"))
-            stream.flush()
-            self.visible = True
-            return
-        if event == "commit_batch":
-            stream.write("\rcommitting batch...")
-            stream.flush()
-            self.visible = True
-            return
-        if event == "finalize":
-            stream.write("\rfinalizing index...")
+        if event == "start":
+            stream.write("\r" + _progress_line(done, total, label="indexing", unit="files"))
             stream.flush()
             self.visible = True
             return
@@ -3060,9 +3064,10 @@ class _CliProgress:
                 stream.flush()
             self.visible = False
             return
-        self.visible = True
-        stream.write("\r" + _progress_line(done, total, label="indexing", unit="files"))
-        stream.flush()
+        if event == "file":
+            self.visible = True
+            stream.write("\r" + _progress_line(done, total, label="indexing", unit="files"))
+            stream.flush()
 
 
 def _progress_line(done: int, total: int, *, label: str, unit: str) -> str:
