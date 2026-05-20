@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-symbol-index"
+version = "0.1.0"
+description = "Tree-sitter backed symbol search and inspection for codebases."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "hit9", email = "hit9@icloud.com" }]
+dependencies = [
+  "pathspec",
+  "tree-sitter",
+  "tree-sitter-language-pack",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+code-symbol-index = "code_symbol_index:main"
+
+[tool.setuptools]
+py-modules = ["code_symbol_index"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

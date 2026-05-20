@@ -1,0 +1,37 @@
+# Local environment
+.env
+.env.*
+*.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# code-symbol-index local index
+.code-symbol-index/
+*.sqlite-wal
+*.sqlite-shm
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Crash dumps
+core
+core.*

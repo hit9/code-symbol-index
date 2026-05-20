@@ -1,0 +1,800 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import code_symbol_index
+from code_symbol_index import CodeIndex, IndexNotFoundError, Repository, main
+
+
+def test_indexes_python_symbols_and_references(tmp_path: Path) -> None:
+    source = tmp_path / "app.py"
+    source.write_text(
+        """
+class Handler:
+    def handle(self):
+        return helper()
+
+def helper():
+    return "ok"
+
+value = helper()
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    index = CodeIndex(tmp_path).build()
+
+    symbols = index.search_symbols("helper")
+    assert symbols
+    helper = symbols[0]
+    assert helper.name == "helper"
+    assert helper.kind == "function"
+    assert helper.path == Path("app.py")
+
+    inspection = index.inspect("helper")
+    assert inspection.definition == helper
+    assert any("return helper()" in reference.context for reference in inspection.references)
+    assert "def helper" in (inspection.source_preview or "")
+
+
+def test_indexes_javascript_symbols(tmp_path: Path) -> None:
+    (tmp_path / "ui.js").write_text(
+        """
+class Widget {
+  render() {
+    return mount();
+  }
+}
+
+function mount() {
+  return true;
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    index = CodeIndex(tmp_path).build()
+
+    assert index.search_symbols("Widget", kind="class", language="javascript")
+    assert index.search_symbols("mount", kind="function", language="javascript")
+
+
+def test_indexes_rust_impl_candidates(tmp_path: Path) -> None:
+    (tmp_path / "lib.rs").write_text(
+        """
+trait Greeter {
+    fn greet(&self);
+}
+
+struct Person;
+
+impl Greeter for Person {
+    fn greet(&self) {}
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    index = CodeIndex(tmp_path).build()
+    trait = index.search_symbols("Greeter", kind="trait", language="rust")[0]
+
+    implementations = index.impls("Greeter", kind="trait", language="rust")
+    assert any(symbol.kind == "impl" and "Greeter" in symbol.signature for symbol in implementations)
+
+
+def test_gitignore_and_update(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
+    kept = tmp_path / "kept.py"
+    ignored = tmp_path / "ignored.py"
+    kept.write_text("def kept():\n    pass\n", encoding="utf-8")
+    ignored.write_text("def ignored():\n    pass\n", encoding="utf-8")
+
+    index = CodeIndex(tmp_path).build()
+
+    assert index.search_symbols("kept")
+    assert not index.search_symbols("ignored")
+
+    kept.write_text("def renamed():\n    pass\n", encoding="utf-8")
+    index.update([kept])
+
+    assert not index.search_symbols("kept")
+    assert index.search_symbols("renamed")
+
+
+def test_repository_uses_disk_index_and_refreshes_changed_files(tmp_path: Path) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("def first_name():\n    pass\n", encoding="utf-8")
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    assert repo.search("first_name")
+    assert (tmp_path / ".code-symbol-index" / "index.sqlite").exists()
+
+    source.write_text("def second_name():\n    pass\n", encoding="utf-8")
+
+    assert repo.search("first_name")
+    assert not repo.search("second_name")
+    repo.refresh()
+    assert not repo.search("first_name")
+    assert repo.search("second_name")
+
+
+def test_repository_skips_unchanged_files(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "app.py").write_text("def unchanged_name():\n    pass\n", encoding="utf-8")
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    assert repo.search("unchanged_name")
+
+    calls = 0
+    original = Repository._index_file
+
+    def count_index_file(self: Repository, path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        original(self, path)
+
+    monkeypatch.setattr(Repository, "_index_file", count_index_file)
+
+    assert repo.search("unchanged_name")
+    assert calls == 0
+
+
+def test_repository_query_does_not_refresh_by_default(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "app.py").write_text("def indexed_name():\n    pass\n", encoding="utf-8")
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    def fail_refresh(self: Repository) -> Repository:
+        raise AssertionError("refresh should not run during query")
+
+    monkeypatch.setattr(Repository, "refresh", fail_refresh)
+
+    assert repo.search("indexed_name")
+
+
+def test_repository_indexes_multiple_changed_files(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(code_symbol_index, "MAX_WORKERS", 2)
+    for index in range(3):
+        (tmp_path / f"module_{index}.py").write_text(
+            f"def multi_target_{index}():\n    pass\n",
+            encoding="utf-8",
+        )
+
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    assert repo.search("multi_target_0")
+    assert repo.search("multi_target_1")
+    assert repo.search("multi_target_2")
+
+
+def test_repository_computes_references_on_demand_without_persisting_refs(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        """
+def helper():
+    local_only = 1
+    return local_only
+
+value = helper()
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    repo = Repository(tmp_path, create_index=True).refresh()
+    persisted_refs = repo.storage.connection.execute("SELECT count(*) FROM refs").fetchone()[0]
+    references = repo.refs("helper")
+
+    assert persisted_refs == 0
+    assert references
+    assert all(reference.name == "helper" for reference in references)
+
+
+def test_inspect_limits_references_and_exposes_next_offset(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        "def helper():\n    return 'ok'\n\n"
+        + "\n".join(f"value_{index} = helper()" for index in range(5))
+        + "\n",
+        encoding="utf-8",
+    )
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    inspection = repo.inspect("helper", limit=2)
+    page = repo.refs("helper", limit=2, offset=2)
+
+    assert len(inspection.references) == 2
+    assert inspection.references_has_more is True
+    assert inspection.references_next_offset == 2
+    assert len(page.items) == 2
+    assert page.limit == 2
+    assert page.offset == 2
+    assert page.has_more is True
+    assert page.next_offset == 4
+
+
+def test_repository_prefilters_reference_parse_by_symbol_name(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "app.py").write_text(
+        "def helper():\n    return 'ok'\n\nvalue = helper()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "other.py").write_text("def unrelated():\n    return 1\n", encoding="utf-8")
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    parsed_paths: list[Path] = []
+    original_parse_file = code_symbol_index._parse_file
+
+    def count_parse_file(*args, **kwargs):
+        parsed_paths.append(args[1])
+        return original_parse_file(*args, **kwargs)
+
+    monkeypatch.setattr(code_symbol_index, "_parse_file", count_parse_file)
+
+    assert repo.refs("helper")
+    assert Path("app.py") in parsed_paths
+    assert Path("other.py") not in parsed_paths
+
+
+def test_top_level_refs_returns_page(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        "def helper():\n    return 'ok'\n\n"
+        + "\n".join(f"value_{index} = helper()" for index in range(3))
+        + "\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+
+    page = code_symbol_index.refs("helper", root=tmp_path, limit=2, offset=1)
+
+    assert len(page.items) == 2
+    assert page.limit == 2
+    assert page.offset == 1
+    assert page.has_more is False
+
+
+def test_repository_populates_symbol_fts_when_available(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("def substring_target():\n    pass\n", encoding="utf-8")
+    repo = Repository(tmp_path, create_index=True).refresh()
+    if not repo.storage.has_symbol_fts:
+        return
+
+    fts_count = repo.storage.connection.execute("SELECT count(*) FROM symbol_fts").fetchone()[0]
+
+    assert fts_count > 0
+    assert repo.search("string_tar")
+
+
+def test_default_excludes_prune_virtualenv(tmp_path: Path) -> None:
+    package_dir = tmp_path / ".venv" / "lib"
+    package_dir.mkdir(parents=True)
+    package_dir.joinpath("dependency.py").write_text("def OnlyDependency():\n    pass\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("def local_index():\n    pass\n", encoding="utf-8")
+
+    index = CodeIndex(tmp_path).build()
+
+    assert not index.search("OnlyDependency")
+    assert index.search("local_index")
+
+
+def test_default_excludes_skip_common_generated_dirs(tmp_path: Path) -> None:
+    coverage_dir = tmp_path / "coverage"
+    next_dir = tmp_path / ".next"
+    coverage_dir.mkdir()
+    next_dir.mkdir()
+    coverage_dir.joinpath("report.py").write_text("def coverage_symbol():\n    pass\n", encoding="utf-8")
+    next_dir.joinpath("page.py").write_text("def next_symbol():\n    pass\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("def app_symbol():\n    pass\n", encoding="utf-8")
+
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    assert not repo.search("coverage_symbol")
+    assert not repo.search("next_symbol")
+    assert repo.search("app_symbol")
+
+
+def test_nested_gitignore_is_respected(tmp_path: Path) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    package.joinpath(".gitignore").write_text("ignored.py\n", encoding="utf-8")
+    package.joinpath("ignored.py").write_text("def ignored_symbol():\n    pass\n", encoding="utf-8")
+    package.joinpath("kept.py").write_text("def kept_symbol():\n    pass\n", encoding="utf-8")
+
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    assert not repo.search("ignored_symbol")
+    assert repo.search("kept_symbol")
+
+
+def test_binary_looking_text_extension_is_skipped(tmp_path: Path) -> None:
+    (tmp_path / "bad.py").write_bytes(b"def binary_symbol():\x00\n    pass\n")
+    (tmp_path / "good.py").write_text("def good_symbol():\n    pass\n", encoding="utf-8")
+
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    assert not repo.search("binary_symbol")
+    assert repo.search("good_symbol")
+
+
+def test_default_root_api_uses_current_directory(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "local.py").write_text("def local_target():\n    pass\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    code_symbol_index.index()
+
+    assert code_symbol_index.search("local_target")[0].path == Path("local.py")
+
+
+def test_top_level_api_sync_is_explicit(tmp_path: Path) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("def first_sync_name():\n    pass\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+    source.write_text("def second_sync_name():\n    pass\n", encoding="utf-8")
+
+    assert not code_symbol_index.search("second_sync_name", root=tmp_path)
+    assert code_symbol_index.search("second_sync_name", root=tmp_path, sync=True)
+
+
+def test_top_level_api_search_limit_defaults_to_twenty(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        "\n".join(f"def target_{index}():\n    pass\n" for index in range(25)),
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+
+    assert len(code_symbol_index.search("target", root=tmp_path)) == 20
+    assert len(code_symbol_index.search("target", root=tmp_path, limit=3)) == 3
+
+
+def test_top_level_api_search_text_is_llm_friendly(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("def target_tool():\n    pass\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    output = code_symbol_index.search_text("target", root=tmp_path)
+
+    assert "query: target" in output
+    assert "count: 1" in output
+    assert "symbols:" in output
+    assert "name: target_tool" in output
+    assert "range: 0:2" in output
+    assert "score: prefix" in output
+    assert "source:" not in output
+
+
+def test_outline_text_returns_file_structure_without_source_or_ids(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        """
+class Tool:
+    def cli_args(cls, args):
+        return args
+
+def main(argv=None):
+    return Tool()
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+
+    output = code_symbol_index.outline_text("app.py", root=tmp_path)
+
+    assert "file: app.py" in output
+    assert "range: 0:6" in output
+    assert "count: 3" in output
+    assert "outline:" in output
+    assert "  class Tool 0:3 class Tool:" in output
+    assert "    function cli_args 1:3 def cli_args(cls, args):" in output
+    assert "  function main 4:6 def main(argv=None):" in output
+    assert "id:" not in output
+    assert "source:" not in output
+
+
+def test_inspect_text_outputs_llm_friendly_source(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        """
+class Handler:
+    def handle(self):
+        return helper()
+
+def helper():
+    return "ok"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+
+    output = code_symbol_index.inspect_text("Handler.handle", root=tmp_path)
+
+    assert "symbol:\n" in output
+    assert "name: handle" in output
+    assert "range: 1:3" in output
+    assert "source:\n" in output
+    assert "status: full" in output
+    assert "  1 |    def handle(self):" in output
+    assert "  2 |        return helper()" in output
+    assert "callees:" in output
+
+
+def test_inspect_text_handles_invalid_not_found_and_ambiguous(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("def helper():\n    pass\n", encoding="utf-8")
+    (tmp_path / "other.py").write_text("def helper():\n    pass\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    assert "invalid_input:" in code_symbol_index.inspect_text("where is helper", root=tmp_path)
+    assert "invalid_input:" in code_symbol_index.inspect_text("app.py", root=tmp_path)
+    assert "not_found:" in code_symbol_index.inspect_text("missing_symbol", root=tmp_path)
+    ambiguous = code_symbol_index.inspect_text("helper", root=tmp_path)
+    assert "ambiguous:" in ambiguous
+    assert "candidates:" in ambiguous
+
+
+def test_cli_search_outputs_text_by_default_and_json_with_flag(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text("def cli_target():\n    pass\n", encoding="utf-8")
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["search", "cli_target", "--root", str(tmp_path), "--language", "python"])
+    text_output = capsys.readouterr().out
+    json_exit = main(["search", "cli_target", "--root", str(tmp_path), "--language", "python", "--json"])
+    raw_json = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "query: cli_target" in text_output
+    assert "symbols:" in text_output
+    assert "name: cli_target" in text_output
+    assert "score: exact" in text_output
+    assert "source:" not in text_output
+    assert json_exit == 0
+    output = json.loads(raw_json)
+    assert output[0]["name"] == "cli_target"
+    assert output[0]["path"] == "app.py"
+    assert output[0]["line"] == 1
+    assert output[0]["column"] == 5
+    assert raw_json.startswith("[\n")
+    assert '"range"' not in raw_json
+
+
+def test_cli_search_limit_defaults_to_twenty_and_accepts_option(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(
+        "\n".join(f"def target_{index}():\n    pass\n" for index in range(25)),
+        encoding="utf-8",
+    )
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+
+    default_exit = main(["target", "--root", str(tmp_path), "--language", "python", "--json"])
+    default_output = json.loads(capsys.readouterr().out)
+    limited_exit = main(["target", "--root", str(tmp_path), "--language", "python", "--limit", "3", "--json"])
+    limited_output = json.loads(capsys.readouterr().out)
+
+    assert default_exit == 0
+    assert len(default_output) == 20
+    assert limited_exit == 0
+    assert len(limited_output) == 3
+
+
+def test_cli_query_does_not_sync_by_default(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("def first_cli_name():\n    pass\n", encoding="utf-8")
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+    source.write_text("def second_cli_name():\n    pass\n", encoding="utf-8")
+
+    stale_exit = main(["second_cli_name", "--root", str(tmp_path), "--language", "python"])
+    stale_output = capsys.readouterr()
+    synced_exit = main(["second_cli_name", "--root", str(tmp_path), "--language", "python", "--sync"])
+    synced_output = capsys.readouterr()
+
+    assert stale_exit == 0
+    assert "count: 0" in stale_output.out
+    assert synced_exit == 0
+    assert "name: second_cli_name" in synced_output.out
+    assert "indexing" in synced_output.err
+
+
+def test_cli_bare_keyword_search_and_inspect_best_match(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(
+        """
+def helper():
+    return "ok"
+
+value = helper()
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+
+    search_exit = main(["helper", "--root", str(tmp_path), "--language", "python"])
+    assert search_exit == 0
+    search_output = capsys.readouterr().out
+    assert "name: helper" in search_output
+
+    inspect_exit = main(["inspect", "helper", "--root", str(tmp_path), "--language", "python"])
+    assert inspect_exit == 0
+    inspect_output = capsys.readouterr().out
+    assert "symbol:" in inspect_output
+    assert "name: helper" in inspect_output
+    assert "source:" in inspect_output
+    assert "  0 |def helper():" in inspect_output
+    assert "references:" in inspect_output
+
+    json_exit = main(["inspect", "helper", "--root", str(tmp_path), "--language", "python", "--json"])
+    assert json_exit == 0
+    json_output = json.loads(capsys.readouterr().out)
+    assert json_output["definition"]["name"] == "helper"
+
+
+def test_cli_inspect_and_refs_support_pagination(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(
+        "def helper():\n    return 'ok'\n\n"
+        + "\n".join(f"value_{index} = helper()" for index in range(5))
+        + "\n",
+        encoding="utf-8",
+    )
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+
+    inspect_exit = main(
+        [
+            "inspect",
+            "helper",
+            "--root",
+            str(tmp_path),
+            "--language",
+            "python",
+            "--max-references",
+            "2",
+        ]
+    )
+    inspect_output = capsys.readouterr().out
+    refs_exit = main(
+        [
+            "refs",
+            "helper",
+            "--root",
+            str(tmp_path),
+            "--language",
+            "python",
+            "--limit",
+            "2",
+            "--offset",
+            "2",
+            "--json",
+        ]
+    )
+    refs_output = json.loads(capsys.readouterr().out)
+
+    assert inspect_exit == 0
+    assert inspect_output.count("context:") == 2
+    assert "kind: usage" not in inspect_output
+    assert refs_exit == 0
+    assert len(refs_output["items"]) == 2
+    assert refs_output["limit"] == 2
+    assert refs_output["offset"] == 2
+    assert refs_output["has_more"] is True
+    assert refs_output["next_offset"] == 4
+
+
+def test_cli_refs_defaults_to_text_and_supports_json(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(
+        "def helper():\n    return 'ok'\n\nvalue = helper()\n",
+        encoding="utf-8",
+    )
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+
+    text_exit = main(["refs", "helper", "--root", str(tmp_path), "--language", "python"])
+    text_output = capsys.readouterr().out
+    json_exit = main(["refs", "helper", "--root", str(tmp_path), "--language", "python", "--json"])
+    json_output = json.loads(capsys.readouterr().out)
+
+    assert text_exit == 0
+    assert "references:" in text_output
+    assert "items:" in text_output
+    assert "context: value = helper()" in text_output
+    assert "kind: usage" not in text_output
+    assert json_exit == 0
+    assert json_output["items"][0]["context"] == "value = helper()"
+
+
+def test_cli_outline_defaults_to_text_and_supports_json(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(
+        """
+class Tool:
+    def cli_args(cls, args):
+        return args
+
+def main(argv=None):
+    return Tool()
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+
+    text_exit = main(["outline", "app.py", "--root", str(tmp_path)])
+    text_output = capsys.readouterr().out
+    json_exit = main(["outline", "app.py", "--root", str(tmp_path), "--json"])
+    json_output = json.loads(capsys.readouterr().out)
+
+    assert text_exit == 0
+    assert "file: app.py" in text_output
+    assert "outline:" in text_output
+    assert "  class Tool 0:3 class Tool:" in text_output
+    assert "    function cli_args 1:3 def cli_args(cls, args):" in text_output
+    assert "id:" not in text_output
+    assert "source:" not in text_output
+    assert json_exit == 0
+    assert json_output["items"][0]["name"] == "Tool"
+
+
+def test_cli_impls_defaults_to_text_and_supports_json(tmp_path: Path, capsys) -> None:
+    (tmp_path / "lib.rs").write_text(
+        """
+trait Greeter {
+    fn greet(&self);
+}
+
+struct Person;
+
+impl Greeter for Person {
+    fn greet(&self) {}
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    assert main(["index", "--root", str(tmp_path), "--language", "rust"]) == 0
+    capsys.readouterr()
+
+    text_exit = main(["impls", "Greeter", "--root", str(tmp_path), "--language", "rust", "--kind", "trait"])
+    text_output = capsys.readouterr().out
+    json_exit = main(["impls", "Greeter", "--root", str(tmp_path), "--language", "rust", "--kind", "trait", "--json"])
+    json_output = json.loads(capsys.readouterr().out)
+
+    assert text_exit == 0
+    assert "implementors:" in text_output
+    assert "items:" in text_output
+    assert "kind: impl" in text_output
+    assert json_exit == 0
+    assert json_output["items"][0]["kind"] == "impl"
+
+
+def test_cli_progress_goes_to_stderr(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text("def progress_target():\n    pass\n", encoding="utf-8")
+
+    exit_code = main(["index", "--root", str(tmp_path), "--language", "python"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert json.loads(captured.out)["root"] == str(tmp_path.resolve())
+    assert "indexing" in captured.err
+    assert "writing index" in captured.err
+
+
+def test_cli_index_command_refreshes_disk_index(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text("def indexed_target():\n    pass\n", encoding="utf-8")
+
+    exit_code = main(["index", "--root", str(tmp_path), "--language", "python"])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0
+    assert payload["root"] == str(tmp_path.resolve())
+    assert (tmp_path / ".code-symbol-index" / "index.sqlite").exists()
+    assert "indexing" in captured.err
+    assert "writing index" in captured.err
+
+
+def test_status_reports_missing_ready_and_stale(tmp_path: Path) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("def status_target():\n    pass\n", encoding="utf-8")
+
+    missing = code_symbol_index.status(tmp_path)
+    code_symbol_index.index(tmp_path)
+    ready = code_symbol_index.status(tmp_path)
+    ready_checked = code_symbol_index.status(tmp_path, check=True)
+    source.write_text("def status_target_changed():\n    pass\n", encoding="utf-8")
+    fast_after_change = code_symbol_index.status(tmp_path)
+    stale = code_symbol_index.status(tmp_path, check=True)
+
+    assert missing.status == "missing"
+    assert missing.reason == "index not initialized"
+    assert ready.status == "ready"
+    assert ready.files == 1
+    assert ready.symbols == 1
+    assert ready.languages == ("python",)
+    assert ready.language_breakdown == ({"language": "python", "files": 1, "percent": 100.0},)
+    assert ready.updated_at is not None
+    assert ready.pending_changes == "unknown"
+    assert ready_checked.status == "ready"
+    assert ready_checked.pending_changes == 0
+    assert fast_after_change.status == "ready"
+    assert fast_after_change.pending_changes == "unknown"
+    assert stale.status == "stale"
+    assert stale.pending_changes == 1
+    assert stale.reason == "files changed after last index update"
+
+
+def test_status_text_is_readable(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("def status_text_target():\n    pass\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    output = code_symbol_index.status_text(tmp_path)
+    checked_output = code_symbol_index.status_text(tmp_path, check=True)
+
+    assert "index:" in output
+    assert "status: ready" in output
+    assert f"root: {tmp_path}" in output
+    assert "files: 1" in output
+    assert "symbols: 1" in output
+    assert "languages: python" in output
+    assert "language_breakdown:" in output
+    assert "- python: 1 files (100.0%)" in output
+    assert "pending_changes: unknown" in output
+    assert "pending_changes: 0" in checked_output
+
+
+def test_cli_status_defaults_to_text_and_supports_json(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text("def cli_status_target():\n    pass\n", encoding="utf-8")
+
+    missing_exit = main(["status", "--root", str(tmp_path)])
+    missing_output = capsys.readouterr().out
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+    text_exit = main(["status", "--root", str(tmp_path)])
+    text_output = capsys.readouterr().out
+    checked_exit = main(["status", "--root", str(tmp_path), "--check"])
+    checked_output = capsys.readouterr().out
+    json_exit = main(["status", "--root", str(tmp_path), "--json"])
+    json_output = json.loads(capsys.readouterr().out)
+
+    assert missing_exit == 0
+    assert "status: missing" in missing_output
+    assert "reason: index not initialized" in missing_output
+    assert text_exit == 0
+    assert "status: ready" in text_output
+    assert "pending_changes: unknown" in text_output
+    assert checked_exit == 0
+    assert "pending_changes: 0" in checked_output
+    assert json_exit == 0
+    assert json_output["status"] == "ready"
+    assert json_output["files"] == 1
+    assert json_output["pending_changes"] == "unknown"
+    assert json_output["language_breakdown"][0]["percent"] == 100.0
+
+
+def test_cli_keyboard_interrupt_returns_130(monkeypatch, capsys) -> None:
+    def interrupt(self: Repository) -> Repository:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Repository, "refresh", interrupt)
+
+    exit_code = main(["index"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 130
+    assert "interrupted" in captured.err
+
+
+def test_api_requires_existing_index(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("def missing_index_target():\n    pass\n", encoding="utf-8")
+
+    try:
+        code_symbol_index.search("missing_index_target", root=tmp_path)
+    except IndexNotFoundError:
+        pass
+    else:
+        raise AssertionError("expected IndexNotFoundError")
+
+
+def test_cli_requires_existing_index(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text("def missing_index_target():\n    pass\n", encoding="utf-8")
+
+    exit_code = main(["missing_index_target", "--root", str(tmp_path), "--language", "python"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "code-symbol-index index" in captured.err
