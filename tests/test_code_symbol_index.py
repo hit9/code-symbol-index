@@ -370,6 +370,14 @@ def test_top_level_api_search_limit_defaults_to_twenty(tmp_path: Path) -> None:
 
     assert len(code_symbol_index.search("target", root=tmp_path)) == 20
     assert len(code_symbol_index.search("target", root=tmp_path, limit=3)) == 3
+    limited_text = code_symbol_index.search("target", root=tmp_path, limit=3, format="text")
+    limited_json = code_symbol_index.search("target", root=tmp_path, limit=3, format="json")
+    assert "limit: 3" in limited_text
+    assert "has_more: true" in limited_text
+    assert limited_json["count"] == 3
+    assert limited_json["limit"] == 3
+    assert limited_json["has_more"] is True
+    assert len(limited_json["symbols"]) == 3
 
 
 def test_top_level_api_search_accepts_multiple_queries(tmp_path: Path) -> None:
@@ -405,6 +413,8 @@ def test_top_level_api_search_text_is_llm_friendly(tmp_path: Path) -> None:
 
     assert "query: target" in output
     assert "count: 1" in output
+    assert "limit: 20" in output
+    assert "has_more: false" in output
     assert "symbols:" in output
     assert "name: target_tool" in output
     assert "range: 0:2" in output
@@ -425,9 +435,10 @@ def test_top_level_api_format_parameter(tmp_path: Path) -> None:
 
     assert isinstance(code_symbol_index.search("target", root=tmp_path), list)
     assert "query: target" in search_text
-    assert search_json[0]["name"] == "target_tool"
-    assert search_json[0]["path"] == "app.py"
-    assert search_json[0]["range"]["start"]["line"] == 0
+    assert search_json["symbols"][0]["name"] == "target_tool"
+    assert search_json["symbols"][0]["path"] == "app.py"
+    assert search_json["symbols"][0]["range"]["start"]["line"] == 0
+    assert search_json["has_more"] is False
     assert "source:" in inspect_text
     assert outline_json["items"][0]["name"] == "target_tool"
     assert "index:\n" in status_text
@@ -552,17 +563,22 @@ def test_cli_search_outputs_text_by_default_and_json_with_flag(tmp_path: Path, c
 
     assert exit_code == 0
     assert "query: cli_target" in text_output
+    assert "limit: 20" in text_output
+    assert "has_more: false" in text_output
     assert "symbols:" in text_output
     assert "name: cli_target" in text_output
     assert "score: exact" in text_output
     assert "source:" not in text_output
     assert json_exit == 0
     output = json.loads(raw_json)
-    assert output[0]["name"] == "cli_target"
-    assert output[0]["path"] == "app.py"
-    assert output[0]["line"] == 1
-    assert output[0]["column"] == 5
-    assert raw_json.startswith("[\n")
+    assert output["symbols"][0]["name"] == "cli_target"
+    assert output["symbols"][0]["path"] == "app.py"
+    assert output["symbols"][0]["line"] == 1
+    assert output["symbols"][0]["column"] == 5
+    assert output["count"] == 1
+    assert output["limit"] == 20
+    assert output["has_more"] is False
+    assert raw_json.startswith("{\n")
     assert '"range"' not in raw_json
 
 
@@ -605,9 +621,12 @@ def test_cli_search_limit_defaults_to_twenty_and_accepts_option(tmp_path: Path, 
     limited_output = json.loads(capsys.readouterr().out)
 
     assert default_exit == 0
-    assert len(default_output) == 20
+    assert len(default_output["symbols"]) == 20
+    assert default_output["has_more"] is True
     assert limited_exit == 0
-    assert len(limited_output) == 3
+    assert len(limited_output["symbols"]) == 3
+    assert limited_output["limit"] == 3
+    assert limited_output["has_more"] is True
 
 
 def test_cli_query_does_not_sync_by_default(tmp_path: Path, capsys) -> None:

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 - 2026-05-20
+
+### Changed
+
+- Search text and JSON output now report `limit` and `has_more` when results are truncated.
+
 ## 0.1.1 - 2026-05-20
 
 ### Added

@@ -121,6 +121,8 @@ Search returns candidates only, never source:
 ```text
 query: Tool
 count: 2
+limit: 20
+has_more: false
 
 symbols:
   - id: python:class:Tool:nanocode.py:1284:1330
@@ -140,6 +142,8 @@ queries:
   - Tool
   - Agent
 count: 2
+limit: 20
+has_more: false
 
 symbols:
   - id: python:class:Tool:nanocode.py:1284:1330
@@ -273,7 +277,8 @@ Top-level query APIs accept `format="object" | "text" | "json"`:
 - `json` returns JSON-safe Python dict/list data.
 
 `search` accepts one query or a list of symbol names/prefixes. Multiple queries
-are OR-ed, are not regexes, and share one total `limit`.
+are OR-ed, are not regexes, and share one total `limit`. Search text and JSON
+formats include `has_more` when more matches exist beyond `limit`.
 
 ## Development
 
@@ -296,7 +301,7 @@ Index lifecycle:
 
 Queries:
 
-- `search(query: str | list[str], *, root=".", kind=None, language=None, limit=20, sync=False, format="object") -> list[Symbol] | str | list[dict]`
+- `search(query: str | list[str], *, root=".", kind=None, language=None, limit=20, sync=False, format="object") -> list[Symbol] | str | dict`
 - `search_text(query: str | list[str], *, root=".", kind=None, language=None, limit=20, sync=False) -> str`
 - `inspect(query, *, root=".", kind=None, language=None, limit=20, sync=False, format="object", ...) -> Inspection | str | dict`
 - `inspect_text(query, *, root=".", kind=None, language=None, sync=False, ...) -> str`

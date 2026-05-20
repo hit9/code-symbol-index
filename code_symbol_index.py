@@ -21,7 +21,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 SCHEMA_VERSION = 3
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -463,7 +463,17 @@ class CodeIndex:
         language: str | None = None,
         limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> list[Symbol]:
-        return _search_many(self, query, kind=kind, language=language, limit=limit)
+        return list(self.search_page(query, kind=kind, language=language, limit=limit).items)
+
+    def search_page(
+        self,
+        query: str | Iterable[str],
+        *,
+        kind: str | None = None,
+        language: str | None = None,
+        limit: int = DEFAULT_SEARCH_LIMIT,
+    ) -> Page:
+        return _search_page(self, query, kind=kind, language=language, limit=limit)
 
     def best_symbol(
         self,
@@ -538,7 +548,7 @@ class CodeIndex:
         return _format_search_text(
             self,
             queries,
-            self.search(queries, kind=kind, language=language, limit=limit),
+            self.search_page(queries, kind=kind, language=language, limit=limit),
         )
 
     def outline(
@@ -957,12 +967,12 @@ def search(
     if sync:
         repo.refresh()
     queries = _coerce_queries(query)
-    symbols = repo.search(queries, kind=kind, language=language, limit=limit)
+    page = repo.search_page(queries, kind=kind, language=language, limit=limit)
     if output_format == "object":
-        return symbols
+        return list(page.items)
     if output_format == "text":
-        return _format_search_text(repo, queries, symbols)
-    return _to_jsonable(symbols)
+        return _format_search_text(repo, queries, page)
+    return _search_jsonable(page)
 
 
 def search_text(
@@ -2366,21 +2376,21 @@ def _enclosing_symbol(symbols: list[Symbol], range_: Range, *, exclude_id: str) 
     return max(candidates, key=lambda symbol: symbol.range.start.line)
 
 
-def _search_many(
+def _search_page(
     repo: CodeIndex,
     query: str | Iterable[str],
     *,
     kind: str | None,
     language: str | None,
     limit: int,
-) -> list[Symbol]:
+) -> Page:
     queries = _coerce_queries(query)
     if not queries or limit <= 0:
-        return []
+        return Page(items=(), limit=limit, offset=0, has_more=False)
 
     seen: dict[str, tuple[Symbol, tuple[int, int, int, str, int]]] = {}
     for query_index, item in enumerate(queries):
-        candidates = repo.search_symbols(item, kind=kind, language=language, limit=limit)
+        candidates = repo.search_symbols(item, kind=kind, language=language, limit=limit + 1)
         for result_index, symbol in enumerate(candidates):
             score_rank = {"exact": 0, "prefix": 1}.get(_match_score(item, symbol), 2)
             rank = (score_rank, query_index, len(symbol.name), symbol.path.as_posix(), result_index)
@@ -2389,7 +2399,7 @@ def _search_many(
                 seen[symbol.id] = (symbol, rank)
 
     ranked = sorted(seen.values(), key=lambda item: item[1])
-    return [symbol for symbol, _ in ranked[:limit]]
+    return _page_from_extra([symbol for symbol, _ in ranked], limit=limit, offset=0)
 
 
 def _definition_range(repo: CodeIndex, symbol: Symbol) -> Range | None:
@@ -2478,14 +2488,21 @@ def _format_page_text(repo: CodeIndex, name: str, page: Page) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _format_search_text(repo: CodeIndex, query: str | Iterable[str], symbols: list[Symbol]) -> str:
+def _format_search_text(repo: CodeIndex, query: str | Iterable[str], page: Page) -> str:
     queries = _coerce_queries(query)
     if len(queries) == 1:
         lines = [f"query: {queries[0]}"]
     else:
         lines = ["queries:"]
         lines.extend(f"  - {item}" for item in queries)
-    lines.extend([f"count: {len(symbols)}", "", "symbols:"])
+    symbols = tuple(item for item in page.items if isinstance(item, Symbol))
+    lines.extend([
+        f"count: {len(symbols)}",
+        f"limit: {page.limit}",
+        f"has_more: {_text_bool(page.has_more)}",
+        "",
+        "symbols:",
+    ])
     if not symbols:
         lines.append("  []")
         return "\n".join(lines) + "\n"
@@ -2916,6 +2933,16 @@ def _print_cli_json(value: Any) -> None:
     print(json.dumps(_to_cli_jsonable(value), ensure_ascii=False, indent=2))
 
 
+def _search_jsonable(page: Page, *, cli: bool = False) -> dict[str, Any]:
+    convert = _to_cli_jsonable if cli else _to_jsonable
+    return {
+        "symbols": [convert(item) for item in page.items],
+        "count": len(page.items),
+        "limit": page.limit,
+        "has_more": page.has_more,
+    }
+
+
 def _to_cli_jsonable(value: Any) -> Any:
     if isinstance(value, Page):
         return _readable_page(value)
@@ -3209,11 +3236,11 @@ def main(argv: list[str] | None = None) -> int:
             repo.refresh()
             _print_json({"index": str(Path(repo.storage.db_path)), "root": str(repo.root)})
         elif args.command == "search":
-            symbols = repo.search(args.query, kind=args.kind, language=language, limit=args.limit)
+            page = repo.search_page(args.query, kind=args.kind, language=language, limit=args.limit)
             if args.json:
-                _print_cli_json(symbols)
+                _print_json(_search_jsonable(page, cli=True))
             else:
-                print(_format_search_text(repo, args.query, symbols), end="")
+                print(_format_search_text(repo, args.query, page), end="")
         elif args.command == "inspect":
             if args.json:
                 _print_cli_json(repo.inspect(args.query, kind=args.kind, language=language, limit=args.limit))
