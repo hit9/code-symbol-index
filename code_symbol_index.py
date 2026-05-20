@@ -21,7 +21,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 SCHEMA_VERSION = 3
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -3174,6 +3174,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     languages = subparsers.add_parser("languages", help="Print configured languages with available parsers.")
     languages.set_defaults(command="languages")
+    version = subparsers.add_parser("version", help="Print the code-symbol-index version.")
+    version.set_defaults(command="version")
     return parser
 
 
@@ -3192,12 +3194,15 @@ def _inspect_options_from_args(args: argparse.Namespace) -> InspectOptions:
 def main(argv: list[str] | None = None) -> int:
     try:
         raw_args = list(sys.argv[1:] if argv is None else argv)
-        commands = {"search", "inspect", "refs", "impls", "outline", "status", "index", "clean", "languages"}
+        commands = {"search", "inspect", "refs", "impls", "outline", "status", "index", "clean", "languages", "version"}
         if raw_args and raw_args[0] not in commands and not raw_args[0].startswith("-"):
             raw_args.insert(0, "search")
 
         parser = build_arg_parser()
         args = parser.parse_args(raw_args)
+        if args.command == "version":
+            print(f"code-symbol-index {__version__}")
+            return 0
         if args.command == "languages":
             _print_json(list(supported_languages()))
             return 0

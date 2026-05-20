@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 - 2026-05-20
+
+### Added
+
+- Added `code-symbol-index version` as a subcommand alias for `--version`.
+
 ## 0.1.2 - 2026-05-20
 
 ### Changed

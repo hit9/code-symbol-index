@@ -91,6 +91,8 @@ code-symbol-index outline src/app.py --root /path/to/repo
 
 ```bash
 code-symbol-index languages
+code-symbol-index --version
+code-symbol-index version
 code-symbol-index index --root /path/to/repo
 code-symbol-index status --root /path/to/repo
 code-symbol-index status --root /path/to/repo --check

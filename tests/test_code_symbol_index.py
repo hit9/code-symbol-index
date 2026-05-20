@@ -947,6 +947,10 @@ def test_cli_version(capsys) -> None:
     captured = capsys.readouterr()
     assert captured.out.strip() == f"code-symbol-index {code_symbol_index.__version__}"
 
+    assert main(["version"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == f"code-symbol-index {code_symbol_index.__version__}"
+
 
 def test_api_requires_existing_index(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("def missing_index_target():\n    pass\n", encoding="utf-8")
