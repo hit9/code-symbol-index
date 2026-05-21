@@ -279,6 +279,15 @@ repo.update(["src/app.py"], progress=on_progress)
 
 Stable progress events are `scan`, `start`, `file`, and `finish`.
 
+To refresh the index during application startup without blocking startup:
+
+```python
+thread = csi.refresh_async("/path/to/repo", progress=on_progress)
+```
+
+`refresh_async` creates its own `Repository` inside the background thread.
+Do not share a `Repository` instance across threads.
+
 Queries require an existing index. Run `code-symbol-index index` or
 `code_symbol_index.index()` first. Queries do not sync automatically unless
 called with `--sync` or `sync=True`. After external file edits, call
@@ -322,6 +331,7 @@ Index lifecycle:
 
 - `index(root=".", *, language=None, progress=None) -> Repository`
 - `update(paths, *, root=".", language=None, progress=None) -> Repository`
+- `refresh_async(root=".", *, language=None, db_path=None, progress=None, daemon=True) -> threading.Thread`
 - `install_skill(*, target="codex", codex_home=None, force=False) -> Path`
 - `clean(root=".") -> None`
 - `status(root=".", *, language=None, db_path=None, check=False, format="object") -> IndexStatus | str | dict`

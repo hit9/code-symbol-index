@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.6 - 2026-05-21
+
+### Added
+
+- Added `refresh_async()` for startup-time background index refresh.
+
+### Fixed
+
+- Changed tree-sitter parser caching to thread-local storage to avoid cross-thread parser reuse.
+
 ## 0.1.5 - 2026-05-21
 
 ### Added

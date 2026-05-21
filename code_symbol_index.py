@@ -9,10 +9,10 @@ import re
 import shutil
 import sqlite3
 import sys
+import threading
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +21,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 SCHEMA_VERSION = 3
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -45,6 +45,7 @@ MAX_INSPECT_CANDIDATES = 20
 SYMBOL_QUERY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
 API_FORMATS = ("object", "text", "json")
 _DEFAULT_PROGRESS = object()
+_THREAD_LOCAL = threading.local()
 CODEX_SKILL_NAME = "code-symbol-index"
 
 CODEX_SKILL = """---
@@ -1254,6 +1255,29 @@ def update(
     return repo.update(paths)
 
 
+def refresh_async(
+    root: str | Path = ".",
+    *,
+    language: str | None = None,
+    db_path: str | Path | None = None,
+    progress: Any | None = None,
+    daemon: bool = True,
+) -> threading.Thread:
+    def run() -> None:
+        repo = Repository(
+            root,
+            languages=_languages_filter(language),
+            db_path=db_path,
+            progress=progress,
+            create_index=True,
+        )
+        repo.refresh()
+
+    thread = threading.Thread(target=run, daemon=daemon)
+    thread.start()
+    return thread
+
+
 def install_skill(
     *,
     target: str = "codex",
@@ -1997,14 +2021,22 @@ def _file_contains_bytes(path: Path, needle: bytes) -> bool:
     return False
 
 
-@lru_cache(maxsize=None)
 def _parser_for_language(language: str):
     if language not in LANGUAGE_BY_NAME:
         raise UnsupportedLanguageError(f"Unsupported language: {language}")
+    parsers = getattr(_THREAD_LOCAL, "parsers", None)
+    if parsers is None:
+        parsers = {}
+        _THREAD_LOCAL.parsers = parsers
+    parser = parsers.get(language)
+    if parser is not None:
+        return parser
     try:
-        return get_parser(language)
+        parser = get_parser(language)
     except Exception as exc:
         raise UnsupportedLanguageError(f"No parser available for language: {language}") from exc
+    parsers[language] = parser
+    return parser
 
 
 def _extract_symbols_and_references(
@@ -3403,6 +3435,7 @@ __all__ = [
     "main",
     "outline",
     "outline_text",
+    "refresh_async",
     "refs",
     "search",
     "search_text",

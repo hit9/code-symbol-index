@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import code_symbol_index
@@ -37,6 +38,25 @@ value = helper()
     assert inspection.definition == helper
     assert any("return helper()" in reference.context for reference in inspection.references)
     assert "def helper" in (inspection.source_preview or "")
+
+
+def test_parsers_are_thread_local() -> None:
+    main_parser = code_symbol_index._parser_for_language("python")
+    assert code_symbol_index._parser_for_language("python") is main_parser
+
+    worker_parser_ids = []
+
+    def load_parser() -> None:
+        parser = code_symbol_index._parser_for_language("python")
+        assert code_symbol_index._parser_for_language("python") is parser
+        worker_parser_ids.append(id(parser))
+
+    thread = threading.Thread(target=load_parser)
+    thread.start()
+    thread.join()
+
+    assert worker_parser_ids
+    assert worker_parser_ids[0] != id(main_parser)
 
 
 def test_indexes_javascript_symbols(tmp_path: Path) -> None:
@@ -148,6 +168,27 @@ def test_top_level_update_removes_deleted_paths(tmp_path: Path) -> None:
     code_symbol_index.update(source, root=tmp_path)
 
     assert not code_symbol_index.search("removed_name", root=tmp_path)
+
+
+def test_refresh_async_indexes_in_background(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(code_symbol_index, "MAX_WORKERS", 1)
+    (tmp_path / "app.py").write_text("def async_target():\n    pass\n", encoding="utf-8")
+    events: list[tuple[str, int, int, str | None]] = []
+
+    def record(event: str, *, done: int = 0, total: int = 0, path: str | None = None) -> None:
+        events.append((event, done, total, path))
+
+    thread = code_symbol_index.refresh_async(tmp_path, progress=record)
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert code_symbol_index.search("async_target", root=tmp_path)
+    assert events == [
+        ("scan", 0, 0, None),
+        ("start", 0, 1, None),
+        ("file", 1, 1, "app.py"),
+        ("finish", 1, 1, None),
+    ]
 
 
 def test_repository_refresh_progress_callback(tmp_path: Path, monkeypatch) -> None:
