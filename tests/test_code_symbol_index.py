@@ -40,6 +40,35 @@ value = helper()
     assert "def helper" in (inspection.source_preview or "")
 
 
+def test_indexes_python_top_level_constants_and_dict_keys(tmp_path: Path, capsys) -> None:
+    (tmp_path / "settings.py").write_text(
+        "MODEL_NAME = 'ask-syft'\n"
+        "SETTINGS = {\n"
+        "    'endpoint': '/ask',\n"
+        "    'retry_count': 3,\n"
+        "}\n"
+        "\n"
+        "def load_settings():\n"
+        "    return SETTINGS\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+
+    constant = code_symbol_index.search("MODEL_NAME", root=tmp_path, kind="constant", exact_only=True)
+    dict_key = code_symbol_index.search("endpoint", root=tmp_path, kind="dict_key", exact_only=True)
+    outline = code_symbol_index.outline_text("settings.py", root=tmp_path)
+    cli_exit = main(["search", "retry_count", "--root", str(tmp_path), "--kind", "dict_key", "--exact-only", "--json"])
+    cli_output = json.loads(capsys.readouterr().out)
+
+    assert constant[0].signature == "MODEL_NAME = 'ask-syft'"
+    assert dict_key[0].container == "SETTINGS"
+    assert dict_key[0].signature == "'endpoint': '/ask'"
+    assert "| MODEL_NAME = 'ask-syft'" in outline
+    assert "| 'endpoint': '/ask'" in outline
+    assert cli_exit == 0
+    assert cli_output["symbols"][0]["name"] == "retry_count"
+
+
 def test_parsers_are_thread_local() -> None:
     main_parser = code_symbol_index._parser_for_language("python")
     assert code_symbol_index._parser_for_language("python") is main_parser
@@ -518,6 +547,75 @@ def test_top_level_api_search_text_is_llm_friendly(tmp_path: Path) -> None:
     assert "source:" not in output
 
 
+def test_search_filters_kind_path_exact_and_pipe_queries(tmp_path: Path) -> None:
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "tools.py").write_text(
+        "class Tool:\n"
+        "    pass\n"
+        "\n"
+        "class ToolRunner:\n"
+        "    pass\n"
+        "\n"
+        "def build_tool():\n"
+        "    return Tool()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "other.py").write_text(
+        "class Tool:\n"
+        "    pass\n"
+        "\n"
+        "def helper():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+
+    exact = code_symbol_index.search("Tool", root=tmp_path, path="pkg", kind="class", exact_only=True)
+    fuzzy = code_symbol_index.search("Tool", root=tmp_path, path="pkg", kind="class")
+    combined = code_symbol_index.search("Tool|helper", root=tmp_path, kind=("class", "function"))
+
+    assert [symbol.name for symbol in exact] == ["Tool"]
+    assert [symbol.name for symbol in fuzzy[:2]] == ["Tool", "ToolRunner"]
+    assert {symbol.name for symbol in combined} >= {"Tool", "helper"}
+
+
+def test_cli_search_filters_kind_path_exact(tmp_path: Path, capsys) -> None:
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "tools.py").write_text(
+        "class Tool:\n"
+        "    pass\n"
+        "\n"
+        "class ToolRunner:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "other.py").write_text("class Tool:\n    pass\n", encoding="utf-8")
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "search",
+            "Tool",
+            "--root",
+            str(tmp_path),
+            "--kind",
+            "class",
+            "--path",
+            "pkg",
+            "--exact-only",
+            "--json",
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert [symbol["name"] for symbol in output["symbols"]] == ["Tool"]
+    assert output["symbols"][0]["path"] == "pkg/tools.py"
+
+
 def test_top_level_api_format_parameter(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("def target_tool():\n    return 1\n", encoding="utf-8")
     code_symbol_index.index(tmp_path)
@@ -607,6 +705,35 @@ def test_outline_text_uses_indexed_signatures_when_file_changes(tmp_path: Path) 
     assert "changed after indexing" not in output
 
 
+def test_outline_supports_local_symbol_filter_for_api_and_cli(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(
+        """
+class Tool:
+    def cli_args(cls, args):
+        return args
+
+class Agent:
+    def run(self):
+        return Tool()
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+
+    api_output = code_symbol_index.outline_text("app.py", root=tmp_path, symbol="Tool")
+    cli_exit = main(["outline", "app.py", "--root", str(tmp_path), "--symbol", "Tool"])
+    cli_output = capsys.readouterr().out
+
+    assert "symbol: Tool" in api_output
+    assert "class Tool:" in api_output
+    assert "def cli_args" in api_output
+    assert "class Agent:" not in api_output
+    assert cli_exit == 0
+    assert "symbol: Tool" in cli_output
+    assert "class Agent:" not in cli_output
+
+
 def test_inspect_text_outputs_llm_friendly_source(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text(
         """
@@ -632,6 +759,43 @@ def helper():
     assert "  1 |    def handle(self):" in output
     assert "  2 |        return helper()" in output
     assert "callees:" in output
+
+
+def test_inspect_includes_imports_for_api_and_cli_json(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "\n"
+        "def helper():\n"
+        "    return Path(os.getcwd())\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+
+    text_output = code_symbol_index.inspect_text("helper", root=tmp_path)
+    json_exit = main(["inspect", "helper", "--root", str(tmp_path), "--json"])
+    json_output = json.loads(capsys.readouterr().out)
+
+    assert "summary:" in text_output
+    assert "imports: 2" in text_output
+    assert "statement: import os" in text_output
+    assert "statement: from pathlib import Path" in text_output
+    assert json_exit == 0
+    assert [item["statement"] for item in json_output["imports"]] == ["import os", "from pathlib import Path"]
+
+
+def test_inspect_callees_ignore_nested_symbol_definitions(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        "class Tool:\n"
+        "    def run(self):\n"
+        "        return 1\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+
+    output = code_symbol_index.inspect_text("Tool", root=tmp_path)
+
+    assert "callees:\n  []" in output
 
 
 def test_inspect_text_handles_invalid_not_found_and_ambiguous(tmp_path: Path) -> None:
@@ -968,6 +1132,7 @@ def test_status_reports_missing_ready_and_stale(tmp_path: Path) -> None:
     assert fast_after_change.pending_changes == "unknown"
     assert stale.status == "stale"
     assert stale.pending_changes == 1
+    assert stale.pending_files == ("app.py",)
     assert stale.reason == "files changed after last index update"
 
 
@@ -988,6 +1153,27 @@ def test_status_text_is_readable(tmp_path: Path) -> None:
     assert "- python: 1 files (100.0%)" in output
     assert "pending_changes: unknown" in output
     assert "pending_changes: 0" in checked_output
+
+
+def test_status_reports_bounded_pending_files_for_api_and_cli(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("def first():\n    pass\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+    source.write_text("def second():\n    pass\n", encoding="utf-8")
+    (tmp_path / "new.py").write_text("def new_file():\n    pass\n", encoding="utf-8")
+
+    status = code_symbol_index.status(tmp_path, check=True, max_pending_files=1)
+    text = code_symbol_index.status_text(tmp_path, check=True, max_pending_files=2)
+    json_exit = main(["status", "--root", str(tmp_path), "--check", "--max-pending-files", "2", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert status.status == "stale"
+    assert status.pending_changes == 2
+    assert len(status.pending_files) == 1
+    assert "pending_files:" in text
+    assert json_exit == 0
+    assert payload["pending_changes"] == 2
+    assert set(payload["pending_files"]) == {"app.py", "new.py"}
 
 
 def test_cli_status_defaults_to_text_and_supports_json(tmp_path: Path, capsys) -> None:

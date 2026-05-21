@@ -72,6 +72,7 @@ Search symbols:
 ```bash
 code-symbol-index search Tool --root /path/to/repo --limit 20
 code-symbol-index search Tool Agent Runner --root /path/to/repo
+code-symbol-index search Tool --root /path/to/repo --kind class,function --path src --exact-only
 ```
 
 Inspect one symbol:
@@ -85,6 +86,7 @@ Outline a file:
 
 ```bash
 code-symbol-index outline src/app.py --root /path/to/repo
+code-symbol-index outline src/app.py --root /path/to/repo --symbol Tool
 ```
 
 ## CLI
@@ -96,10 +98,14 @@ code-symbol-index version
 code-symbol-index index --root /path/to/repo
 code-symbol-index status --root /path/to/repo
 code-symbol-index status --root /path/to/repo --check
+code-symbol-index status --root /path/to/repo --check --max-pending-files 20
 code-symbol-index search Tool --root /path/to/repo
 code-symbol-index search Tool Agent Runner --root /path/to/repo
+code-symbol-index search Tool --root /path/to/repo --kind class,function --path src --exact-only
 code-symbol-index inspect Tool --root /path/to/repo
+code-symbol-index inspect Tool --root /path/to/repo --path src --exact-only
 code-symbol-index outline src/app.py --root /path/to/repo
+code-symbol-index outline src/app.py --root /path/to/repo --symbol Tool
 code-symbol-index refs Tool --root /path/to/repo --limit 20 --offset 0
 code-symbol-index impls Greeter --root /path/to/repo --kind trait --limit 20 --offset 0
 code-symbol-index clean --root /path/to/repo
@@ -169,6 +175,16 @@ symbol:
   file: src/app.py
   range: 120:123
   signature: def foo():
+summary:
+  imports: 2
+  members: 0
+  callers: 1
+  callees: 1
+  references: 3
+  implementors: 0
+imports:
+  - range: 0:1
+    statement: import os
 source:
   status: full
   range: 120:123
@@ -218,8 +234,14 @@ index:
   files: 128
   symbols: 4820
   pending_changes: 3
+  pending_files:
+    - src/app.py
+    - src/new_feature.py
   reason: files changed after last index update
 ```
+
+`pending_files` is bounded by `--max-pending-files` and is only computed with
+`--check`.
 
 ## Query Rules
 
@@ -233,6 +255,15 @@ index:
 It rejects natural language, file paths, and directory paths. Use `outline` for
 file paths.
 
+`search` accepts `A|B|C` as a non-regex OR shorthand. `--kind` accepts one kind
+or comma-separated kinds, `--path` filters to a file or directory, and
+`--exact-only` disables prefix/fuzzy matches. The same filters are available in
+the Python API as `kind=`, `path=`, and `exact_only=True`.
+
+Python indexes top-level constants, top-level variables, and top-level
+dictionary keys as symbols. Dictionary keys use `kind=dict_key` and the parent
+assignment as `container`.
+
 All line ranges are `start:end`, 0-based, with `end` exclusive.
 
 ## Python API
@@ -245,8 +276,11 @@ csi.update(["src/app.py", "src/lib.py"], root="/path/to/repo")
 
 print(csi.status_text("/path/to/repo"))
 print(csi.search_text("Tool", root="/path/to/repo"))
+print(csi.search_text("Tool|Agent", root="/path/to/repo", kind="class,function", path="src"))
 print(csi.inspect_text("Tool", root="/path/to/repo"))
+print(csi.inspect_text("Tool", root="/path/to/repo", path="src", exact_only=True))
 print(csi.outline_text("src/app.py", root="/path/to/repo"))
+print(csi.outline_text("src/app.py", root="/path/to/repo", symbol="Tool"))
 
 symbols = csi.search("Tool", root="/path/to/repo", format="object")
 symbols = csi.search(["Tool", "Agent", "Runner"], root="/path/to/repo")
@@ -312,9 +346,10 @@ Top-level query APIs accept `format="object" | "text" | "json"`:
 - `text` returns the same readable format as the `*_text` helpers.
 - `json` returns JSON-safe Python dict/list data.
 
-`search` accepts one query or a list of symbol names/prefixes. Multiple queries
-are OR-ed, are not regexes, and share one total `limit`. Search text and JSON
-formats include `has_more` when more matches exist beyond `limit`.
+`search` accepts one query, `A|B|C`, or a list of symbol names/prefixes.
+Multiple queries are OR-ed, are not regexes, and share one total `limit`.
+Search text and JSON formats include `has_more` when more matches exist beyond
+`limit`.
 
 ## Development
 
@@ -334,19 +369,19 @@ Index lifecycle:
 - `refresh_async(root=".", *, language=None, db_path=None, progress=None, daemon=True) -> threading.Thread`
 - `install_skill(*, target="codex", codex_home=None, force=False) -> Path`
 - `clean(root=".") -> None`
-- `status(root=".", *, language=None, db_path=None, check=False, format="object") -> IndexStatus | str | dict`
-- `status_text(root=".", *, language=None, db_path=None, check=False) -> str`
+- `status(root=".", *, language=None, db_path=None, check=False, max_pending_files=50, format="object") -> IndexStatus | str | dict`
+- `status_text(root=".", *, language=None, db_path=None, check=False, max_pending_files=50) -> str`
 
 Queries:
 
-- `search(query: str | list[str], *, root=".", kind=None, language=None, limit=20, sync=False, format="object") -> list[Symbol] | str | dict`
-- `search_text(query: str | list[str], *, root=".", kind=None, language=None, limit=20, sync=False) -> str`
-- `inspect(query, *, root=".", kind=None, language=None, limit=20, sync=False, format="object", ...) -> Inspection | str | dict`
-- `inspect_text(query, *, root=".", kind=None, language=None, sync=False, ...) -> str`
-- `refs(query, *, root=".", kind=None, language=None, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
-- `impls(query, *, root=".", kind=None, language=None, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
-- `outline(path, *, root=".", max_symbols=200, sync=False, format="object") -> Page | str | dict`
-- `outline_text(path, *, root=".", max_symbols=200, sync=False) -> str`
+- `search(query: str | list[str], *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, sync=False, format="object") -> list[Symbol] | str | dict`
+- `search_text(query: str | list[str], *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, sync=False) -> str`
+- `inspect(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, sync=False, format="object", ...) -> Inspection | str | dict`
+- `inspect_text(query, *, root=".", kind=None, language=None, path=None, exact_only=False, sync=False, ...) -> str`
+- `refs(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
+- `impls(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
+- `outline(path, *, root=".", symbol=None, max_symbols=200, sync=False, format="object") -> Page | str | dict`
+- `outline_text(path, *, root=".", symbol=None, max_symbols=200, sync=False) -> str`
 
 Repository handle:
 

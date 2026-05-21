@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.7 - 2026-05-21
+
+### Added
+
+- Added symbol search filters for kind, path, and exact-only matching in CLI and API.
+- Added bounded pending file lists to checked index status.
+- Added local file outlines with `outline --symbol` and `symbol=` in the API.
+- Added import summaries to inspect output.
+- Added Python top-level constants, variables, and dictionary keys to the symbol index.
+
+### Changed
+
+- Bumped the index schema so existing indexes are refreshed for the new Python symbols.
+
 ## 0.1.6 - 2026-05-21
 
 ### Added

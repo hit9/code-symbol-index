@@ -21,8 +21,8 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.6"
-SCHEMA_VERSION = 3
+__version__ = "0.1.7"
+SCHEMA_VERSION = 4
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
 TEXT_SAMPLE_BYTES = 8192
@@ -40,7 +40,9 @@ DEFAULT_MAX_CALLERS = 50
 DEFAULT_MAX_CALLEES = 50
 DEFAULT_MAX_REFERENCES = 50
 DEFAULT_MAX_IMPLEMENTORS = 50
+DEFAULT_MAX_IMPORTS = 40
 DEFAULT_MAX_OUTLINE_SYMBOLS = 200
+DEFAULT_MAX_PENDING_FILES = 50
 MAX_INSPECT_CANDIDATES = 20
 SYMBOL_QUERY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
 API_FORMATS = ("object", "text", "json")
@@ -65,10 +67,14 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
    `code-symbol-index index --root <repo>`
 3. Search symbols by exact name or prefix:
    `code-symbol-index search Tool Agent --root <repo> --limit 20`
+   Use filters when needed:
+   `code-symbol-index search Tool --root <repo> --kind class,function --path src --exact-only`
 4. Inspect a symbol:
    `code-symbol-index inspect Tool --root <repo>`
 5. Outline a file:
    `code-symbol-index outline src/app.py --root <repo>`
+   For a local class/function outline:
+   `code-symbol-index outline src/app.py --root <repo> --symbol Tool`
 6. Find references or implementation candidates:
    `code-symbol-index refs Tool --root <repo>`
    `code-symbol-index impls Greeter --root <repo>`
@@ -191,6 +197,13 @@ class Reference:
 
 
 @dataclass(frozen=True, slots=True)
+class ImportItem:
+    path: Path
+    range: Range
+    statement: str
+
+
+@dataclass(frozen=True, slots=True)
 class Page:
     items: tuple[Any, ...]
     limit: int
@@ -216,6 +229,7 @@ class Inspection:
     definition: Symbol
     references: tuple[Reference, ...]
     implementations: tuple[Symbol, ...]
+    imports: tuple[ImportItem, ...] = ()
     doc: str | None = None
     source_preview: str | None = None
     confidence: str = "medium"
@@ -234,6 +248,7 @@ class InspectOptions:
     max_callees: int = DEFAULT_MAX_CALLEES
     max_references: int = DEFAULT_MAX_REFERENCES
     max_implementors: int = DEFAULT_MAX_IMPLEMENTORS
+    max_imports: int = DEFAULT_MAX_IMPORTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +261,7 @@ class IndexStatus:
     language_breakdown: tuple[dict[str, Any], ...] = ()
     updated_at: str | None = None
     pending_changes: int | str | None = None
+    pending_files: tuple[str, ...] = ()
     reason: str | None = None
     message: str | None = None
 
@@ -481,14 +497,18 @@ class CodeIndex:
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> list[Symbol]:
         return self.storage.search_symbols(
             query,
             kind=kind,
             language=language,
+            path=path,
+            exact_only=exact_only,
             limit=limit,
         )
 
@@ -496,139 +516,179 @@ class CodeIndex:
         self,
         query: str | Iterable[str],
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> list[Symbol]:
-        return list(self.search_page(query, kind=kind, language=language, limit=limit).items)
+        return list(self.search_page(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit).items)
 
     def search_page(
         self,
         query: str | Iterable[str],
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> Page:
-        return _search_page(self, query, kind=kind, language=language, limit=limit)
+        return _search_page(self, query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit)
 
     def best_symbol(
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
     ) -> Symbol:
-        return self._resolve_symbol(query, kind=kind, language=language)
+        return self._resolve_symbol(query, kind=kind, language=language, path=path, exact_only=exact_only)
 
     def inspect(
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
     ) -> Inspection:
-        return self._inspect(_resolve_inspect_symbol(self, query, kind=kind, language=language), limit=limit)
+        return self._inspect(
+            _resolve_inspect_symbol(self, query, kind=kind, language=language, path=path, exact_only=exact_only),
+            limit=limit,
+        )
 
     def refs(
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
     ) -> Page:
-        return self.find_references(query, kind=kind, language=language, limit=limit, offset=offset)
+        return self.find_references(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit, offset=offset)
 
     def impls(
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
     ) -> Page:
-        return self.find_implementations(query, kind=kind, language=language, limit=limit, offset=offset)
+        return self.find_implementations(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit, offset=offset)
 
     def inspect_symbol(
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
     ) -> Inspection:
-        return self._inspect(_resolve_inspect_symbol(self, query, kind=kind, language=language), limit=limit)
+        return self._inspect(
+            _resolve_inspect_symbol(self, query, kind=kind, language=language, path=path, exact_only=exact_only),
+            limit=limit,
+        )
 
     def inspect_text(
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         options: InspectOptions | None = None,
     ) -> str:
-        return _inspect_text(self, query, kind=kind, language=language, options=options or InspectOptions())
+        return _inspect_text(
+            self,
+            query,
+            kind=kind,
+            language=language,
+            path=path,
+            exact_only=exact_only,
+            options=options or InspectOptions(),
+        )
 
     def search_text(
         self,
         query: str | Iterable[str],
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> str:
         queries = _coerce_queries(query)
         return _format_search_text(
             self,
             queries,
-            self.search_page(queries, kind=kind, language=language, limit=limit),
+            self.search_page(queries, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit),
         )
 
     def outline(
         self,
         path: str | Path,
         *,
+        symbol: str | None = None,
         max_symbols: int = DEFAULT_MAX_OUTLINE_SYMBOLS,
     ) -> Page:
         relative_path = self._relative_path(Path(path))
         symbols = self.storage.symbols_in_file(relative_path)
+        if symbol is not None:
+            symbols = _local_outline_symbols(self, symbols, symbol)
         return _page_from_extra(symbols[: max_symbols + 1], limit=max_symbols, offset=0)
 
     def outline_text(
         self,
         path: str | Path,
         *,
+        symbol: str | None = None,
         max_symbols: int = DEFAULT_MAX_OUTLINE_SYMBOLS,
     ) -> str:
         relative_path = self._relative_path(Path(path))
-        return _format_outline_text(self, relative_path, self.outline(relative_path, max_symbols=max_symbols))
+        return _format_outline_text(self, relative_path, self.outline(relative_path, symbol=symbol, max_symbols=max_symbols), symbol=symbol)
 
     def find_references(
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
     ) -> Page:
-        symbol = self._resolve_symbol(query, kind=kind, language=language)
+        symbol = self._resolve_symbol(query, kind=kind, language=language, path=path, exact_only=exact_only)
         return self.storage.references_for(symbol, limit=limit, offset=offset)
 
     def find_implementations(
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
     ) -> Page:
-        symbol = self._resolve_symbol(query, kind=kind, language=language)
+        symbol = self._resolve_symbol(query, kind=kind, language=language, path=path, exact_only=exact_only)
         return self.storage.implementation_candidates(symbol, limit=limit, offset=offset)
 
     def _inspect(self, symbol: Symbol, *, limit: int = DEFAULT_PAGE_LIMIT) -> Inspection:
@@ -640,6 +700,7 @@ class CodeIndex:
             definition=symbol,
             references=references.items,
             implementations=implementations.items,
+            imports=_imports_for_file(self, symbol.path, limit=DEFAULT_MAX_IMPORTS),
             source_preview=preview,
             confidence="medium" if implementations else "low",
             references_has_more=references.has_more,
@@ -652,14 +713,16 @@ class CodeIndex:
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
     ) -> Symbol:
         symbol = self.storage.get_symbol(query)
         if symbol is not None:
             return symbol
 
-        matches = self.search_symbols(query, kind=kind, language=language, limit=1)
+        matches = self.search_symbols(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=1)
         if matches:
             return matches[0]
         raise SymbolNotFoundError(f"No symbol matched: {query}")
@@ -906,22 +969,26 @@ class Repository(CodeIndex):
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> list[Symbol]:
-        return super().search_symbols(query, kind=kind, language=language, limit=limit)
+        return super().search_symbols(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit)
 
     def find_references(
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
     ) -> Page:
-        symbol = self._resolve_symbol(query, kind=kind, language=language)
+        symbol = self._resolve_symbol(query, kind=kind, language=language, path=path, exact_only=exact_only)
         return self._references_for_symbol(symbol, limit=limit, offset=offset)
 
     def _inspect(self, symbol: Symbol, *, limit: int = DEFAULT_PAGE_LIMIT) -> Inspection:
@@ -933,6 +1000,7 @@ class Repository(CodeIndex):
             definition=symbol,
             references=references.items,
             implementations=implementations.items,
+            imports=_imports_for_file(self, symbol.path, limit=DEFAULT_MAX_IMPORTS),
             source_preview=preview,
             confidence="medium" if implementations else "low",
             references_has_more=references.has_more,
@@ -996,8 +1064,10 @@ def search(
     query: str | Iterable[str],
     *,
     root: str | Path = ".",
-    kind: str | None = None,
+    kind: str | Iterable[str] | None = None,
     language: str | None = None,
+    path: str | Path | Iterable[str | Path] | None = None,
+    exact_only: bool = False,
     limit: int = DEFAULT_SEARCH_LIMIT,
     sync: bool = False,
     format: str = "object",
@@ -1007,7 +1077,7 @@ def search(
     if sync:
         repo.refresh()
     queries = _coerce_queries(query)
-    page = repo.search_page(queries, kind=kind, language=language, limit=limit)
+    page = repo.search_page(queries, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit)
     if output_format == "object":
         return list(page.items)
     if output_format == "text":
@@ -1019,21 +1089,24 @@ def search_text(
     query: str | Iterable[str],
     *,
     root: str | Path = ".",
-    kind: str | None = None,
+    kind: str | Iterable[str] | None = None,
     language: str | None = None,
+    path: str | Path | Iterable[str | Path] | None = None,
+    exact_only: bool = False,
     limit: int = DEFAULT_SEARCH_LIMIT,
     sync: bool = False,
 ) -> str:
     repo = Repository(root, languages=_languages_filter(language))
     if sync:
         repo.refresh()
-    return repo.search_text(query, kind=kind, language=language, limit=limit)
+    return repo.search_text(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit)
 
 
 def outline(
     path: str | Path,
     *,
     root: str | Path = ".",
+    symbol: str | None = None,
     max_symbols: int = DEFAULT_MAX_OUTLINE_SYMBOLS,
     sync: bool = False,
     format: str = "object",
@@ -1042,12 +1115,12 @@ def outline(
     repo = Repository(root)
     if sync:
         repo.refresh()
-    page = repo.outline(path, max_symbols=max_symbols)
+    page = repo.outline(path, symbol=symbol, max_symbols=max_symbols)
     if output_format == "object":
         return page
     if output_format == "text":
         relative_path = repo._relative_path(Path(path))
-        return _format_outline_text(repo, relative_path, page)
+        return _format_outline_text(repo, relative_path, page, symbol=symbol)
     return _to_jsonable(page)
 
 
@@ -1055,35 +1128,40 @@ def outline_text(
     path: str | Path,
     *,
     root: str | Path = ".",
+    symbol: str | None = None,
     max_symbols: int = DEFAULT_MAX_OUTLINE_SYMBOLS,
     sync: bool = False,
 ) -> str:
     repo = Repository(root)
     if sync:
         repo.refresh()
-    return repo.outline_text(path, max_symbols=max_symbols)
+    return repo.outline_text(path, symbol=symbol, max_symbols=max_symbols)
 
 
 def best_symbol(
     query: str,
     *,
     root: str | Path = ".",
-    kind: str | None = None,
+    kind: str | Iterable[str] | None = None,
     language: str | None = None,
+    path: str | Path | Iterable[str | Path] | None = None,
+    exact_only: bool = False,
     sync: bool = False,
 ) -> Symbol:
     repo = Repository(root, languages=_languages_filter(language))
     if sync:
         repo.refresh()
-    return repo.best_symbol(query, kind=kind, language=language)
+    return repo.best_symbol(query, kind=kind, language=language, path=path, exact_only=exact_only)
 
 
 def inspect(
     query: str,
     *,
     root: str | Path = ".",
-    kind: str | None = None,
+    kind: str | Iterable[str] | None = None,
     language: str | None = None,
+    path: str | Path | Iterable[str | Path] | None = None,
+    exact_only: bool = False,
     limit: int = DEFAULT_PAGE_LIMIT,
     sync: bool = False,
     format: str = "object",
@@ -1094,6 +1172,7 @@ def inspect(
     max_callees: int = DEFAULT_MAX_CALLEES,
     max_references: int = DEFAULT_MAX_REFERENCES,
     max_implementors: int = DEFAULT_MAX_IMPLEMENTORS,
+    max_imports: int = DEFAULT_MAX_IMPORTS,
 ) -> Any:
     output_format = _validate_api_format(format)
     repo = Repository(root, languages=_languages_filter(language))
@@ -1104,6 +1183,8 @@ def inspect(
             query,
             kind=kind,
             language=language,
+            path=path,
+            exact_only=exact_only,
             options=InspectOptions(
                 max_source_chars=max_source_chars,
                 max_total_chars=max_total_chars,
@@ -1112,9 +1193,10 @@ def inspect(
                 max_callees=max_callees,
                 max_references=max_references,
                 max_implementors=max_implementors,
+                max_imports=max_imports,
             ),
         )
-    inspection = repo.inspect(query, kind=kind, language=language, limit=limit)
+    inspection = repo.inspect(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit)
     if output_format == "object":
         return inspection
     return _to_jsonable(inspection)
@@ -1124,8 +1206,10 @@ def inspect_text(
     query: str,
     *,
     root: str | Path = ".",
-    kind: str | None = None,
+    kind: str | Iterable[str] | None = None,
     language: str | None = None,
+    path: str | Path | Iterable[str | Path] | None = None,
+    exact_only: bool = False,
     max_source_chars: int = DEFAULT_MAX_SOURCE_CHARS,
     max_total_chars: int = DEFAULT_MAX_TOTAL_CHARS,
     max_members: int = DEFAULT_MAX_MEMBERS,
@@ -1133,6 +1217,7 @@ def inspect_text(
     max_callees: int = DEFAULT_MAX_CALLEES,
     max_references: int = DEFAULT_MAX_REFERENCES,
     max_implementors: int = DEFAULT_MAX_IMPLEMENTORS,
+    max_imports: int = DEFAULT_MAX_IMPORTS,
     sync: bool = False,
 ) -> str:
     repo = Repository(root, languages=_languages_filter(language))
@@ -1142,6 +1227,8 @@ def inspect_text(
         query,
         kind=kind,
         language=language,
+        path=path,
+        exact_only=exact_only,
         options=InspectOptions(
             max_source_chars=max_source_chars,
             max_total_chars=max_total_chars,
@@ -1150,6 +1237,7 @@ def inspect_text(
             max_callees=max_callees,
             max_references=max_references,
             max_implementors=max_implementors,
+            max_imports=max_imports,
         ),
     )
 
@@ -1158,8 +1246,10 @@ def refs(
     query: str,
     *,
     root: str | Path = ".",
-    kind: str | None = None,
+    kind: str | Iterable[str] | None = None,
     language: str | None = None,
+    path: str | Path | Iterable[str | Path] | None = None,
+    exact_only: bool = False,
     limit: int = DEFAULT_PAGE_LIMIT,
     offset: int = 0,
     sync: bool = False,
@@ -1169,7 +1259,7 @@ def refs(
     repo = Repository(root, languages=_languages_filter(language))
     if sync:
         repo.refresh()
-    page = repo.refs(query, kind=kind, language=language, limit=limit, offset=offset)
+    page = repo.refs(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit, offset=offset)
     if output_format == "object":
         return page
     if output_format == "text":
@@ -1181,8 +1271,10 @@ def impls(
     query: str,
     *,
     root: str | Path = ".",
-    kind: str | None = None,
+    kind: str | Iterable[str] | None = None,
     language: str | None = None,
+    path: str | Path | Iterable[str | Path] | None = None,
+    exact_only: bool = False,
     limit: int = DEFAULT_PAGE_LIMIT,
     offset: int = 0,
     sync: bool = False,
@@ -1192,7 +1284,7 @@ def impls(
     repo = Repository(root, languages=_languages_filter(language))
     if sync:
         repo.refresh()
-    page = repo.impls(query, kind=kind, language=language, limit=limit, offset=offset)
+    page = repo.impls(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit, offset=offset)
     if output_format == "object":
         return page
     if output_format == "text":
@@ -1206,6 +1298,7 @@ def status(
     language: str | None = None,
     db_path: str | Path | None = None,
     check: bool = False,
+    max_pending_files: int = DEFAULT_MAX_PENDING_FILES,
     format: str = "object",
 ) -> Any:
     output_format = _validate_api_format(format)
@@ -1216,6 +1309,7 @@ def status(
         exclude=(),
         db_path=Path(db_path) if db_path is not None else None,
         check=check,
+        max_pending_files=max_pending_files,
     )
     if output_format == "object":
         return index_status
@@ -1230,8 +1324,11 @@ def status_text(
     language: str | None = None,
     db_path: str | Path | None = None,
     check: bool = False,
+    max_pending_files: int = DEFAULT_MAX_PENDING_FILES,
 ) -> str:
-    return _format_status_text(status(root, language=language, db_path=db_path, check=check))
+    return _format_status_text(
+        status(root, language=language, db_path=db_path, check=check, max_pending_files=max_pending_files)
+    )
 
 
 def index(
@@ -1565,20 +1662,23 @@ class _Storage:
         self,
         query: str,
         *,
-        kind: str | None = None,
+        kind: str | Iterable[str] | None = None,
         language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
         limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> list[Symbol]:
         if limit <= 0:
             return []
 
         normalized_query = query.strip()
-        if normalized_query and self.has_symbol_fts and len(normalized_query) >= 3:
+        if normalized_query and not exact_only and self.has_symbol_fts and len(normalized_query) >= 3:
             try:
                 rows = self._search_symbols_fts(
                     normalized_query,
                     kind=kind,
                     language=language,
+                    path=path,
                     limit=limit,
                 )
                 return [_symbol_from_row(row) for row in rows]
@@ -1589,6 +1689,8 @@ class _Storage:
             normalized_query,
             kind=kind,
             language=language,
+            path=path,
+            exact_only=exact_only,
             limit=limit,
         )
 
@@ -1596,18 +1698,24 @@ class _Storage:
         self,
         query: str,
         *,
-        kind: str | None,
+        kind: str | Iterable[str] | None,
         language: str | None,
+        path: str | Path | Iterable[str | Path] | None,
         limit: int,
     ) -> list[sqlite3.Row]:
         clauses = []
         values: list[object] = [f"name : {_escape_fts_query(query)}"]
-        if kind is not None:
-            clauses.append("symbols.kind = ?")
-            values.append(kind)
+        kind_clause, kind_values = _sql_in_clause("symbols.kind", _coerce_filter_values(kind))
+        if kind_clause:
+            clauses.append(kind_clause)
+            values.extend(kind_values)
         if language is not None:
             clauses.append("symbols.language = ?")
             values.append(language)
+        path_clause, path_values = _path_filter_clause("symbols.path", path)
+        if path_clause:
+            clauses.append(path_clause)
+            values.extend(path_values)
 
         filters = " AND ".join(["symbol_fts MATCH ?", *clauses])
         values.extend([query, f"{_escape_like(query)}%", limit])
@@ -1633,25 +1741,36 @@ class _Storage:
         self,
         query: str,
         *,
-        kind: str | None,
+        kind: str | Iterable[str] | None,
         language: str | None,
+        path: str | Path | Iterable[str | Path] | None,
+        exact_only: bool,
         limit: int,
     ) -> list[Symbol]:
         clauses = []
         values: list[object] = []
         if query:
-            clauses.append("name COLLATE NOCASE LIKE ? ESCAPE '\\'")
-            values.append(f"%{_escape_like(query)}%")
-        if kind is not None:
-            clauses.append("kind = ?")
-            values.append(kind)
+            if exact_only:
+                clauses.append("name COLLATE NOCASE = ?")
+                values.append(query)
+            else:
+                clauses.append("name COLLATE NOCASE LIKE ? ESCAPE '\\'")
+                values.append(f"%{_escape_like(query)}%")
+        kind_clause, kind_values = _sql_in_clause("kind", _coerce_filter_values(kind))
+        if kind_clause:
+            clauses.append(kind_clause)
+            values.extend(kind_values)
         if language is not None:
             clauses.append("language = ?")
             values.append(language)
+        path_clause, path_values = _path_filter_clause("path", path)
+        if path_clause:
+            clauses.append(path_clause)
+            values.extend(path_values)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         order_values: list[object] = []
-        if query:
+        if query and not exact_only:
             order_sql = """
                 CASE
                     WHEN name COLLATE NOCASE = ? THEN 0
@@ -1843,6 +1962,7 @@ class _Storage:
                 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
                 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
                 CREATE INDEX IF NOT EXISTS idx_symbols_language ON symbols(language);
+                CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path);
                 CREATE INDEX IF NOT EXISTS idx_files_language_path ON files(language, path);
                 CREATE INDEX IF NOT EXISTS idx_symbols_name_nocase ON symbols(name COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_symbols_language_kind ON symbols(language, kind);
@@ -1919,9 +2039,9 @@ def _emit_progress(
 
 def _coerce_queries(query: str | Iterable[str]) -> tuple[str, ...]:
     if isinstance(query, str):
-        queries = (query,)
+        queries = tuple(query.split("|"))
     else:
-        queries = tuple(query)
+        queries = tuple(part for item in query for part in str(item).split("|"))
     return tuple(item for item in (value.strip() for value in queries) if item)
 
 
@@ -1929,6 +2049,58 @@ def _coerce_paths(paths: str | Path | Iterable[str | Path]) -> tuple[Path, ...]:
     if isinstance(paths, (str, Path)):
         return (Path(paths),)
     return tuple(Path(path) for path in paths)
+
+
+def _coerce_filter_values(value: str | Iterable[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw_values = value.split(",")
+    else:
+        raw_values = [part for item in value for part in str(item).split(",")]
+    return tuple(item for item in (raw.strip() for raw in raw_values) if item)
+
+
+def _sql_in_clause(column: str, values: tuple[str, ...]) -> tuple[str, list[object]]:
+    if not values:
+        return "", []
+    if len(values) == 1:
+        return f"{column} = ?", [values[0]]
+    placeholders = ",".join("?" for _ in values)
+    return f"{column} IN ({placeholders})", list(values)
+
+
+def _path_filter_values(path: str | Path | Iterable[str | Path] | None) -> tuple[str, ...]:
+    if path is None:
+        return ()
+    if isinstance(path, (str, Path)):
+        raw_values = str(path).split(",")
+    else:
+        raw_values = [part for item in path for part in str(item).split(",")]
+    normalized = (_normalize_filter_path(item) for item in raw_values if item.strip())
+    return tuple(item for item in normalized if item)
+
+
+def _normalize_filter_path(path: str) -> str:
+    normalized = Path(path.strip()).as_posix().strip("/")
+    return "" if normalized == "." else normalized
+
+
+def _path_filter_clause(column: str, path: str | Path | Iterable[str | Path] | None) -> tuple[str, list[object]]:
+    values = _path_filter_values(path)
+    if not values:
+        return "", []
+
+    clauses: list[str] = []
+    params: list[object] = []
+    for value in values:
+        if any(character in value for character in "*?[]"):
+            clauses.append(f"{column} GLOB ?")
+            params.append(value)
+            continue
+        clauses.append(f"({column} = ? OR {column} LIKE ? ESCAPE '\\')")
+        params.extend([value, f"{_escape_like(value)}/%"])
+    return "(" + " OR ".join(clauses) + ")", params
 
 
 def _spec_for_path(path: Path, languages: set[str] | None = None) -> LanguageSpec | None:
@@ -2076,7 +2248,90 @@ def _extract_symbols_and_references(
             walk(child, next_container)
 
     walk(root_node, None)
+    if language.name == "python":
+        symbols.extend(_python_top_level_symbols(source, path, language, root_node))
     return symbols, references
+
+
+def _python_top_level_symbols(source: bytes, path: Path, language: LanguageSpec, root_node: Node) -> list[Symbol]:
+    symbols: list[Symbol] = []
+    for node in _node_children(root_node):
+        if _node_kind(node) != "assignment":
+            continue
+        left = node.child_by_field_name("left")
+        if left is None:
+            continue
+        name_node = _first_identifier(left, language)
+        if name_node is None:
+            continue
+        name = _node_text(source, name_node)
+        if not name or not _looks_like_symbol_name(name):
+            continue
+        kind = "constant" if name.isupper() else "variable"
+        range_ = _node_range(name_node)
+        symbols.append(
+            Symbol(
+                id=_symbol_id(language.name, path, kind, name, range_.start_byte),
+                name=name,
+                kind=kind,
+                language=language.name,
+                path=path,
+                range=range_,
+                signature=_signature(source, node),
+                container=None,
+            )
+        )
+        symbols.extend(_python_dict_key_symbols(source, path, language, node, container=name))
+    return symbols
+
+
+def _python_dict_key_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    assignment: Node,
+    *,
+    container: str,
+) -> list[Symbol]:
+    value = assignment.child_by_field_name("right")
+    if value is None or _node_kind(value) != "dictionary":
+        return []
+
+    symbols: list[Symbol] = []
+    for child in _node_children(value):
+        if _node_kind(child) != "pair":
+            continue
+        key = child.child_by_field_name("key")
+        if key is None:
+            continue
+        key_name, key_node = _python_dict_key_name(source, language, key)
+        if not key_name or not _looks_like_symbol_name(key_name):
+            continue
+        range_ = _node_range(key_node)
+        symbols.append(
+            Symbol(
+                id=_symbol_id(language.name, path, "dict_key", key_name, range_.start_byte),
+                name=key_name,
+                kind="dict_key",
+                language=language.name,
+                path=path,
+                range=range_,
+                signature=_signature(source, child),
+                container=container,
+            )
+        )
+    return symbols
+
+
+def _python_dict_key_name(source: bytes, language: LanguageSpec, node: Node) -> tuple[str | None, Node]:
+    if _node_kind(node) == "string":
+        for child in _node_children(node):
+            if _node_kind(child) == "string_content":
+                return _node_text(source, child), child
+        return _node_text(source, node).strip("\"'"), node
+    if _node_kind(node) in language.identifier_node_types:
+        return _node_text(source, node), node
+    return None, node
 
 
 def _symbol_from_node(
@@ -2214,6 +2469,39 @@ def _source_preview(source: str, range_: Range, radius: int = 2) -> str:
     return "\n".join(lines[start:end])
 
 
+def _imports_for_file(repo: CodeIndex, path: Path, *, limit: int) -> tuple[ImportItem, ...]:
+    if limit <= 0:
+        return ()
+    source = repo.storage.file_source(repo.root, path)
+    if source is None:
+        return ()
+    imports: list[ImportItem] = []
+    for line_number, line in enumerate(source.splitlines()):
+        stripped = line.strip()
+        if not _looks_like_import_statement(stripped):
+            continue
+        range_ = Range(
+            start=Position(line_number, 0),
+            end=Position(line_number, len(line)),
+            start_byte=0,
+            end_byte=0,
+        )
+        imports.append(ImportItem(path=path, range=range_, statement=stripped[:240]))
+        if len(imports) >= limit:
+            break
+    return tuple(imports)
+
+
+def _looks_like_import_statement(stripped: str) -> bool:
+    return (
+        stripped.startswith("import ")
+        or stripped.startswith("from ")
+        or stripped.startswith("use ")
+        or stripped.startswith("#include")
+        or stripped.startswith("require ")
+    )
+
+
 def _symbol_row(symbol: Symbol) -> tuple[object, ...]:
     return (
         symbol.id,
@@ -2299,15 +2587,17 @@ def _inspect_text(
     repo: CodeIndex,
     query: str,
     *,
-    kind: str | None,
+    kind: str | Iterable[str] | None,
     language: str | None,
+    path: str | Path | Iterable[str | Path] | None,
+    exact_only: bool,
     options: InspectOptions,
 ) -> str:
     invalid_reason = _invalid_symbol_query_reason(query, repo.root)
     if invalid_reason is not None:
         return _bounded_text(f"invalid_input:\n  reason: {invalid_reason}\n", options.max_total_chars)
 
-    candidates = _inspect_candidates(repo, query, kind=kind, language=language)
+    candidates = _inspect_candidates(repo, query, kind=kind, language=language, path=path, exact_only=exact_only)
     if not candidates:
         return _bounded_text(f"not_found:\n  query: {query}\n", options.max_total_chars)
     if len(candidates) > 1:
@@ -2319,6 +2609,7 @@ def _inspect_text(
     symbol = candidates[0]
     source = repo.storage.file_source(repo.root, symbol.path) or ""
     source_range = _definition_range(repo, symbol) or symbol.range
+    imports = _imports_for_file(repo, symbol.path, limit=options.max_imports)
     members = _members_for_symbol(repo, symbol, limit=options.max_members)
     references = _references_for_inspect(repo, symbol, limit=options.max_references)
     implementors = (
@@ -2331,6 +2622,8 @@ def _inspect_text(
 
     lines = ["symbol:"]
     lines.extend(_format_symbol_fields(symbol, indent=2, range_=source_range))
+    lines.extend(_format_summary_section(imports, members, callers, callees, references, implementors))
+    lines.extend(_format_import_section(imports))
     lines.extend(_format_source_block(source, source_range, options.max_source_chars))
     lines.extend(_format_relation_section(repo, "members", members, options.max_members))
     lines.extend(_format_relation_section(repo, "callers", callers, options.max_callers))
@@ -2362,21 +2655,37 @@ def _inspect_candidates(
     repo: CodeIndex,
     query: str,
     *,
-    kind: str | None,
+    kind: str | Iterable[str] | None,
     language: str | None,
+    path: str | Path | Iterable[str | Path] | None,
+    exact_only: bool,
 ) -> list[Symbol]:
     if "." in query:
         container, name = query.rsplit(".", 1)
-        matches = repo.search_symbols(name, kind=kind, language=language, limit=MAX_INSPECT_CANDIDATES + 1)
+        matches = repo.search_symbols(
+            name,
+            kind=kind,
+            language=language,
+            path=path,
+            exact_only=exact_only,
+            limit=MAX_INSPECT_CANDIDATES + 1,
+        )
         matches = [
             symbol
             for symbol in matches
             if symbol.name == name and symbol.container is not None and symbol.container.split(".")[-1] == container
         ]
     else:
-        matches = repo.search_symbols(query, kind=kind, language=language, limit=MAX_INSPECT_CANDIDATES + 1)
+        matches = repo.search_symbols(
+            query,
+            kind=kind,
+            language=language,
+            path=path,
+            exact_only=exact_only,
+            limit=MAX_INSPECT_CANDIDATES + 1,
+        )
         exact = [symbol for symbol in matches if symbol.name == query]
-        prefix = [symbol for symbol in matches if symbol.name.startswith(query)]
+        prefix = [] if exact_only else [symbol for symbol in matches if symbol.name.startswith(query)]
         matches = exact or prefix
     return matches
 
@@ -2385,13 +2694,15 @@ def _resolve_inspect_symbol(
     repo: CodeIndex,
     query: str,
     *,
-    kind: str | None,
+    kind: str | Iterable[str] | None,
     language: str | None,
+    path: str | Path | Iterable[str | Path] | None,
+    exact_only: bool,
 ) -> Symbol:
     invalid_reason = _invalid_symbol_query_reason(query, repo.root)
     if invalid_reason is not None:
         raise SymbolNotFoundError(invalid_reason)
-    candidates = _inspect_candidates(repo, query, kind=kind, language=language)
+    candidates = _inspect_candidates(repo, query, kind=kind, language=language, path=path, exact_only=exact_only)
     if not candidates:
         raise SymbolNotFoundError(f"No symbol matched: {query}")
     if len(candidates) > 1:
@@ -2412,6 +2723,57 @@ def _members_for_symbol(repo: CodeIndex, symbol: Symbol, *, limit: int) -> tuple
         and (candidate.container == symbol.name or candidate.container.startswith(f"{symbol.name}."))
     ]
     return tuple(members[:limit])
+
+
+def _local_outline_symbols(repo: CodeIndex, symbols: list[Symbol], query: str) -> list[Symbol]:
+    stripped = query.strip()
+    if not stripped:
+        return []
+
+    candidates = _local_outline_candidates(symbols, stripped)
+    if not candidates:
+        return []
+    selected = sorted(candidates, key=lambda symbol: (_local_outline_rank(symbol, stripped), symbol.range.start_byte))[0]
+    selected_range = _definition_range(repo, selected) or selected.range
+
+    result: list[Symbol] = []
+    for symbol in symbols:
+        range_ = _definition_range(repo, symbol) or symbol.range
+        if symbol.id == selected.id or _range_within(range_, selected_range):
+            result.append(symbol)
+    return result
+
+
+def _local_outline_candidates(symbols: list[Symbol], query: str) -> list[Symbol]:
+    if "." in query:
+        container, name = query.rsplit(".", 1)
+        return [
+            symbol
+            for symbol in symbols
+            if symbol.name == name and symbol.container is not None and symbol.container.split(".")[-1] == container
+        ]
+    exact = [symbol for symbol in symbols if symbol.name == query]
+    if exact:
+        return exact
+    return [symbol for symbol in symbols if symbol.name.startswith(query)]
+
+
+def _local_outline_rank(symbol: Symbol, query: str) -> int:
+    if "." in query:
+        return 0
+    if symbol.name == query:
+        return 0
+    if symbol.name.startswith(query):
+        return 1
+    return 2
+
+
+def _range_within(candidate: Range, container: Range) -> bool:
+    return (
+        container.start.line <= candidate.start.line
+        and candidate.start.line < container.end.line + 1
+        and candidate.end.line <= container.end.line
+    )
 
 
 def _references_for_inspect(repo: CodeIndex, symbol: Symbol, *, limit: int) -> tuple[Reference, ...]:
@@ -2453,10 +2815,13 @@ def _callees_for_symbol(repo: CodeIndex, symbol: Symbol, range_: Range, *, limit
     if indexed is None:
         return ()
     known = repo.storage.symbol_names_by_language().get(symbol.language, set())
+    definition_spans = {(candidate.range.start_byte, candidate.range.end_byte) for candidate in indexed.symbols}
     names: list[str] = []
     seen_names: set[str] = set()
     for reference in indexed.references:
         if reference.range.start.line < range_.start.line or reference.range.start.line >= range_.end.line + 1:
+            continue
+        if (reference.range.start_byte, reference.range.end_byte) in definition_spans:
             continue
         if reference.name == symbol.name or reference.name not in known or reference.name in seen_names:
             continue
@@ -2492,8 +2857,10 @@ def _search_page(
     repo: CodeIndex,
     query: str | Iterable[str],
     *,
-    kind: str | None,
+    kind: str | Iterable[str] | None,
     language: str | None,
+    path: str | Path | Iterable[str | Path] | None,
+    exact_only: bool,
     limit: int,
 ) -> Page:
     queries = _coerce_queries(query)
@@ -2502,7 +2869,14 @@ def _search_page(
 
     seen: dict[str, tuple[Symbol, tuple[int, int, int, str, int]]] = {}
     for query_index, item in enumerate(queries):
-        candidates = repo.search_symbols(item, kind=kind, language=language, limit=limit + 1)
+        candidates = repo.search_symbols(
+            item,
+            kind=kind,
+            language=language,
+            path=path,
+            exact_only=exact_only,
+            limit=limit + 1,
+        )
         for result_index, symbol in enumerate(candidates):
             score_rank = {"exact": 0, "prefix": 1}.get(_match_score(item, symbol), 2)
             rank = (score_rank, query_index, len(symbol.name), symbol.path.as_posix(), result_index)
@@ -2584,6 +2958,36 @@ def _format_relation_section(repo: CodeIndex, name: str, items: tuple[Any, ...],
     return lines
 
 
+def _format_summary_section(
+    imports: tuple[ImportItem, ...],
+    members: tuple[Symbol, ...],
+    callers: tuple[Symbol, ...],
+    callees: tuple[Symbol, ...],
+    references: tuple[Reference, ...],
+    implementors: tuple[Symbol, ...],
+) -> list[str]:
+    return [
+        "summary:",
+        f"  imports: {len(imports)}",
+        f"  members: {len(members)}",
+        f"  callers: {len(callers)}",
+        f"  callees: {len(callees)}",
+        f"  references: {len(references)}",
+        f"  implementors: {len(implementors)}",
+    ]
+
+
+def _format_import_section(imports: tuple[ImportItem, ...]) -> list[str]:
+    lines = ["imports:"]
+    if not imports:
+        lines.append("  []")
+        return lines
+    for import_item in imports:
+        lines.append(f"  - range: {_line_range(import_item.range)}")
+        lines.append(f"    statement: {import_item.statement}")
+    return lines
+
+
 def _format_page_text(repo: CodeIndex, name: str, page: Page) -> str:
     lines = [f"{name}:", f"  limit: {page.limit}", f"  offset: {page.offset}", f"  has_more: {_text_bool(page.has_more)}"]
     if page.next_offset is not None:
@@ -2637,7 +3041,7 @@ def _format_search_text(repo: CodeIndex, query: str | Iterable[str], page: Page)
     return "\n".join(lines) + "\n"
 
 
-def _format_outline_text(repo: CodeIndex, path: Path, page: Page) -> str:
+def _format_outline_text(repo: CodeIndex, path: Path, page: Page, *, symbol: str | None = None) -> str:
     source = repo.storage.file_source(repo.root, path)
     total_lines = len(source.splitlines()) if source is not None else 0
     symbols = tuple(item for item in page.items if isinstance(item, Symbol))
@@ -2646,6 +3050,8 @@ def _format_outline_text(repo: CodeIndex, path: Path, page: Page) -> str:
         f"range: 0:{total_lines}",
         f"count: {len(symbols)}",
     ]
+    if symbol is not None:
+        lines.append(f"symbol: {symbol}")
     if page.has_more:
         lines.append(f"has_more: true")
         lines.append(f"limit: {page.limit}")
@@ -2680,6 +3086,7 @@ def _index_status(
     exclude: Iterable[str],
     db_path: Path | None,
     check: bool,
+    max_pending_files: int,
 ) -> IndexStatus:
     index_path = db_path or root / DEFAULT_INDEX_DIR / DEFAULT_INDEX_DB
     if not index_path.exists():
@@ -2691,13 +3098,15 @@ def _index_status(
 
     try:
         data = _read_index_metadata(index_path)
+        pending_files: tuple[str, ...] = ()
         if check:
-            pending_changes: int | str = _pending_index_changes(
+            pending_changes, pending_files = _pending_index_changes(
                 root=root,
                 languages=languages,
                 include=include,
                 exclude=exclude,
                 indexed_files=data["indexed_files"],
+                max_files=max_pending_files,
             )
         else:
             pending_changes = "unknown"
@@ -2726,6 +3135,7 @@ def _index_status(
         language_breakdown=data["language_breakdown"],
         updated_at=data["updated_at"],
         pending_changes=pending_changes,
+        pending_files=pending_files,
         reason=reason,
     )
 
@@ -2780,7 +3190,8 @@ def _pending_index_changes(
     include: Iterable[str],
     exclude: Iterable[str],
     indexed_files: dict[str, tuple[str, int, int]],
-) -> int:
+    max_files: int,
+) -> tuple[int, tuple[str, ...]]:
     language_filter = set(languages) if languages is not None else None
     filtered_indexed_files = {
         path: (mtime_ns, size)
@@ -2803,13 +3214,18 @@ def _pending_index_changes(
         current_files[path.as_posix()] = (stat.st_mtime_ns, stat.st_size)
 
     pending = 0
+    pending_files: list[str] = []
     for path_text, stat_info in current_files.items():
         if filtered_indexed_files.get(path_text) != stat_info:
             pending += 1
+            if len(pending_files) < max_files:
+                pending_files.append(path_text)
     for path_text in filtered_indexed_files:
         if path_text not in current_files:
             pending += 1
-    return pending
+            if len(pending_files) < max_files:
+                pending_files.append(path_text)
+    return pending, tuple(pending_files)
 
 
 def _language_breakdown(rows: list[sqlite3.Row], total_files: int) -> tuple[dict[str, Any], ...]:
@@ -2841,6 +3257,10 @@ def _format_status_text(index_status: IndexStatus) -> str:
         lines.append(f"  updated_at: {index_status.updated_at}")
     if index_status.pending_changes is not None:
         lines.append(f"  pending_changes: {index_status.pending_changes}")
+    if index_status.pending_files:
+        lines.append("  pending_files:")
+        for path in index_status.pending_files:
+            lines.append(f"    - {path}")
     if index_status.reason:
         lines.append(f"  reason: {index_status.reason}")
     if index_status.message:
@@ -3024,7 +3444,7 @@ def _json_default(value: Any) -> Any:
 
 
 def _to_jsonable(value: Any) -> Any:
-    if isinstance(value, (Symbol, Reference, Inspection, IndexStatus, Page, Position, Range)):
+    if isinstance(value, (Symbol, Reference, ImportItem, Inspection, IndexStatus, Page, Position, Range)):
         return _to_jsonable(asdict(value))
     if isinstance(value, Path):
         return value.as_posix()
@@ -3062,6 +3482,8 @@ def _to_cli_jsonable(value: Any) -> Any:
         return _readable_symbol(value)
     if isinstance(value, Reference):
         return _readable_reference(value)
+    if isinstance(value, ImportItem):
+        return _readable_import(value)
     if isinstance(value, Inspection):
         return _readable_inspection(value)
     if isinstance(value, list):
@@ -3107,12 +3529,21 @@ def _readable_reference(reference: Reference) -> dict[str, Any]:
     }
 
 
+def _readable_import(import_item: ImportItem) -> dict[str, Any]:
+    return {
+        "path": import_item.path.as_posix(),
+        "range": _line_range(import_item.range),
+        "statement": import_item.statement,
+    }
+
+
 def _readable_inspection(inspection: Inspection) -> dict[str, Any]:
     result: dict[str, Any] = {
         "definition": _readable_symbol(inspection.definition),
     }
     if inspection.source_preview:
         result["source"] = inspection.source_preview
+    result["imports"] = [_readable_import(import_item) for import_item in inspection.imports]
     result["references"] = [_readable_reference(reference) for reference in inspection.references]
     result["references_has_more"] = inspection.references_has_more
     if inspection.references_next_offset is not None:
@@ -3179,7 +3610,9 @@ def _add_index_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_match_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--kind", help="Prefer or filter by symbol kind.")
+    parser.add_argument("--kind", help="Filter by symbol kind. Use comma-separated values for multiple kinds.")
+    parser.add_argument("--path", action="append", help="Filter to a file or directory path. Repeatable.")
+    parser.add_argument("--exact-only", action="store_true", help="Only return exact symbol-name matches.")
     parser.add_argument("--sync", action="store_true", help="Refresh the index before querying.")
 
 
@@ -3234,6 +3667,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--max-callees", type=_non_negative_int, default=DEFAULT_MAX_CALLEES)
     inspect.add_argument("--max-references", type=_non_negative_int, default=DEFAULT_MAX_REFERENCES)
     inspect.add_argument("--max-implementors", type=_non_negative_int, default=DEFAULT_MAX_IMPLEMENTORS)
+    inspect.add_argument("--max-imports", type=_non_negative_int, default=DEFAULT_MAX_IMPORTS)
 
     refs = subparsers.add_parser("refs", help="Find references for the best symbol match.")
     _add_index_options(refs)
@@ -3253,12 +3687,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_index_options(outline_parser)
     outline_parser.add_argument("path")
     outline_parser.add_argument("--sync", action="store_true", help="Refresh the index before querying.")
+    outline_parser.add_argument("--symbol", help="Show only the local outline for one class, function, or prefix.")
     outline_parser.add_argument("--max-symbols", type=_positive_int, default=DEFAULT_MAX_OUTLINE_SYMBOLS)
     outline_parser.add_argument("--json", action="store_true", help="Print JSON instead of LLM-friendly text.")
 
     status_parser = subparsers.add_parser("status", help="Print index status.")
     _add_index_options(status_parser)
     status_parser.add_argument("--check", action="store_true", help="Scan files to compute stale state and pending changes.")
+    status_parser.add_argument("--max-pending-files", type=_non_negative_int, default=DEFAULT_MAX_PENDING_FILES)
     status_parser.add_argument("--json", action="store_true", help="Print JSON instead of LLM-friendly text.")
 
     index_parser = subparsers.add_parser("index", help="Refresh the on-disk code-symbol-index index.")
@@ -3288,6 +3724,7 @@ def _inspect_options_from_args(args: argparse.Namespace) -> InspectOptions:
         max_callees=args.max_callees,
         max_references=args.max_references,
         max_implementors=args.max_implementors,
+        max_imports=args.max_imports,
     )
 
 
@@ -3333,6 +3770,7 @@ def main(argv: list[str] | None = None) -> int:
                 exclude=args.exclude,
                 db_path=Path(args.db) if args.db is not None else None,
                 check=args.check,
+                max_pending_files=args.max_pending_files,
             )
             if args.json:
                 _print_json(payload)
@@ -3357,42 +3795,76 @@ def main(argv: list[str] | None = None) -> int:
             repo.refresh()
             _print_json({"index": str(Path(repo.storage.db_path)), "root": str(repo.root)})
         elif args.command == "search":
-            page = repo.search_page(args.query, kind=args.kind, language=language, limit=args.limit)
+            page = repo.search_page(
+                args.query,
+                kind=args.kind,
+                language=language,
+                path=args.path,
+                exact_only=args.exact_only,
+                limit=args.limit,
+            )
             if args.json:
                 _print_json(_search_jsonable(page, cli=True))
             else:
                 print(_format_search_text(repo, args.query, page), end="")
         elif args.command == "inspect":
             if args.json:
-                _print_cli_json(repo.inspect(args.query, kind=args.kind, language=language, limit=args.limit))
+                _print_cli_json(
+                    repo.inspect(
+                        args.query,
+                        kind=args.kind,
+                        language=language,
+                        path=args.path,
+                        exact_only=args.exact_only,
+                        limit=args.limit,
+                    )
+                )
             else:
                 print(
                     repo.inspect_text(
                         args.query,
                         kind=args.kind,
                         language=language,
+                        path=args.path,
+                        exact_only=args.exact_only,
                         options=_inspect_options_from_args(args),
                     ),
                     end="",
                 )
         elif args.command == "refs":
-            page = repo.refs(args.query, kind=args.kind, language=language, limit=args.limit, offset=args.offset)
+            page = repo.refs(
+                args.query,
+                kind=args.kind,
+                language=language,
+                path=args.path,
+                exact_only=args.exact_only,
+                limit=args.limit,
+                offset=args.offset,
+            )
             if args.json:
                 _print_cli_json(page)
             else:
                 print(_format_page_text(repo, "references", page), end="")
         elif args.command == "impls":
-            page = repo.impls(args.query, kind=args.kind, language=language, limit=args.limit, offset=args.offset)
+            page = repo.impls(
+                args.query,
+                kind=args.kind,
+                language=language,
+                path=args.path,
+                exact_only=args.exact_only,
+                limit=args.limit,
+                offset=args.offset,
+            )
             if args.json:
                 _print_cli_json(page)
             else:
                 print(_format_page_text(repo, "implementors", page), end="")
         elif args.command == "outline":
-            page = repo.outline(args.path, max_symbols=args.max_symbols)
+            page = repo.outline(args.path, symbol=args.symbol, max_symbols=args.max_symbols)
             if args.json:
                 _print_cli_json(page)
             else:
-                print(repo.outline_text(args.path, max_symbols=args.max_symbols), end="")
+                print(repo.outline_text(args.path, symbol=args.symbol, max_symbols=args.max_symbols), end="")
         else:
             parser.error(f"unknown command: {args.command}")
         return 0
@@ -3415,6 +3887,7 @@ __all__ = [
     "IndexStatus",
     "Inspection",
     "InspectOptions",
+    "ImportItem",
     "Page",
     "Position",
     "Range",
