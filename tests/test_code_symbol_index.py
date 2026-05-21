@@ -1007,6 +1007,55 @@ def test_cli_version(capsys) -> None:
     assert captured.out.strip() == f"code-symbol-index {code_symbol_index.__version__}"
 
 
+def test_install_skill_writes_codex_skill(tmp_path: Path) -> None:
+    path = code_symbol_index.install_skill(codex_home=tmp_path)
+
+    assert path == tmp_path / "skills" / "code-symbol-index" / "SKILL.md"
+    text = path.read_text(encoding="utf-8")
+    assert "name: code-symbol-index" in text
+    assert "code-symbol-index search Tool Agent" in text
+
+    second = code_symbol_index.install_skill(codex_home=tmp_path)
+    assert second == path
+
+
+def test_install_skill_refuses_overwrite_without_force(tmp_path: Path) -> None:
+    path = tmp_path / "skills" / "code-symbol-index" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("custom skill\n", encoding="utf-8")
+
+    try:
+        code_symbol_index.install_skill(codex_home=tmp_path)
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("expected FileExistsError")
+
+    overwritten = code_symbol_index.install_skill(codex_home=tmp_path, force=True)
+
+    assert overwritten == path
+    assert "name: code-symbol-index" in path.read_text(encoding="utf-8")
+
+
+def test_cli_install_skill(tmp_path: Path, capsys) -> None:
+    exit_code = main(["install-skill", "--codex-home", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    skill_path = tmp_path / "skills" / "code-symbol-index" / "SKILL.md"
+    assert exit_code == 0
+    assert str(skill_path) in captured.out
+    assert skill_path.exists()
+
+    skill_path.write_text("custom skill\n", encoding="utf-8")
+    conflict_exit = main(["install-skill", "--codex-home", str(tmp_path)])
+    conflict = capsys.readouterr()
+    force_exit = main(["install-skill", "--codex-home", str(tmp_path), "--force"])
+
+    assert conflict_exit == 2
+    assert "use --force" in conflict.err
+    assert force_exit == 0
+
+
 def test_api_requires_existing_index(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("def missing_index_target():\n    pass\n", encoding="utf-8")
 

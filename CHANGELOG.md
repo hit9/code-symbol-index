@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added `code-symbol-index install-skill` to install a Codex skill.
+
 ## 0.1.4 - 2026-05-20
 
 ### Added

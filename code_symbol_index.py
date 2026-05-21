@@ -45,6 +45,41 @@ MAX_INSPECT_CANDIDATES = 20
 SYMBOL_QUERY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
 API_FORMATS = ("object", "text", "json")
 _DEFAULT_PROGRESS = object()
+CODEX_SKILL_NAME = "code-symbol-index"
+
+CODEX_SKILL = """---
+name: code-symbol-index
+description: Use this skill when navigating a local codebase with the code-symbol-index CLI, including indexing, symbol search, symbol inspection, references, implementations, file outlines, index status, and refreshing changed files.
+---
+
+# Code Symbol Index
+
+Use `code-symbol-index` for bounded, indexed code navigation over a local repository.
+
+## Workflow
+
+1. Check index state:
+   `code-symbol-index status --root <repo>`
+2. If missing or stale, ask before running:
+   `code-symbol-index index --root <repo>`
+3. Search symbols by exact name or prefix:
+   `code-symbol-index search Tool Agent --root <repo> --limit 20`
+4. Inspect a symbol:
+   `code-symbol-index inspect Tool --root <repo>`
+5. Outline a file:
+   `code-symbol-index outline src/app.py --root <repo>`
+6. Find references or implementation candidates:
+   `code-symbol-index refs Tool --root <repo>`
+   `code-symbol-index impls Greeter --root <repo>`
+
+## Rules
+
+- Queries are symbol names or prefixes, not natural language.
+- Use `outline` for file paths.
+- Use `--json` only when structured data is needed; readable text is preferred for LLM context.
+- After editing known files, refresh only those files when possible:
+  `python -c "import code_symbol_index as csi; csi.update(['src/app.py'], root='<repo>')"`
+"""
 
 DEFAULT_EXCLUDES = (
     ".git/**",
@@ -1217,6 +1252,29 @@ def update(
 ) -> Repository:
     repo = Repository(root, languages=_languages_filter(language), progress=progress)
     return repo.update(paths)
+
+
+def install_skill(
+    *,
+    target: str = "codex",
+    codex_home: str | Path | None = None,
+    force: bool = False,
+) -> Path:
+    if target != "codex":
+        raise ValueError("only codex skill installation is supported")
+    home = Path(codex_home) if codex_home is not None else Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+    skill_dir = home / "skills" / CODEX_SKILL_NAME
+    skill_file = skill_dir / "SKILL.md"
+    content = CODEX_SKILL.rstrip() + "\n"
+    if skill_file.exists():
+        existing = skill_file.read_text(encoding="utf-8")
+        if existing == content:
+            return skill_file
+        if not force:
+            raise FileExistsError(f"skill already exists: {skill_file}")
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_file.write_text(content, encoding="utf-8")
+    return skill_file
 
 
 def clean(root: str | Path = ".") -> None:
@@ -3177,6 +3235,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     clean_parser = subparsers.add_parser("clean", help="Delete the on-disk code-symbol-index index.")
     clean_parser.add_argument("--root", default=".", help="Codebase root. Defaults to the current directory.")
 
+    install_skill_parser = subparsers.add_parser("install-skill", help="Install the Codex skill for code-symbol-index.")
+    install_skill_parser.add_argument("--target", default="codex", choices=("codex",), help="Skill target. Currently only codex is supported.")
+    install_skill_parser.add_argument("--codex-home", help="Codex home directory. Defaults to $CODEX_HOME or ~/.codex.")
+    install_skill_parser.add_argument("--force", action="store_true", help="Overwrite an existing skill.")
+
     languages = subparsers.add_parser("languages", help="Print configured languages with available parsers.")
     languages.set_defaults(command="languages")
     version = subparsers.add_parser("version", help="Print the code-symbol-index version.")
@@ -3199,7 +3262,19 @@ def _inspect_options_from_args(args: argparse.Namespace) -> InspectOptions:
 def main(argv: list[str] | None = None) -> int:
     try:
         raw_args = list(sys.argv[1:] if argv is None else argv)
-        commands = {"search", "inspect", "refs", "impls", "outline", "status", "index", "clean", "languages", "version"}
+        commands = {
+            "search",
+            "inspect",
+            "refs",
+            "impls",
+            "outline",
+            "status",
+            "index",
+            "clean",
+            "install-skill",
+            "languages",
+            "version",
+        }
         if raw_args and raw_args[0] not in commands and not raw_args[0].startswith("-"):
             raw_args.insert(0, "search")
 
@@ -3213,6 +3288,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "clean":
             clean(args.root)
+            return 0
+        if args.command == "install-skill":
+            path = install_skill(target=args.target, codex_home=args.codex_home, force=args.force)
+            print(f"installed codex skill: {path}")
             return 0
         if args.command == "status":
             payload = _index_status(
@@ -3288,6 +3367,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         sys.stderr.write("\ninterrupted\n")
         return 130
+    except FileExistsError as exc:
+        sys.stderr.write(f"{exc}; use --force to overwrite\n")
+        return 2
     except IndexNotFoundError:
         sys.stderr.write("index not found; run `code-symbol-index index` first\n")
         return 2
@@ -3315,6 +3397,7 @@ __all__ = [
     "clean",
     "impls",
     "index",
+    "install_skill",
     "inspect",
     "inspect_text",
     "main",

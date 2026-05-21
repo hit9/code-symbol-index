@@ -103,6 +103,7 @@ code-symbol-index outline src/app.py --root /path/to/repo
 code-symbol-index refs Tool --root /path/to/repo --limit 20 --offset 0
 code-symbol-index impls Greeter --root /path/to/repo --kind trait --limit 20 --offset 0
 code-symbol-index clean --root /path/to/repo
+code-symbol-index install-skill
 ```
 
 JSON is available for structured consumers:
@@ -285,6 +286,17 @@ called with `--sync` or `sync=True`. After external file edits, call
 refresh only those files; deleted or newly ignored paths are removed from the
 index.
 
+Install the Codex skill:
+
+```bash
+code-symbol-index install-skill
+code-symbol-index install-skill --codex-home ~/.codex --force
+```
+
+The command writes `SKILL.md` to
+`$CODEX_HOME/skills/code-symbol-index/`, or `~/.codex/skills/code-symbol-index/`
+when `CODEX_HOME` is not set.
+
 Top-level query APIs accept `format="object" | "text" | "json"`:
 
 - `object` returns Python dataclasses/lists and is the default.
@@ -310,6 +322,7 @@ Index lifecycle:
 
 - `index(root=".", *, language=None, progress=None) -> Repository`
 - `update(paths, *, root=".", language=None, progress=None) -> Repository`
+- `install_skill(*, target="codex", codex_home=None, force=False) -> Path`
 - `clean(root=".") -> None`
 - `status(root=".", *, language=None, db_path=None, check=False, format="object") -> IndexStatus | str | dict`
 - `status_text(root=".", *, language=None, db_path=None, check=False) -> str`
