@@ -80,6 +80,7 @@ Inspect one symbol:
 ```bash
 code-symbol-index inspect Tool --root /path/to/repo
 code-symbol-index inspect Tool.method_name --root /path/to/repo
+code-symbol-index inspect Tool --root /path/to/repo --anchors
 ```
 
 Outline a file:
@@ -104,6 +105,7 @@ code-symbol-index search Tool Agent Runner --root /path/to/repo
 code-symbol-index search Tool --root /path/to/repo --kind class,function --path src --exact-only
 code-symbol-index inspect Tool --root /path/to/repo
 code-symbol-index inspect Tool --root /path/to/repo --path src --exact-only
+code-symbol-index inspect Tool --root /path/to/repo --anchors
 code-symbol-index outline src/app.py --root /path/to/repo
 code-symbol-index outline src/app.py --root /path/to/repo --symbol Tool
 code-symbol-index refs Tool --root /path/to/repo --limit 20 --offset 0
@@ -117,6 +119,7 @@ JSON is available for structured consumers:
 ```bash
 code-symbol-index search Tool --root /path/to/repo --json
 code-symbol-index inspect Tool --root /path/to/repo --json
+code-symbol-index inspect Tool --root /path/to/repo --anchors --json
 code-symbol-index outline src/app.py --root /path/to/repo --json
 code-symbol-index refs Tool --root /path/to/repo --json
 code-symbol-index impls Tool --root /path/to/repo --json
@@ -195,6 +198,27 @@ source:
   121 |    if ok:
   122 |        return 1
 ```
+
+Use `inspect --anchors` or `inspect_text(..., anchors=True)` to emit hashline
+source anchors from the current file contents:
+
+```text
+source:
+  status: full
+  range: 120:123
+  shown_range: 120:123
+  total_lines: 3
+  note: Use line:hash as edit anchor; code starts after |
+
+120:a1b2c3d4|def foo():
+121:d4e5f6a7|    if ok:
+122:f6a7b8c9|        return 1
+```
+
+JSON inspect with `anchors=True` includes `source_anchor` with `path`,
+`start_line`, `end_line`, `start_anchor`, `end_anchor`, and
+`lines[{line, hash, text}]`. Hashes are computed from current file contents at
+output time.
 
 Outline returns file structure without source or ids:
 
@@ -279,6 +303,7 @@ print(csi.search_text("Tool", root="/path/to/repo"))
 print(csi.search_text("Tool|Agent", root="/path/to/repo", kind="class,function", path="src"))
 print(csi.inspect_text("Tool", root="/path/to/repo"))
 print(csi.inspect_text("Tool", root="/path/to/repo", path="src", exact_only=True))
+print(csi.inspect_text("Tool", root="/path/to/repo", anchors=True))
 print(csi.outline_text("src/app.py", root="/path/to/repo"))
 print(csi.outline_text("src/app.py", root="/path/to/repo", symbol="Tool"))
 
@@ -287,6 +312,7 @@ symbols = csi.search(["Tool", "Agent", "Runner"], root="/path/to/repo")
 search_payload = csi.search("Tool", root="/path/to/repo", format="json")
 search_text = csi.search("Tool", root="/path/to/repo", format="text")
 inspection = csi.inspect("Tool", root="/path/to/repo")
+anchored = csi.inspect("Tool", root="/path/to/repo", format="json", anchors=True)
 references = csi.refs("Tool", root="/path/to/repo", limit=20, offset=0)
 ```
 
@@ -376,8 +402,8 @@ Queries:
 
 - `search(query: str | list[str], *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, sync=False, format="object") -> list[Symbol] | str | dict`
 - `search_text(query: str | list[str], *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, sync=False) -> str`
-- `inspect(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, sync=False, format="object", ...) -> Inspection | str | dict`
-- `inspect_text(query, *, root=".", kind=None, language=None, path=None, exact_only=False, sync=False, ...) -> str`
+- `inspect(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, anchors=False, sync=False, format="object", ...) -> Inspection | str | dict`
+- `inspect_text(query, *, root=".", kind=None, language=None, path=None, exact_only=False, anchors=False, sync=False, ...) -> str`
 - `refs(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
 - `impls(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
 - `outline(path, *, root=".", symbol=None, max_symbols=200, sync=False, format="object") -> Page | str | dict`

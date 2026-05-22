@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -21,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 SCHEMA_VERSION = 4
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -43,6 +44,7 @@ DEFAULT_MAX_IMPLEMENTORS = 50
 DEFAULT_MAX_IMPORTS = 40
 DEFAULT_MAX_OUTLINE_SYMBOLS = 200
 DEFAULT_MAX_PENDING_FILES = 50
+HASHLINE_HASH_CHARS = 8
 MAX_INSPECT_CANDIDATES = 20
 SYMBOL_QUERY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
 API_FORMATS = ("object", "text", "json")
@@ -71,6 +73,8 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
    `code-symbol-index search Tool --root <repo> --kind class,function --path src --exact-only`
 4. Inspect a symbol:
    `code-symbol-index inspect Tool --root <repo>`
+   Use source anchors before edits:
+   `code-symbol-index inspect Tool --root <repo> --anchors`
 5. Outline a file:
    `code-symbol-index outline src/app.py --root <repo>`
    For a local class/function outline:
@@ -204,6 +208,23 @@ class ImportItem:
 
 
 @dataclass(frozen=True, slots=True)
+class HashLine:
+    line: int
+    hash: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class SourceAnchor:
+    path: Path
+    start_line: int
+    end_line: int
+    start_anchor: str | None
+    end_anchor: str | None
+    lines: tuple[HashLine, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class Page:
     items: tuple[Any, ...]
     limit: int
@@ -230,6 +251,7 @@ class Inspection:
     references: tuple[Reference, ...]
     implementations: tuple[Symbol, ...]
     imports: tuple[ImportItem, ...] = ()
+    source_anchor: SourceAnchor | None = None
     doc: str | None = None
     source_preview: str | None = None
     confidence: str = "medium"
@@ -556,10 +578,14 @@ class CodeIndex:
         path: str | Path | Iterable[str | Path] | None = None,
         exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
+        anchors: bool = False,
+        max_source_chars: int = DEFAULT_MAX_SOURCE_CHARS,
     ) -> Inspection:
         return self._inspect(
             _resolve_inspect_symbol(self, query, kind=kind, language=language, path=path, exact_only=exact_only),
             limit=limit,
+            anchors=anchors,
+            max_source_chars=max_source_chars,
         )
 
     def refs(
@@ -597,10 +623,14 @@ class CodeIndex:
         path: str | Path | Iterable[str | Path] | None = None,
         exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
+        anchors: bool = False,
+        max_source_chars: int = DEFAULT_MAX_SOURCE_CHARS,
     ) -> Inspection:
         return self._inspect(
             _resolve_inspect_symbol(self, query, kind=kind, language=language, path=path, exact_only=exact_only),
             limit=limit,
+            anchors=anchors,
+            max_source_chars=max_source_chars,
         )
 
     def inspect_text(
@@ -612,6 +642,7 @@ class CodeIndex:
         path: str | Path | Iterable[str | Path] | None = None,
         exact_only: bool = False,
         options: InspectOptions | None = None,
+        anchors: bool = False,
     ) -> str:
         return _inspect_text(
             self,
@@ -621,6 +652,7 @@ class CodeIndex:
             path=path,
             exact_only=exact_only,
             options=options or InspectOptions(),
+            anchors=anchors,
         )
 
     def search_text(
@@ -691,16 +723,25 @@ class CodeIndex:
         symbol = self._resolve_symbol(query, kind=kind, language=language, path=path, exact_only=exact_only)
         return self.storage.implementation_candidates(symbol, limit=limit, offset=offset)
 
-    def _inspect(self, symbol: Symbol, *, limit: int = DEFAULT_PAGE_LIMIT) -> Inspection:
+    def _inspect(
+        self,
+        symbol: Symbol,
+        *,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        anchors: bool = False,
+        max_source_chars: int = DEFAULT_MAX_SOURCE_CHARS,
+    ) -> Inspection:
         references = self.storage.references_for(symbol, limit=limit, offset=0)
         implementations = self.storage.implementation_candidates(symbol, limit=limit, offset=0)
         source = self.storage.file_source(self.root, symbol.path)
+        source_range = _definition_range(self, symbol) or symbol.range
         preview = _source_preview(source, symbol.range) if source is not None else None
         return Inspection(
             definition=symbol,
             references=references.items,
             implementations=implementations.items,
             imports=_imports_for_file(self, symbol.path, limit=DEFAULT_MAX_IMPORTS),
+            source_anchor=_source_anchor(symbol.path, source, source_range, max_source_chars) if anchors and source is not None else None,
             source_preview=preview,
             confidence="medium" if implementations else "low",
             references_has_more=references.has_more,
@@ -991,16 +1032,25 @@ class Repository(CodeIndex):
         symbol = self._resolve_symbol(query, kind=kind, language=language, path=path, exact_only=exact_only)
         return self._references_for_symbol(symbol, limit=limit, offset=offset)
 
-    def _inspect(self, symbol: Symbol, *, limit: int = DEFAULT_PAGE_LIMIT) -> Inspection:
+    def _inspect(
+        self,
+        symbol: Symbol,
+        *,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        anchors: bool = False,
+        max_source_chars: int = DEFAULT_MAX_SOURCE_CHARS,
+    ) -> Inspection:
         references = self._references_for_symbol(symbol, limit=limit, offset=0)
         implementations = self.storage.implementation_candidates(symbol, limit=limit, offset=0)
         source = self.storage.file_source(self.root, symbol.path)
+        source_range = _definition_range(self, symbol) or symbol.range
         preview = _source_preview(source, symbol.range) if source is not None else None
         return Inspection(
             definition=symbol,
             references=references.items,
             implementations=implementations.items,
             imports=_imports_for_file(self, symbol.path, limit=DEFAULT_MAX_IMPORTS),
+            source_anchor=_source_anchor(symbol.path, source, source_range, max_source_chars) if anchors and source is not None else None,
             source_preview=preview,
             confidence="medium" if implementations else "low",
             references_has_more=references.has_more,
@@ -1173,6 +1223,7 @@ def inspect(
     max_references: int = DEFAULT_MAX_REFERENCES,
     max_implementors: int = DEFAULT_MAX_IMPLEMENTORS,
     max_imports: int = DEFAULT_MAX_IMPORTS,
+    anchors: bool = False,
 ) -> Any:
     output_format = _validate_api_format(format)
     repo = Repository(root, languages=_languages_filter(language))
@@ -1195,8 +1246,18 @@ def inspect(
                 max_implementors=max_implementors,
                 max_imports=max_imports,
             ),
+            anchors=anchors,
         )
-    inspection = repo.inspect(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit)
+    inspection = repo.inspect(
+        query,
+        kind=kind,
+        language=language,
+        path=path,
+        exact_only=exact_only,
+        limit=limit,
+        anchors=anchors,
+        max_source_chars=max_source_chars,
+    )
     if output_format == "object":
         return inspection
     return _to_jsonable(inspection)
@@ -1218,6 +1279,7 @@ def inspect_text(
     max_references: int = DEFAULT_MAX_REFERENCES,
     max_implementors: int = DEFAULT_MAX_IMPLEMENTORS,
     max_imports: int = DEFAULT_MAX_IMPORTS,
+    anchors: bool = False,
     sync: bool = False,
 ) -> str:
     repo = Repository(root, languages=_languages_filter(language))
@@ -1239,6 +1301,7 @@ def inspect_text(
             max_implementors=max_implementors,
             max_imports=max_imports,
         ),
+        anchors=anchors,
     )
 
 
@@ -2592,6 +2655,7 @@ def _inspect_text(
     path: str | Path | Iterable[str | Path] | None,
     exact_only: bool,
     options: InspectOptions,
+    anchors: bool,
 ) -> str:
     invalid_reason = _invalid_symbol_query_reason(query, repo.root)
     if invalid_reason is not None:
@@ -2624,7 +2688,7 @@ def _inspect_text(
     lines.extend(_format_symbol_fields(symbol, indent=2, range_=source_range))
     lines.extend(_format_summary_section(imports, members, callers, callees, references, implementors))
     lines.extend(_format_import_section(imports))
-    lines.extend(_format_source_block(source, source_range, options.max_source_chars))
+    lines.extend(_format_source_block(source, source_range, options.max_source_chars, anchors=anchors))
     lines.extend(_format_relation_section(repo, "members", members, options.max_members))
     lines.extend(_format_relation_section(repo, "callers", callers, options.max_callers))
     lines.extend(_format_relation_section(repo, "callees", callees, options.max_callees))
@@ -3294,7 +3358,46 @@ def _matched_query(queries: tuple[str, ...], symbol: Symbol) -> str:
     )
 
 
-def _format_source_block(source: str, range_: Range, max_source_chars: int) -> list[str]:
+def _format_source_block(source: str, range_: Range, max_source_chars: int, *, anchors: bool = False) -> list[str]:
+    start, end, shown_end, total_lines, shown_lines, status = _source_excerpt(source, range_, max_source_chars)
+    lines = [
+        "source:",
+        f"  status: {status}",
+        f"  range: {start}:{end}",
+        f"  shown_range: {start}:{shown_end}",
+        f"  total_lines: {total_lines}",
+    ]
+    if anchors:
+        lines.append("  note: Use line:hash as edit anchor; code starts after |")
+    lines.append("")
+
+    for line_number, line in enumerate(shown_lines, start=start):
+        if anchors:
+            lines.append(f"{line_number}:{_hash_line(line)}|{line}")
+        else:
+            lines.append(f"  {line_number} |{line}")
+    if status == "truncated":
+        lines.extend(_format_chunks(start, end, shown_end))
+    return lines
+
+
+def _source_anchor(path: Path, source: str, range_: Range, max_source_chars: int) -> SourceAnchor:
+    start, _end, shown_end, _total_lines, shown_lines, _status = _source_excerpt(source, range_, max_source_chars)
+    hash_lines = tuple(
+        HashLine(line=line_number, hash=_hash_line(line), text=line)
+        for line_number, line in enumerate(shown_lines, start=start)
+    )
+    return SourceAnchor(
+        path=path,
+        start_line=start,
+        end_line=shown_end,
+        start_anchor=_anchor_for_line(hash_lines[0]) if hash_lines else None,
+        end_anchor=_anchor_for_line(hash_lines[-1]) if hash_lines else None,
+        lines=hash_lines,
+    )
+
+
+def _source_excerpt(source: str, range_: Range, max_source_chars: int) -> tuple[int, int, int, int, list[str], str]:
     all_lines = source.splitlines()
     start = range_.start.line
     end = min(range_.end.line + 1, len(all_lines))
@@ -3310,20 +3413,15 @@ def _format_source_block(source: str, range_: Range, max_source_chars: int) -> l
         used += line_cost
     shown_end = start + len(shown_lines)
     status = "full" if len(shown_lines) == total_lines else "truncated"
+    return start, end, shown_end, total_lines, shown_lines, status
 
-    lines = [
-        "source:",
-        f"  status: {status}",
-        f"  range: {start}:{end}",
-        f"  shown_range: {start}:{shown_end}",
-        f"  total_lines: {total_lines}",
-        "",
-    ]
-    for line_number, line in enumerate(shown_lines, start=start):
-        lines.append(f"  {line_number} |{line}")
-    if status == "truncated":
-        lines.extend(_format_chunks(start, end, shown_end))
-    return lines
+
+def _hash_line(line: str) -> str:
+    return hashlib.sha256(line.encode("utf-8")).hexdigest()[:HASHLINE_HASH_CHARS]
+
+
+def _anchor_for_line(line: HashLine) -> str:
+    return f"{line.line}:{line.hash}"
 
 
 def _format_chunks(start: int, end: int, shown_end: int) -> list[str]:
@@ -3444,7 +3542,7 @@ def _json_default(value: Any) -> Any:
 
 
 def _to_jsonable(value: Any) -> Any:
-    if isinstance(value, (Symbol, Reference, ImportItem, Inspection, IndexStatus, Page, Position, Range)):
+    if isinstance(value, (Symbol, Reference, ImportItem, HashLine, SourceAnchor, Inspection, IndexStatus, Page, Position, Range)):
         return _to_jsonable(asdict(value))
     if isinstance(value, Path):
         return value.as_posix()
@@ -3484,6 +3582,10 @@ def _to_cli_jsonable(value: Any) -> Any:
         return _readable_reference(value)
     if isinstance(value, ImportItem):
         return _readable_import(value)
+    if isinstance(value, HashLine):
+        return _readable_hash_line(value)
+    if isinstance(value, SourceAnchor):
+        return _readable_source_anchor(value)
     if isinstance(value, Inspection):
         return _readable_inspection(value)
     if isinstance(value, list):
@@ -3537,12 +3639,33 @@ def _readable_import(import_item: ImportItem) -> dict[str, Any]:
     }
 
 
+def _readable_hash_line(hash_line: HashLine) -> dict[str, Any]:
+    return {
+        "line": hash_line.line,
+        "hash": hash_line.hash,
+        "text": hash_line.text,
+    }
+
+
+def _readable_source_anchor(source_anchor: SourceAnchor) -> dict[str, Any]:
+    return {
+        "path": source_anchor.path.as_posix(),
+        "start_line": source_anchor.start_line,
+        "end_line": source_anchor.end_line,
+        "start_anchor": source_anchor.start_anchor,
+        "end_anchor": source_anchor.end_anchor,
+        "lines": [_readable_hash_line(line) for line in source_anchor.lines],
+    }
+
+
 def _readable_inspection(inspection: Inspection) -> dict[str, Any]:
     result: dict[str, Any] = {
         "definition": _readable_symbol(inspection.definition),
     }
     if inspection.source_preview:
         result["source"] = inspection.source_preview
+    if inspection.source_anchor is not None:
+        result["source_anchor"] = _readable_source_anchor(inspection.source_anchor)
     result["imports"] = [_readable_import(import_item) for import_item in inspection.imports]
     result["references"] = [_readable_reference(reference) for reference in inspection.references]
     result["references_has_more"] = inspection.references_has_more
@@ -3660,6 +3783,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_match_options(inspect)
     inspect.add_argument("--limit", type=_positive_int, default=DEFAULT_PAGE_LIMIT)
     inspect.add_argument("--json", action="store_true", help="Print JSON instead of LLM-friendly text.")
+    inspect.add_argument("--anchors", action="store_true", help="Emit current-file line hashes for source snippets.")
     inspect.add_argument("--max-source-chars", type=_positive_int, default=DEFAULT_MAX_SOURCE_CHARS)
     inspect.add_argument("--max-total-chars", type=_positive_int, default=DEFAULT_MAX_TOTAL_CHARS)
     inspect.add_argument("--max-members", type=_non_negative_int, default=DEFAULT_MAX_MEMBERS)
@@ -3817,6 +3941,8 @@ def main(argv: list[str] | None = None) -> int:
                         path=args.path,
                         exact_only=args.exact_only,
                         limit=args.limit,
+                        anchors=args.anchors,
+                        max_source_chars=args.max_source_chars,
                     )
                 )
             else:
@@ -3828,6 +3954,7 @@ def main(argv: list[str] | None = None) -> int:
                         path=args.path,
                         exact_only=args.exact_only,
                         options=_inspect_options_from_args(args),
+                        anchors=args.anchors,
                     ),
                     end="",
                 )
@@ -3887,12 +4014,14 @@ __all__ = [
     "IndexStatus",
     "Inspection",
     "InspectOptions",
+    "HashLine",
     "ImportItem",
     "Page",
     "Position",
     "Range",
     "Reference",
     "Repository",
+    "SourceAnchor",
     "Symbol",
     "SymbolNotFoundError",
     "UnsupportedLanguageError",

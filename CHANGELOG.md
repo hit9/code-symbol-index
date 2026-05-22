@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.8 - 2026-05-22
+
+### Added
+
+- Added optional hashline source anchors to inspect text and JSON output.
+
 ## 0.1.7 - 2026-05-21
 
 ### Added

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 from pathlib import Path
 
@@ -759,6 +760,66 @@ def helper():
     assert "  1 |    def handle(self):" in output
     assert "  2 |        return helper()" in output
     assert "callees:" in output
+
+
+def test_inspect_text_supports_hashline_anchors(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        "def helper():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+
+    output = code_symbol_index.inspect_text("helper", root=tmp_path, anchors=True)
+    first_hash = hashlib.sha256("def helper():".encode("utf-8")).hexdigest()[:8]
+    second_hash = hashlib.sha256("    return 1".encode("utf-8")).hexdigest()[:8]
+
+    assert "note: Use line:hash as edit anchor; code starts after |" in output
+    assert f"0:{first_hash}|def helper():" in output
+    assert f"1:{second_hash}|    return 1" in output
+    assert "  0 |def helper():" not in output
+
+
+def test_inspect_json_includes_current_file_source_anchors(tmp_path: Path) -> None:
+    source = tmp_path / "app.py"
+    source.write_text(
+        "def helper():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+    source.write_text(
+        "def helper():\n"
+        "    return 2\n",
+        encoding="utf-8",
+    )
+
+    output = code_symbol_index.inspect("helper", root=tmp_path, format="json", anchors=True)
+    body_hash = hashlib.sha256("    return 2".encode("utf-8")).hexdigest()[:8]
+
+    assert output["source_anchor"]["path"] == "app.py"
+    assert output["source_anchor"]["start_line"] == 0
+    assert output["source_anchor"]["end_line"] == 2
+    assert output["source_anchor"]["lines"][1] == {"line": 1, "hash": body_hash, "text": "    return 2"}
+    assert output["source_anchor"]["end_anchor"] == f"1:{body_hash}"
+
+
+def test_cli_inspect_json_supports_source_anchors(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(
+        "def helper():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["inspect", "helper", "--root", str(tmp_path), "--anchors", "--json"])
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert output["source_anchor"]["path"] == "app.py"
+    assert output["source_anchor"]["lines"][0]["line"] == 0
+    assert output["source_anchor"]["lines"][0]["text"] == "def helper():"
 
 
 def test_inspect_includes_imports_for_api_and_cli_json(tmp_path: Path, capsys) -> None:
