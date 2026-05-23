@@ -1302,6 +1302,8 @@ def test_install_skill_writes_codex_skill(tmp_path: Path) -> None:
     text = path.read_text(encoding="utf-8")
     assert "name: code-symbol-index" in text
     assert "code-symbol-index search Tool Agent" in text
+    assert "If status is `missing`, ask the user before initializing the index" in text
+    assert "Do not refresh or sync automatically during ordinary status checks" in text
 
     second = code_symbol_index.install_skill(codex_home=tmp_path)
     assert second == path

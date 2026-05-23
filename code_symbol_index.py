@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 SCHEMA_VERSION = 4
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -63,23 +63,28 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
 
 ## Workflow
 
-1. Check index state:
+1. Check index state with a cheap read-only status:
    `code-symbol-index status --root <repo>`
-2. If missing or stale, ask before running:
+2. If status is `missing`, ask the user before initializing the index:
    `code-symbol-index index --root <repo>`
-3. Search symbols by exact name or prefix:
+3. If status is `ready`, use the indexed tools directly.
+4. If freshness matters, check staleness without refreshing:
+   `code-symbol-index status --root <repo> --check`
+   If status is `stale`, ask the user before refreshing:
+   `code-symbol-index index --root <repo>`
+5. Search symbols by exact name or prefix:
    `code-symbol-index search Tool Agent --root <repo> --limit 20`
    Use filters when needed:
    `code-symbol-index search Tool --root <repo> --kind class,function --path src --exact-only`
-4. Inspect a symbol:
+6. Inspect a symbol:
    `code-symbol-index inspect Tool --root <repo>`
    Use source anchors before edits:
    `code-symbol-index inspect Tool --root <repo> --anchors`
-5. Outline a file:
+7. Outline a file:
    `code-symbol-index outline src/app.py --root <repo>`
    For a local class/function outline:
    `code-symbol-index outline src/app.py --root <repo> --symbol Tool`
-6. Find references or implementation candidates:
+8. Find references or implementation candidates:
    `code-symbol-index refs Tool --root <repo>`
    `code-symbol-index impls Greeter --root <repo>`
 
@@ -88,6 +93,7 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
 - Queries are symbol names or prefixes, not natural language.
 - Use `outline` for file paths.
 - Use `--json` only when structured data is needed; readable text is preferred for LLM context.
+- Do not refresh or sync automatically during ordinary status checks; indexing is a write operation and can be slow.
 - After editing known files, refresh only those files when possible:
   `python -c "import code_symbol_index as csi; csi.update(['src/app.py'], root='<repo>')"`
 """

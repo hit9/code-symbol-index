@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.9 - 2026-05-23
+
+### Changed
+
+- Updated the installed Codex skill guidance to ask before initializing or refreshing indexes.
+- Clarified that ordinary index status checks should stay read-only and should not sync automatically.
+
 ## 0.1.8 - 2026-05-22
 
 ### Added
