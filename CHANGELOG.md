@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.10 - 2026-05-23
+
+### Fixed
+
+- Optimized outline text formatting to parse each file once instead of once per symbol.
+
 ## 0.1.9 - 2026-05-23
 
 ### Changed

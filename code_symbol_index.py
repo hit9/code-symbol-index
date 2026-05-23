@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 SCHEMA_VERSION = 4
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -2803,12 +2803,13 @@ def _local_outline_symbols(repo: CodeIndex, symbols: list[Symbol], query: str) -
     candidates = _local_outline_candidates(symbols, stripped)
     if not candidates:
         return []
+    ranges = _definition_ranges_for_symbols(repo, symbols[0].path, symbols) if symbols else {}
     selected = sorted(candidates, key=lambda symbol: (_local_outline_rank(symbol, stripped), symbol.range.start_byte))[0]
-    selected_range = _definition_range(repo, selected) or selected.range
+    selected_range = ranges.get(selected.id) or selected.range
 
     result: list[Symbol] = []
     for symbol in symbols:
-        range_ = _definition_range(repo, symbol) or symbol.range
+        range_ = ranges.get(symbol.id) or symbol.range
         if symbol.id == selected.id or _range_within(range_, selected_range):
             result.append(symbol)
     return result
@@ -2959,29 +2960,50 @@ def _search_page(
 
 
 def _definition_range(repo: CodeIndex, symbol: Symbol) -> Range | None:
-    source = repo.storage.file_source(repo.root, symbol.path)
+    return _definition_ranges_for_symbols(repo, symbol.path, (symbol,)).get(symbol.id)
+
+
+def _definition_ranges_for_symbols(
+    repo: CodeIndex,
+    path: Path,
+    symbols: Iterable[Symbol],
+    *,
+    source: str | None = None,
+) -> dict[str, Range]:
+    symbols = tuple(symbols)
+    if not symbols:
+        return {}
     if source is None:
-        return None
-    spec = _spec_for_path(symbol.path, repo.languages)
+        source = repo.storage.file_source(repo.root, path)
+    if source is None:
+        return {}
+    spec = _spec_for_path(path, repo.languages)
     if spec is None:
-        return None
-    source_bytes = source.encode("utf-8")
+        return {}
+
+    wanted: dict[tuple[str, int], Symbol] = {
+        (symbol.kind, symbol.range.start_byte): symbol
+        for symbol in symbols
+    }
+    ranges: dict[str, Range] = {}
     tree = _parser_for_language(spec.name).parse(source)
     root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
 
-    def walk(node: Node) -> Range | None:
+    def walk(node: Node) -> None:
+        if len(ranges) >= len(wanted):
+            return
         kind = spec.definitions.get(_node_kind(node))
-        if kind == symbol.kind:
+        if kind is not None:
             name_node = _name_node(node, spec)
-            if name_node is not None and _node_start_byte(name_node) == symbol.range.start_byte:
-                return _node_range(node)
+            if name_node is not None:
+                symbol = wanted.get((kind, _node_start_byte(name_node)))
+                if symbol is not None:
+                    ranges[symbol.id] = _node_range(node)
         for child in _node_children(node):
-            found = walk(child)
-            if found is not None:
-                return found
-        return None
+            walk(child)
 
-    return walk(root_node)
+    walk(root_node)
+    return ranges
 
 
 def _format_symbol_fields(symbol: Symbol, *, indent: int, range_: Range | None = None) -> list[str]:
@@ -3131,8 +3153,9 @@ def _format_outline_text(repo: CodeIndex, path: Path, page: Page, *, symbol: str
         return "\n".join(lines) + "\n"
 
     outline_items = []
+    definition_ranges = _definition_ranges_for_symbols(repo, path, symbols, source=source)
     for symbol in symbols:
-        definition_range = _definition_range(repo, symbol)
+        definition_range = definition_ranges.get(symbol.id)
         outline_items.append((symbol, definition_range or symbol.range, definition_range))
     range_width = max(len(_line_range(range_)) for _, range_, _ in outline_items)
     for symbol, range_, definition_range in outline_items:

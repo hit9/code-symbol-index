@@ -706,6 +706,29 @@ def test_outline_text_uses_indexed_signatures_when_file_changes(tmp_path: Path) 
     assert "changed after indexing" not in output
 
 
+def test_outline_text_parses_file_once_for_definition_ranges(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "app.py").write_text(
+        "\n".join(f"def target_{index}():\n    pass\n" for index in range(12)),
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+    parser_calls = 0
+    original_parser_for_language = code_symbol_index._parser_for_language
+
+    def count_parser(language: str):
+        nonlocal parser_calls
+        if language == "python":
+            parser_calls += 1
+        return original_parser_for_language(language)
+
+    monkeypatch.setattr(code_symbol_index, "_parser_for_language", count_parser)
+
+    output = code_symbol_index.outline_text("app.py", root=tmp_path)
+
+    assert "target_11" in output
+    assert parser_calls <= 2
+
+
 def test_outline_supports_local_symbol_filter_for_api_and_cli(tmp_path: Path, capsys) -> None:
     (tmp_path / "app.py").write_text(
         """
