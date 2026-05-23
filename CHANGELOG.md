@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.13 - 2026-05-23
+
+### Changed
+
+- Updated installed Codex skill guidance to sync changed files after each round of edits.
+
 ## 0.1.12 - 2026-05-23
 
 ### Changed

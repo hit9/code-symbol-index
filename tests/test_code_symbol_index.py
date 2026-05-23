@@ -1347,8 +1347,10 @@ def test_install_skill_writes_codex_skill(tmp_path: Path) -> None:
     assert "Do not refresh the whole index automatically during ordinary status checks" in text
     assert "reason: files changed after last index update" in text
     assert "Do not ask for approval for incremental updates of known changed paths" in text
-    assert "boldly sync those files with incremental update" in text
-    assert "code-symbol-index update src/app.py --root <repo>" in text
+    assert "After each round of edits, sync the index for the files you changed" in text
+    assert "code-symbol-index update src/app.py src/lib.py --root <repo>" in text
+    assert "This is expected to be fast, including in large repositories" in text
+    assert "Only ask before full-index refresh" in text
     assert "python -c" not in text
 
     second = code_symbol_index.install_skill(codex_home=tmp_path)

@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.12"
+__version__ = "0.1.13"
 SCHEMA_VERSION = 4
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -98,8 +98,11 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
 - Use `outline` for file paths.
 - Use `--json` only when structured data is needed; readable text is preferred for LLM context.
 - Do not refresh the whole index automatically during ordinary status checks.
-- After editing known files, boldly sync those files with incremental update:
-  `code-symbol-index update src/app.py --root <repo>`
+- After each round of edits, sync the index for the files you changed:
+  `code-symbol-index update src/app.py src/lib.py --root <repo>`
+  This is expected to be fast, including in large repositories, and keeps indexed tools usable after edits.
+- Only ask before full-index refresh:
+  `code-symbol-index index --root <repo>`
 """
 
 DEFAULT_EXCLUDES = (
