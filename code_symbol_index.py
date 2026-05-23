@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.10"
+__version__ = "0.1.11"
 SCHEMA_VERSION = 4
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -70,7 +70,10 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
 3. If status is `ready`, use the indexed tools directly.
 4. If freshness matters, check staleness without refreshing:
    `code-symbol-index status --root <repo> --check`
-   If status is `stale`, ask the user before refreshing:
+   If status is `stale` with `reason: files changed after last index update`, ask before updating the index.
+   If changed paths are known, prefer incremental update:
+   `python -c "import code_symbol_index as csi; csi.update(['src/app.py'], root='<repo>')"`
+   If changed paths are unknown, ask before refreshing the whole index:
    `code-symbol-index index --root <repo>`
 5. Search symbols by exact name or prefix:
    `code-symbol-index search Tool Agent --root <repo> --limit 20`

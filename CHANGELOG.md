@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.11 - 2026-05-23
+
+### Changed
+
+- Clarified installed Codex skill guidance for `files changed after last index update`.
+- Recommended incremental index updates when changed paths are known.
+
 ## 0.1.10 - 2026-05-23
 
 ### Fixed
