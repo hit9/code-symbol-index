@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.12 - 2026-05-23
+
+### Changed
+
+- Relaxed installed Codex skill guidance for incremental index sync of known changed paths.
+- Clarified that full index refresh still requires approval when changed paths are unknown.
+- Updated installed Codex skill guidance to use the CLI for incremental index sync.
+
+### Added
+
+- Added `code-symbol-index update <paths...>` for incremental index sync from the CLI.
+
 ## 0.1.11 - 2026-05-23
 
 ### Changed

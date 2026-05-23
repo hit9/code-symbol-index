@@ -1189,6 +1189,24 @@ def test_cli_index_command_refreshes_disk_index(tmp_path: Path, capsys) -> None:
     assert "writing index" not in captured.err
 
 
+def test_cli_update_command_refreshes_known_paths(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("def first_name():\n    pass\n", encoding="utf-8")
+    assert main(["index", "--root", str(tmp_path), "--language", "python"]) == 0
+    capsys.readouterr()
+    source.write_text("def second_name():\n    pass\n", encoding="utf-8")
+
+    update_exit = main(["update", "app.py", "--root", str(tmp_path), "--language", "python"])
+    update_output = json.loads(capsys.readouterr().out)
+    search_exit = main(["search", "second_name", "--root", str(tmp_path), "--language", "python", "--json"])
+    search_output = json.loads(capsys.readouterr().out)
+
+    assert update_exit == 0
+    assert update_output["updated"] == ["app.py"]
+    assert search_exit == 0
+    assert search_output["symbols"][0]["name"] == "second_name"
+
+
 def test_status_reports_missing_ready_and_stale(tmp_path: Path) -> None:
     source = tmp_path / "app.py"
     source.write_text("def status_target():\n    pass\n", encoding="utf-8")
@@ -1326,9 +1344,12 @@ def test_install_skill_writes_codex_skill(tmp_path: Path) -> None:
     assert "name: code-symbol-index" in text
     assert "code-symbol-index search Tool Agent" in text
     assert "If status is `missing`, ask the user before initializing the index" in text
-    assert "Do not refresh or sync automatically during ordinary status checks" in text
+    assert "Do not refresh the whole index automatically during ordinary status checks" in text
     assert "reason: files changed after last index update" in text
-    assert "prefer incremental update" in text
+    assert "Do not ask for approval for incremental updates of known changed paths" in text
+    assert "boldly sync those files with incremental update" in text
+    assert "code-symbol-index update src/app.py --root <repo>" in text
+    assert "python -c" not in text
 
     second = code_symbol_index.install_skill(codex_home=tmp_path)
     assert second == path

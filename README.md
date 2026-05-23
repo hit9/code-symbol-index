@@ -97,6 +97,7 @@ code-symbol-index languages
 code-symbol-index --version
 code-symbol-index version
 code-symbol-index index --root /path/to/repo
+code-symbol-index update src/app.py src/lib.py --root /path/to/repo
 code-symbol-index status --root /path/to/repo
 code-symbol-index status --root /path/to/repo --check
 code-symbol-index status --root /path/to/repo --check --max-pending-files 20
@@ -392,6 +393,7 @@ Index lifecycle:
 
 - `index(root=".", *, language=None, progress=None) -> Repository`
 - `update(paths, *, root=".", language=None, progress=None) -> Repository`
+  CLI: `code-symbol-index update <paths...> --root <repo>`
 - `refresh_async(root=".", *, language=None, db_path=None, progress=None, daemon=True) -> threading.Thread`
 - `install_skill(*, target="codex", codex_home=None, force=False) -> Path`
 - `clean(root=".") -> None`

@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.11"
+__version__ = "0.1.12"
 SCHEMA_VERSION = 4
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -70,9 +70,10 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
 3. If status is `ready`, use the indexed tools directly.
 4. If freshness matters, check staleness without refreshing:
    `code-symbol-index status --root <repo> --check`
-   If status is `stale` with `reason: files changed after last index update`, ask before updating the index.
-   If changed paths are known, prefer incremental update:
-   `python -c "import code_symbol_index as csi; csi.update(['src/app.py'], root='<repo>')"`
+   If status is `stale` with `reason: files changed after last index update`, keep using the indexed tools after syncing known changes.
+   If `pending_files` are listed or you edited files in this turn, run incremental update for those exact paths:
+   `code-symbol-index update src/app.py --root <repo>`
+   Incremental update is expected to be fast even in large repositories. Do not ask for approval for incremental updates of known changed paths.
    If changed paths are unknown, ask before refreshing the whole index:
    `code-symbol-index index --root <repo>`
 5. Search symbols by exact name or prefix:
@@ -96,9 +97,9 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
 - Queries are symbol names or prefixes, not natural language.
 - Use `outline` for file paths.
 - Use `--json` only when structured data is needed; readable text is preferred for LLM context.
-- Do not refresh or sync automatically during ordinary status checks; indexing is a write operation and can be slow.
-- After editing known files, refresh only those files when possible:
-  `python -c "import code_symbol_index as csi; csi.update(['src/app.py'], root='<repo>')"`
+- Do not refresh the whole index automatically during ordinary status checks.
+- After editing known files, boldly sync those files with incremental update:
+  `code-symbol-index update src/app.py --root <repo>`
 """
 
 DEFAULT_EXCLUDES = (
@@ -3856,6 +3857,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     index_parser = subparsers.add_parser("index", help="Refresh the on-disk code-symbol-index index.")
     _add_index_options(index_parser)
 
+    update_parser = subparsers.add_parser("update", help="Incrementally update indexed files.")
+    _add_index_options(update_parser)
+    update_parser.add_argument("paths", nargs="+", help="File paths to refresh in the index.")
+
     clean_parser = subparsers.add_parser("clean", help="Delete the on-disk code-symbol-index index.")
     clean_parser.add_argument("--root", default=".", help="Codebase root. Defaults to the current directory.")
 
@@ -3895,6 +3900,7 @@ def main(argv: list[str] | None = None) -> int:
             "outline",
             "status",
             "index",
+            "update",
             "clean",
             "install-skill",
             "languages",
@@ -3950,6 +3956,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "index":
             repo.refresh()
             _print_json({"index": str(Path(repo.storage.db_path)), "root": str(repo.root)})
+        elif args.command == "update":
+            repo.update(args.paths)
+            _print_json(
+                {
+                    "index": str(Path(repo.storage.db_path)),
+                    "root": str(repo.root),
+                    "updated": [Path(path).as_posix() for path in args.paths],
+                }
+            )
         elif args.command == "search":
             page = repo.search_page(
                 args.query,
