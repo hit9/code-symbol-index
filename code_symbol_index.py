@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.1.13"
+__version__ = "0.2.0"
 SCHEMA_VERSION = 4
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -49,7 +49,6 @@ MAX_INSPECT_CANDIDATES = 20
 SYMBOL_QUERY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
 API_FORMATS = ("object", "text", "json")
 _DEFAULT_PROGRESS = object()
-_THREAD_LOCAL = threading.local()
 CODEX_SKILL_NAME = "code-symbol-index"
 
 CODEX_SKILL = """---
@@ -2272,19 +2271,10 @@ def _file_contains_bytes(path: Path, needle: bytes) -> bool:
 def _parser_for_language(language: str):
     if language not in LANGUAGE_BY_NAME:
         raise UnsupportedLanguageError(f"Unsupported language: {language}")
-    parsers = getattr(_THREAD_LOCAL, "parsers", None)
-    if parsers is None:
-        parsers = {}
-        _THREAD_LOCAL.parsers = parsers
-    parser = parsers.get(language)
-    if parser is not None:
-        return parser
     try:
-        parser = get_parser(language)
+        return get_parser(language)
     except Exception as exc:
         raise UnsupportedLanguageError(f"No parser available for language: {language}") from exc
-    parsers[language] = parser
-    return parser
 
 
 def _extract_symbols_and_references(
