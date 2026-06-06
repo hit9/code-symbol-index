@@ -90,6 +90,30 @@ code-symbol-index outline src/app.py --root /path/to/repo
 code-symbol-index outline src/app.py --root /path/to/repo --symbol Tool
 ```
 
+
+## Codex Skill
+
+Install the Codex skill so LLM coding agents can discover and use
+`code-symbol-index` automatically:
+
+```bash
+code-symbol-index install-skill
+```
+
+To override the Codex home directory or force overwrite an existing skill:
+
+```bash
+code-symbol-index install-skill --codex-home ~/.codex --force
+```
+
+The command writes `SKILL.md` to
+`$CODEX_HOME/skills/code-symbol-index/`, or `~/.codex/skills/code-symbol-index/`
+when `CODEX_HOME` is not set.
+
+Once installed, the agent will know the skill rules for symbol search,
+inspection, references, file outlines, incremental updates, and index status
+checks.
+
 ## CLI
 
 ```bash
@@ -356,16 +380,6 @@ called with `--sync` or `sync=True`. After external file edits, call
 refresh only those files; deleted or newly ignored paths are removed from the
 index.
 
-Install the Codex skill:
-
-```bash
-code-symbol-index install-skill
-code-symbol-index install-skill --codex-home ~/.codex --force
-```
-
-The command writes `SKILL.md` to
-`$CODEX_HOME/skills/code-symbol-index/`, or `~/.codex/skills/code-symbol-index/`
-when `CODEX_HOME` is not set.
 
 Top-level query APIs accept `format="object" | "text" | "json"`:
 
