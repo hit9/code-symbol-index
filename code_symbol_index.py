@@ -53,7 +53,7 @@ CODEX_SKILL_NAME = "code-symbol-index"
 
 CODEX_SKILL = """---
 name: code-symbol-index
-description: Use this skill when navigating a local codebase with the code-symbol-index CLI, including indexing, symbol search, symbol inspection, references, implementations, file outlines, index status, and refreshing changed files.
+description: Use this skill when navigating a local codebase with the code-symbol-index CLI, including indexing, symbol search, symbol inspection, references (classified by behavior), call-chain queries (transitive callers/callees with entry-point grouping), implementations, file outlines, index status, and refreshing changed files.
 ---
 
 # Code Symbol Index
