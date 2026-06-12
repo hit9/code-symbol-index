@@ -424,6 +424,10 @@ repo.update(["src/app.py"], progress=on_progress)
 
 稳定的进度事件为 `scan`、`start`、`file` 和 `finish`。
 
+仅当 stderr 为交互式终端时，CLI 才显示实时进度条。当 stderr 被捕获（管道，或被
+agent 读取）时，会抑制逐文件刷新，并在完成时只打印一行 `indexed N files` 摘要，
+因此 `--sync` 查询的结果输出保持干净。
+
 若要在应用启动时刷新索引而不阻塞启动：
 
 ```python

@@ -451,6 +451,11 @@ repo.update(["src/app.py"], progress=on_progress)
 
 Stable progress events are `scan`, `start`, `file`, and `finish`.
 
+The CLI shows a live progress bar only when stderr is an interactive terminal.
+When stderr is captured (piped, or read by an agent), per-file updates are
+suppressed and a single `indexed N files` summary line is printed on completion,
+so a `--sync` query keeps its result output clean.
+
 To refresh the index during application startup without blocking startup:
 
 ```python
