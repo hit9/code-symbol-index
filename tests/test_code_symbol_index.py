@@ -1634,3 +1634,153 @@ def test_cli_progress_keeps_live_bar_when_interactive() -> None:
     assert "\r" in output          # live, self-rewriting bar
     assert "indexing" in output
     assert "indexed 2 files" not in output
+
+
+def _write_call_chain_fixture(tmp_path: Path) -> None:
+    (tmp_path / "app" / "api").mkdir(parents=True)
+    (tmp_path / "app" / "workers").mkdir(parents=True)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "app" / "jobs.py").write_text(
+        "def handle_agent_job_run(job):\n"
+        "    return _do_work(job)\n\n"
+        "def _do_work(job):\n"
+        "    return 1\n\n"
+        "def dispatch_job(job):\n"
+        "    return handle_agent_job_run(job)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "app" / "api" / "agents.py").write_text(
+        "from app.jobs import dispatch_job\n\n"
+        "@router.post('/agents/{id}/run')\n"
+        "def run_agent_endpoint(id):\n"
+        "    return dispatch_job(id)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "app" / "workers" / "queue.py").write_text(
+        "from app.jobs import handle_agent_job_run\n\n"
+        "@shared_task\n"
+        "def process_queue(msg):\n"
+        "    return handle_agent_job_run(msg)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "test_jobs.py").write_text(
+        "from app.jobs import handle_agent_job_run\n\n"
+        "def test_handle_agent_job_run():\n"
+        "    assert handle_agent_job_run({}) is not None\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "scripts" / "run.py").write_text(
+        "from app.jobs import dispatch_job\n\n"
+        "def main():\n"
+        "    dispatch_job({})\n\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+
+
+def test_callers_groups_entry_points(tmp_path: Path) -> None:
+    _write_call_chain_fixture(tmp_path)
+    code_symbol_index.index(tmp_path)
+    graph = code_symbol_index.callers("handle_agent_job_run", root=tmp_path, depth=3)
+
+    by_type: dict[str, set[str]] = {}
+    for entry in graph.entry_points:
+        by_type.setdefault(entry.entry_type, set()).add(entry.symbol.name)
+
+    assert by_type.get("http_route") == {"run_agent_endpoint"}
+    assert by_type.get("worker") == {"process_queue"}
+    assert by_type.get("test") == {"test_handle_agent_job_run"}
+    assert "main" in by_type.get("script", set())
+
+    route_entry = next(e for e in graph.entry_points if e.symbol.name == "run_agent_endpoint")
+    assert [s.name for s in route_entry.path] == ["run_agent_endpoint", "dispatch_job", "handle_agent_job_run"]
+
+
+def test_callees_descend_depth(tmp_path: Path) -> None:
+    _write_call_chain_fixture(tmp_path)
+    code_symbol_index.index(tmp_path)
+    graph = code_symbol_index.callees("dispatch_job", root=tmp_path, depth=2)
+
+    level1 = {node.symbol.name for node in graph.roots}
+    assert "handle_agent_job_run" in level1
+    level2 = {child.symbol.name for node in graph.roots for child in node.children}
+    assert "_do_work" in level2
+
+
+def test_callees_ignore_non_call_references(tmp_path: Path) -> None:
+    # A type annotation referencing a known symbol must not become a callee.
+    (tmp_path / "m.py").write_text(
+        "class Widget:\n    pass\n\n"
+        "def helper():\n    return 1\n\n"
+        "def use(x: Widget):\n    return helper()\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+    graph = code_symbol_index.callees("use", root=tmp_path, depth=1)
+    names = {node.symbol.name for node in graph.roots}
+    assert "helper" in names
+    assert "Widget" not in names
+
+
+def test_callers_cycle_terminates(tmp_path: Path) -> None:
+    (tmp_path / "m.py").write_text(
+        "def a():\n    return b()\n\n"
+        "def b():\n    return a()\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+    graph = code_symbol_index.callers("a", root=tmp_path, depth=5)
+    # b calls a; a calls b — traversal must terminate and find b as a caller.
+    assert any(node.symbol.name == "b" for node in graph.roots)
+
+
+def test_callers_depth_is_bounded(tmp_path: Path) -> None:
+    _write_call_chain_fixture(tmp_path)
+    code_symbol_index.index(tmp_path)
+    shallow = code_symbol_index.callers("handle_agent_job_run", root=tmp_path, depth=1)
+    # depth 1 reaches direct callers only (dispatch_job, process_queue, test_*),
+    # not the http_route two hops away.
+    names_depth1 = {node.symbol.name for node in shallow.roots}
+    assert "dispatch_job" in names_depth1
+    assert all(not node.children for node in shallow.roots)
+
+
+def test_cli_callers_text_and_json(tmp_path: Path, capsys) -> None:
+    _write_call_chain_fixture(tmp_path)
+    code_symbol_index.index(tmp_path)
+
+    assert main(["callers", "handle_agent_job_run", "--root", str(tmp_path), "--depth", "3"]) == 0
+    text = capsys.readouterr().out
+    assert "entry_points:" in text
+    assert "http_route:" in text
+    assert "path: run_agent_endpoint -> dispatch_job -> handle_agent_job_run" in text
+
+    assert main(["callees", "dispatch_job", "--root", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["direction"] == "callees"
+    assert payload["confidence"] == "low"
+    assert any(node["name"] == "handle_agent_job_run" for node in payload["callees"])
+
+
+def test_cli_callers_depth_validation(tmp_path: Path) -> None:
+    _write_call_chain_fixture(tmp_path)
+    code_symbol_index.index(tmp_path)
+    try:
+        main(["callers", "handle_agent_job_run", "--root", str(tmp_path), "--depth", "99"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit for out-of-range --depth")
+
+
+def test_cli_callers_ambiguous_symbol_clean_error(tmp_path: Path, capsys) -> None:
+    (tmp_path / "a.py").write_text("def dup():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def dup():\n    return 2\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    exit_code = main(["callers", "dup", "--root", str(tmp_path)])
+    err = capsys.readouterr().err
+    assert exit_code == 2
+    assert "mbiguous" in err or "narrow with" in err

@@ -98,12 +98,21 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
    `code-symbol-index refs Tool --root <repo> --ref-kind call,write`
    `code-symbol-index refs Tool --root <repo> --all-kinds`
    `inspect` reports a `reference_kinds` breakdown in its summary.
+9. Trace transitive call chains to locate real execution paths:
+   `code-symbol-index callers handle_job --root <repo> --depth 3`
+   `code-symbol-index callees handle_job --root <repo> --depth 3`
+   `callers` groups reachable entry points by type (http_route / worker /
+   script / tool / test) with a call path back to the target. Disambiguate a
+   common name with `--path`/`--kind`/`--exact-only`.
 
 ## Rules
 
 - Queries are symbol names or prefixes, not natural language.
 - Reference classification is syntactic (no type inference); treat `kind` as a
   strong hint, not a guarantee. Use `--all-kinds` if a reference seems missing.
+- `callers`/`callees` are syntactic and name-based (`confidence: low`): indirect
+  or dynamically dispatched calls may be missed, and same-named symbols can be
+  conflated. Use them to narrow the search, then confirm with `inspect`.
 - Use `outline` for file paths.
 - Use `--json` only when structured data is needed; readable text is preferred for LLM context.
 - Do not refresh the whole index automatically during ordinary status checks.
@@ -185,6 +194,15 @@ DEFAULT_REFERENCE_KINDS = frozenset(REFERENCE_KINDS - DEFAULT_REFERENCE_NOISE_KI
 # Sentinel for the friendly ``ref_kinds`` API argument: keep the behavioral
 # default unless the caller asks for ``"all"`` or an explicit kind list.
 _REF_KINDS_DEFAULT = "behavioral"
+
+# Entry-point classification for call-chain queries. Detection is heuristic
+# (path/name conventions + a decorator scan) and Python-first; treat it as a
+# best-effort hint, not a guarantee.
+ENTRY_TYPES = ("http_route", "worker", "tool", "script", "test")
+DEFAULT_CALL_DEPTH = 3
+MAX_CALL_DEPTH = 6
+DEFAULT_CALL_FANOUT = 20
+MAX_CALL_GRAPH_NODES = 200
 
 CONTAINER_KINDS = {
     "class",
@@ -289,6 +307,32 @@ class Page:
 
     def __getitem__(self, index):
         return self.items[index]
+
+
+@dataclass(frozen=True, slots=True)
+class CallNode:
+    symbol: Symbol
+    depth: int
+    entry_type: str | None = None
+    children: tuple["CallNode", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EntryPoint:
+    entry_type: str
+    symbol: Symbol
+    path: tuple[Symbol, ...]  # from the entry symbol down to the target
+
+
+@dataclass(frozen=True, slots=True)
+class CallGraph:
+    target: Symbol
+    direction: str  # "callers" | "callees"
+    depth: int
+    roots: tuple[CallNode, ...]
+    entry_points: tuple[EntryPoint, ...] = ()
+    truncated: bool = False
+    confidence: str = "low"
 
 
 @dataclass(frozen=True, slots=True)
@@ -703,6 +747,34 @@ class CodeIndex:
         offset: int = 0,
     ) -> Page:
         return self.find_implementations(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit, offset=offset)
+
+    def callers(
+        self,
+        query: str,
+        *,
+        kind: str | Iterable[str] | None = None,
+        language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
+        depth: int = DEFAULT_CALL_DEPTH,
+        limit: int = DEFAULT_CALL_FANOUT,
+    ) -> CallGraph:
+        symbol = _resolve_inspect_symbol(self, query, kind=kind, language=language, path=path, exact_only=exact_only)
+        return _build_call_graph(self, symbol, direction="callers", depth=_clamp_depth(depth), limit=limit)
+
+    def callees(
+        self,
+        query: str,
+        *,
+        kind: str | Iterable[str] | None = None,
+        language: str | None = None,
+        path: str | Path | Iterable[str | Path] | None = None,
+        exact_only: bool = False,
+        depth: int = DEFAULT_CALL_DEPTH,
+        limit: int = DEFAULT_CALL_FANOUT,
+    ) -> CallGraph:
+        symbol = _resolve_inspect_symbol(self, query, kind=kind, language=language, path=path, exact_only=exact_only)
+        return _build_call_graph(self, symbol, direction="callees", depth=_clamp_depth(depth), limit=limit)
 
     def inspect_symbol(
         self,
@@ -1458,6 +1530,71 @@ def impls(
     if output_format == "text":
         return _format_page_text(repo, "implementors", page)
     return _to_jsonable(page)
+
+
+def callers(
+    query: str,
+    *,
+    root: str | Path = ".",
+    kind: str | Iterable[str] | None = None,
+    language: str | None = None,
+    path: str | Path | Iterable[str | Path] | None = None,
+    exact_only: bool = False,
+    depth: int = DEFAULT_CALL_DEPTH,
+    limit: int = DEFAULT_CALL_FANOUT,
+    sync: bool = False,
+    format: str = "object",
+) -> Any:
+    return _call_chain(
+        "callers", query, root=root, kind=kind, language=language, path=path,
+        exact_only=exact_only, depth=depth, limit=limit, sync=sync, format=format,
+    )
+
+
+def callees(
+    query: str,
+    *,
+    root: str | Path = ".",
+    kind: str | Iterable[str] | None = None,
+    language: str | None = None,
+    path: str | Path | Iterable[str | Path] | None = None,
+    exact_only: bool = False,
+    depth: int = DEFAULT_CALL_DEPTH,
+    limit: int = DEFAULT_CALL_FANOUT,
+    sync: bool = False,
+    format: str = "object",
+) -> Any:
+    return _call_chain(
+        "callees", query, root=root, kind=kind, language=language, path=path,
+        exact_only=exact_only, depth=depth, limit=limit, sync=sync, format=format,
+    )
+
+
+def _call_chain(
+    direction: str,
+    query: str,
+    *,
+    root: str | Path,
+    kind: str | Iterable[str] | None,
+    language: str | None,
+    path: str | Path | Iterable[str | Path] | None,
+    exact_only: bool,
+    depth: int,
+    limit: int,
+    sync: bool,
+    format: str,
+) -> Any:
+    output_format = _validate_api_format(format)
+    repo = Repository(root, languages=_languages_filter(language))
+    if sync:
+        repo.refresh()
+    method = repo.callers if direction == "callers" else repo.callees
+    graph = method(query, kind=kind, language=language, path=path, exact_only=exact_only, depth=depth, limit=limit)
+    if output_format == "object":
+        return graph
+    if output_format == "text":
+        return _format_call_graph_text(repo, graph)
+    return _to_jsonable(graph)
 
 
 def status(
@@ -3121,6 +3258,206 @@ def _references_for_inspect(
     return tuple(repo.storage.references_for(symbol, limit=limit, offset=0, ref_kinds=ref_kinds).items)
 
 
+_HTTP_ROUTE_DECORATOR_RE = re.compile(
+    r"(?:^|\.)(?:route|get|post|put|patch|delete|head|options|websocket|api_route|endpoint)\b"
+    r"|app\.route|router\.|blueprint|\bapi\.(?:get|post|put|patch|delete|route)",
+    re.IGNORECASE,
+)
+_WORKER_DECORATOR_RE = re.compile(
+    r"(?:^|\.)(?:shared_task|periodic_task|task|cron|scheduled|on_message|consumer|subscriber|subscribe)\b"
+    r"|celery|\brq\b",
+    re.IGNORECASE,
+)
+_TOOL_DECORATOR_RE = re.compile(
+    r"(?:^|\.)(?:tool|register_tool|function_tool|command)\b",
+    re.IGNORECASE,
+)
+_TEST_FILE_RE = re.compile(r"(?:^test_|_test$|\.test$|\.spec$)", re.IGNORECASE)
+_MAIN_GUARD_RE = re.compile(r"""__name__\s*==\s*['"]__main__['"]""")
+_SCRIPT_DIR_PARTS = frozenset({"bin", "scripts", "cmd"})
+_TEST_DIR_PARTS = frozenset({"test", "tests", "__tests__", "spec", "specs"})
+
+
+def _decorators_above(repo: CodeIndex, symbol: Symbol, source_cache: dict[Path, str]) -> list[str]:
+    """Return decorator text (without the leading @) on the lines above a def."""
+    source = source_cache.get(symbol.path)
+    if source is None:
+        source = repo.storage.file_source(repo.root, symbol.path) or ""
+        source_cache[symbol.path] = source
+    lines = source.splitlines()
+    decorators: list[str] = []
+    index = symbol.range.start.line - 1
+    while index >= 0 and index < len(lines):
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith("#"):
+            index -= 1
+            continue
+        if stripped.startswith("@"):
+            decorators.append(stripped[1:])
+            index -= 1
+            continue
+        break
+    return decorators
+
+
+def _is_test_symbol(symbol: Symbol) -> bool:
+    if any(part.lower() in _TEST_DIR_PARTS for part in symbol.path.parts):
+        return True
+    if _TEST_FILE_RE.search(symbol.path.stem):
+        return True
+    return symbol.name.startswith("test_") or symbol.name.lower().startswith("test")
+
+
+def _is_script_symbol(repo: CodeIndex, symbol: Symbol, source_cache: dict[Path, str]) -> bool:
+    if any(part.lower() in _SCRIPT_DIR_PARTS for part in symbol.path.parts):
+        return True
+    if symbol.container is None and symbol.name == "main":
+        source = source_cache.get(symbol.path)
+        if source is None:
+            source = repo.storage.file_source(repo.root, symbol.path) or ""
+            source_cache[symbol.path] = source
+        if _MAIN_GUARD_RE.search(source):
+            return True
+    return False
+
+
+def _entry_type(repo: CodeIndex, symbol: Symbol, *, source_cache: dict[Path, str]) -> str | None:
+    if _is_test_symbol(symbol):
+        return "test"
+    decorators = _decorators_above(repo, symbol, source_cache)
+    if any(_HTTP_ROUTE_DECORATOR_RE.search(dec) for dec in decorators):
+        return "http_route"
+    if any(_WORKER_DECORATOR_RE.search(dec) for dec in decorators):
+        return "worker"
+    if any(_TOOL_DECORATOR_RE.search(dec) for dec in decorators):
+        return "tool"
+    if _is_script_symbol(repo, symbol, source_cache):
+        return "script"
+    return None
+
+
+def _direct_callers(repo: CodeIndex, symbol: Symbol, *, limit: int) -> tuple[Symbol, ...]:
+    references = _references_for_inspect(repo, symbol, limit=limit, ref_kinds=frozenset({"call"}))
+    return _callers_for_symbol(repo, symbol, references, limit=limit)
+
+
+def _direct_callees(repo: CodeIndex, symbol: Symbol, *, limit: int) -> tuple[Symbol, ...]:
+    source_range = _definition_range(repo, symbol) or symbol.range
+    return _callees_for_symbol(repo, symbol, source_range, limit=limit, ref_kinds=frozenset({"call"}))
+
+
+def _clamp_depth(depth: int) -> int:
+    if depth < 1:
+        return 1
+    return min(depth, MAX_CALL_DEPTH)
+
+
+def _build_call_graph(
+    repo: CodeIndex,
+    symbol: Symbol,
+    *,
+    direction: str,
+    depth: int,
+    limit: int,
+    max_nodes: int = MAX_CALL_GRAPH_NODES,
+) -> CallGraph:
+    step = _direct_callers if direction == "callers" else _direct_callees
+    source_cache: dict[Path, str] = {}
+
+    visited: dict[str, int] = {symbol.id: 0}
+    parent: dict[str, Symbol] = {}
+    symbol_by_id: dict[str, Symbol] = {symbol.id: symbol}
+    children_ids: dict[str, list[str]] = {}
+    truncated = False
+
+    frontier = [symbol]
+    for level in range(1, depth + 1):
+        next_frontier: list[Symbol] = []
+        for current in frontier:
+            for neighbour in step(repo, current, limit=limit):
+                if neighbour.id == symbol.id:
+                    continue
+                if neighbour.id not in visited:
+                    if len(visited) > max_nodes:
+                        truncated = True
+                        break
+                    visited[neighbour.id] = level
+                    parent[neighbour.id] = current
+                    symbol_by_id[neighbour.id] = neighbour
+                    next_frontier.append(neighbour)
+                    children_ids.setdefault(current.id, []).append(neighbour.id)
+                elif neighbour.id != current.id and neighbour.id not in children_ids.get(current.id, ()):
+                    # Edge to an already-seen node (cross-link / shallower depth).
+                    children_ids.setdefault(current.id, []).append(neighbour.id)
+            if truncated:
+                break
+        if truncated or not next_frontier:
+            break
+        frontier = next_frontier
+
+    entry_cache: dict[str, str | None] = {}
+
+    def entry_of(node_symbol: Symbol) -> str | None:
+        if node_symbol.id not in entry_cache:
+            entry_cache[node_symbol.id] = _entry_type(repo, node_symbol, source_cache=source_cache)
+        return entry_cache[node_symbol.id]
+
+    def build_node(node_id: str, building: frozenset[str]) -> CallNode:
+        node_symbol = symbol_by_id[node_id]
+        child_nodes: list[CallNode] = []
+        for child_id in children_ids.get(node_id, ()):
+            # Only nest children first discovered through this node, and break
+            # cycles in the rendered tree.
+            discovery_parent = parent.get(child_id)
+            if discovery_parent is not None and discovery_parent.id == node_id and child_id not in building:
+                child_nodes.append(build_node(child_id, building | {node_id}))
+        return CallNode(
+            symbol=node_symbol,
+            depth=visited[node_id],
+            entry_type=entry_of(node_symbol),
+            children=tuple(child_nodes),
+        )
+
+    roots = tuple(build_node(cid, frozenset({symbol.id})) for cid in children_ids.get(symbol.id, ()))
+
+    entry_points: list[EntryPoint] = []
+    if direction == "callers":
+        for node_id, node_symbol in symbol_by_id.items():
+            if node_id == symbol.id:
+                continue
+            kind = entry_of(node_symbol)
+            if kind is None:
+                continue
+            entry_points.append(
+                EntryPoint(entry_type=kind, symbol=node_symbol, path=_reconstruct_path(node_id, symbol, parent, symbol_by_id))
+            )
+        entry_points.sort(key=lambda item: (ENTRY_TYPES.index(item.entry_type) if item.entry_type in ENTRY_TYPES else 99, item.symbol.path.as_posix(), item.symbol.range.start.line))
+
+    return CallGraph(
+        target=symbol,
+        direction=direction,
+        depth=depth,
+        roots=roots,
+        entry_points=tuple(entry_points),
+        truncated=truncated,
+    )
+
+
+def _reconstruct_path(
+    node_id: str, target: Symbol, parent: dict[str, Symbol], symbol_by_id: dict[str, Symbol]
+) -> tuple[Symbol, ...]:
+    """Path from the entry symbol down to the target (entry first)."""
+    chain = [symbol_by_id[node_id]]
+    current_id = node_id
+    while current_id in parent:
+        parent_symbol = parent[current_id]
+        chain.append(parent_symbol)
+        current_id = parent_symbol.id
+        if len(chain) > MAX_CALL_DEPTH + 1:
+            break
+    return tuple(chain)
+
+
 def _callers_for_symbol(
     repo: CodeIndex,
     symbol: Symbol,
@@ -3131,11 +3468,16 @@ def _callers_for_symbol(
     if limit <= 0:
         return ()
     file_symbols_cache: dict[Path, list[Symbol]] = {}
+    def_ranges_cache: dict[Path, dict[str, Range]] = {}
     callers: list[Symbol] = []
     seen: set[str] = set()
     for reference in references:
-        file_symbols = file_symbols_cache.setdefault(reference.path, repo.storage.symbols_in_file(reference.path))
-        caller = _enclosing_symbol(file_symbols, reference.range, exclude_id=symbol.id)
+        path = reference.path
+        if path not in file_symbols_cache:
+            file_symbols = repo.storage.symbols_in_file(path)
+            file_symbols_cache[path] = file_symbols
+            def_ranges_cache[path] = _definition_ranges_for_symbols(repo, path, file_symbols)
+        caller = _enclosing_symbol(file_symbols_cache[path], def_ranges_cache[path], reference.range, exclude_id=symbol.id)
         if caller is None or caller.id in seen:
             continue
         callers.append(caller)
@@ -3145,7 +3487,9 @@ def _callers_for_symbol(
     return tuple(callers)
 
 
-def _callees_for_symbol(repo: CodeIndex, symbol: Symbol, range_: Range, *, limit: int) -> tuple[Symbol, ...]:
+def _callees_for_symbol(
+    repo: CodeIndex, symbol: Symbol, range_: Range, *, limit: int, ref_kinds: frozenset[str] | None = None
+) -> tuple[Symbol, ...]:
     if limit <= 0:
         return ()
     indexed = _parse_file(repo.root, symbol.path, repo.languages)
@@ -3157,6 +3501,8 @@ def _callees_for_symbol(repo: CodeIndex, symbol: Symbol, range_: Range, *, limit
     seen_names: set[str] = set()
     for reference in indexed.references:
         if reference.range.start.line < range_.start.line or reference.range.start.line >= range_.end.line + 1:
+            continue
+        if ref_kinds is not None and reference.reference_kind not in ref_kinds:
             continue
         if (reference.range.start_byte, reference.range.end_byte) in definition_spans:
             continue
@@ -3177,17 +3523,20 @@ def _callees_for_symbol(repo: CodeIndex, symbol: Symbol, range_: Range, *, limit
     return tuple(callees)
 
 
-def _enclosing_symbol(symbols: list[Symbol], range_: Range, *, exclude_id: str) -> Symbol | None:
-    candidates = [
-        symbol
-        for symbol in symbols
-        if symbol.id != exclude_id
-        and symbol.range.start.line <= range_.start.line
-        and range_.start.line < symbol.range.end.line
-    ]
+def _enclosing_symbol(
+    symbols: list[Symbol], def_ranges: dict[str, Range], range_: Range, *, exclude_id: str
+) -> Symbol | None:
+    candidates: list[tuple[Symbol, Range]] = []
+    for symbol in symbols:
+        if symbol.id == exclude_id:
+            continue
+        body = def_ranges.get(symbol.id, symbol.range)
+        if body.start.line <= range_.start.line <= body.end.line:
+            candidates.append((symbol, body))
     if not candidates:
         return None
-    return max(candidates, key=lambda symbol: symbol.range.start.line)
+    # Innermost enclosing definition: deepest start, then tightest end.
+    return max(candidates, key=lambda item: (item[1].start.line, -item[1].end.line))[0]
 
 
 def _search_page(
@@ -3376,6 +3725,60 @@ def _format_page_text(repo: CodeIndex, name: str, page: Page) -> str:
             else:
                 lines.extend(_format_relation_item(repo, item, indent=4))
     return "\n".join(lines) + "\n"
+
+
+def _symbol_location(symbol: Symbol) -> str:
+    return f"{symbol.name}  {symbol.path.as_posix()}:{symbol.range.start.line}"
+
+
+def _format_call_graph_text(repo: CodeIndex, graph: CallGraph) -> str:
+    target_range = _definition_range(repo, graph.target) or graph.target.range
+    lines = [
+        "target:",
+        f"  id: {_text_symbol_id(graph.target, target_range)}",
+        f"  name: {graph.target.name}",
+        f"  kind: {graph.target.kind}",
+        f"  file: {graph.target.path.as_posix()}",
+        f"  range: {_line_range(target_range)}",
+        f"direction: {graph.direction}",
+        f"depth: {graph.depth}",
+        f"confidence: {graph.confidence}",
+        f"truncated: {_text_bool(graph.truncated)}",
+    ]
+
+    if graph.direction == "callers":
+        lines.append("entry_points:")
+        if not graph.entry_points:
+            lines.append("  []")
+        else:
+            grouped: dict[str, list[EntryPoint]] = {}
+            for entry in graph.entry_points:
+                grouped.setdefault(entry.entry_type, []).append(entry)
+            for entry_type in ENTRY_TYPES:
+                bucket = grouped.get(entry_type)
+                if not bucket:
+                    continue
+                lines.append(f"  {entry_type}:")
+                for entry in bucket:
+                    lines.append(f"    - {_symbol_location(entry.symbol)}")
+                    path_text = " -> ".join(item.name for item in entry.path)
+                    lines.append(f"        path: {path_text}")
+
+    lines.append(f"{graph.direction}:")
+    if not graph.roots:
+        lines.append("  []")
+    else:
+        for node in graph.roots:
+            _append_call_node_lines(node, lines, indent=2)
+    return "\n".join(lines) + "\n"
+
+
+def _append_call_node_lines(node: CallNode, lines: list[str], *, indent: int) -> None:
+    prefix = " " * indent
+    tag = f"  [{node.entry_type}]" if node.entry_type else ""
+    lines.append(f"{prefix}- {_symbol_location(node.symbol)}{tag}")
+    for child in node.children:
+        _append_call_node_lines(child, lines, indent=indent + 4)
 
 
 def _format_search_text(repo: CodeIndex, query: str | Iterable[str], page: Page) -> str:
@@ -3853,7 +4256,10 @@ def _json_default(value: Any) -> Any:
 
 
 def _to_jsonable(value: Any) -> Any:
-    if isinstance(value, (Symbol, Reference, ImportItem, HashLine, SourceAnchor, Inspection, IndexStatus, Page, Position, Range)):
+    if isinstance(
+        value,
+        (Symbol, Reference, ImportItem, HashLine, SourceAnchor, Inspection, IndexStatus, Page, Position, Range, CallGraph, CallNode, EntryPoint),
+    ):
         return _to_jsonable(asdict(value))
     if isinstance(value, Path):
         return value.as_posix()
@@ -3899,6 +4305,8 @@ def _to_cli_jsonable(value: Any) -> Any:
         return _readable_source_anchor(value)
     if isinstance(value, Inspection):
         return _readable_inspection(value)
+    if isinstance(value, CallGraph):
+        return _readable_call_graph(value)
     if isinstance(value, list):
         return [_to_cli_jsonable(item) for item in value]
     if isinstance(value, tuple):
@@ -3989,6 +4397,34 @@ def _readable_inspection(inspection: Inspection) -> dict[str, Any]:
     if inspection.implementations_next_offset is not None:
         result["implementations_next_offset"] = inspection.implementations_next_offset
     return result
+
+
+def _readable_call_node(node: CallNode) -> dict[str, Any]:
+    result: dict[str, Any] = _readable_symbol(node.symbol)
+    result["depth"] = node.depth
+    result["entry_type"] = node.entry_type
+    result["children"] = [_readable_call_node(child) for child in node.children]
+    return result
+
+
+def _readable_entry_point(entry: EntryPoint) -> dict[str, Any]:
+    return {
+        "entry_type": entry.entry_type,
+        "symbol": _readable_symbol(entry.symbol),
+        "path": [item.name for item in entry.path],
+    }
+
+
+def _readable_call_graph(graph: CallGraph) -> dict[str, Any]:
+    return {
+        "target": _readable_symbol(graph.target),
+        "direction": graph.direction,
+        "depth": graph.depth,
+        "confidence": graph.confidence,
+        "truncated": graph.truncated,
+        "entry_points": [_readable_entry_point(entry) for entry in graph.entry_points],
+        graph.direction: [_readable_call_node(node) for node in graph.roots],
+    }
 
 
 class _CliProgress:
@@ -4129,6 +4565,13 @@ def _non_negative_int(value: str) -> int:
     return parsed
 
 
+def _depth(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1 or parsed > MAX_CALL_DEPTH:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_CALL_DEPTH}")
+    return parsed
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="code-symbol-index")
     parser.add_argument("--version", action="version", version=f"code-symbol-index {__version__}")
@@ -4172,6 +4615,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _add_match_options(impls)
     _add_page_options(impls)
     impls.add_argument("--json", action="store_true", help="Print JSON instead of LLM-friendly text.")
+
+    for direction, help_text in (
+        ("callers", "Walk the transitive callers of a symbol, grouped by entry type."),
+        ("callees", "Walk the transitive callees of a symbol."),
+    ):
+        chain_parser = subparsers.add_parser(direction, help=help_text)
+        _add_index_options(chain_parser)
+        chain_parser.add_argument("query")
+        _add_match_options(chain_parser)
+        chain_parser.add_argument("--depth", type=_depth, default=DEFAULT_CALL_DEPTH, help=f"Traversal depth (1-{MAX_CALL_DEPTH}).")
+        chain_parser.add_argument("--limit", type=_positive_int, default=DEFAULT_CALL_FANOUT, help="Max neighbours expanded per node.")
+        chain_parser.add_argument("--json", action="store_true", help="Print JSON instead of LLM-friendly text.")
 
     outline_parser = subparsers.add_parser("outline", help="Print an indexed file outline.")
     _add_index_options(outline_parser)
@@ -4231,6 +4686,8 @@ def main(argv: list[str] | None = None) -> int:
             "inspect",
             "refs",
             "impls",
+            "callers",
+            "callees",
             "outline",
             "status",
             "index",
@@ -4369,6 +4826,21 @@ def main(argv: list[str] | None = None) -> int:
                 _print_cli_json(page)
             else:
                 print(_format_page_text(repo, "implementors", page), end="")
+        elif args.command in ("callers", "callees"):
+            method = repo.callers if args.command == "callers" else repo.callees
+            graph = method(
+                args.query,
+                kind=args.kind,
+                language=language,
+                path=args.path,
+                exact_only=args.exact_only,
+                depth=args.depth,
+                limit=args.limit,
+            )
+            if args.json:
+                _print_cli_json(graph)
+            else:
+                print(_format_call_graph_text(repo, graph), end="")
         elif args.command == "outline":
             page = repo.outline(args.path, symbol=args.symbol, max_symbols=args.max_symbols)
             if args.json:
@@ -4387,12 +4859,18 @@ def main(argv: list[str] | None = None) -> int:
     except IndexNotFoundError:
         sys.stderr.write("index not found; run `code-symbol-index index` first\n")
         return 2
+    except SymbolNotFoundError as exc:
+        sys.stderr.write(f"{exc}; narrow with --path/--kind/--exact-only\n")
+        return 2
 
 
 __all__ = [
     "BinaryFileError",
+    "CallGraph",
+    "CallNode",
     "CodeIndex",
     "CodeSymbolIndexError",
+    "EntryPoint",
     "IndexNotFoundError",
     "IndexStatus",
     "Inspection",
@@ -4411,6 +4889,8 @@ __all__ = [
     "__version__",
     "best_symbol",
     "build_arg_parser",
+    "callees",
+    "callers",
     "clean",
     "impls",
     "index",

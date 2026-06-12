@@ -4,6 +4,11 @@
 
 ### Added
 
+- `callers` and `callees` commands (and Python `callers()`/`callees()`) walk the
+  transitive call graph up to `--depth` (default 3). `callers` groups reachable
+  entry points by type (http_route / worker / tool / script / test) with a call
+  path back to the target. Syntactic/name-based (`confidence: low`).
+
 - Classified references by behavior: each `refs` result now carries a `kind`
   (`call`, `read`, `write`, `inherit`, `type`, `import`, `attribute`, or
   `usage`). Tuned rules for Python/JavaScript/TypeScript, best-effort elsewhere.

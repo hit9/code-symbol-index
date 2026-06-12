@@ -137,6 +137,8 @@ code-symbol-index refs Tool --root /path/to/repo --limit 20 --offset 0
 code-symbol-index refs Tool --root /path/to/repo --ref-kind call,write
 code-symbol-index refs Tool --root /path/to/repo --all-kinds
 code-symbol-index impls Greeter --root /path/to/repo --kind trait --limit 20 --offset 0
+code-symbol-index callers handle_job --root /path/to/repo --depth 3
+code-symbol-index callees handle_job --root /path/to/repo --depth 3
 code-symbol-index clean --root /path/to/repo
 code-symbol-index install-skill
 ```
@@ -150,6 +152,7 @@ code-symbol-index inspect Tool --root /path/to/repo --anchors --json
 code-symbol-index outline src/app.py --root /path/to/repo --json
 code-symbol-index refs Tool --root /path/to/repo --json
 code-symbol-index impls Tool --root /path/to/repo --json
+code-symbol-index callers handle_job --root /path/to/repo --json
 code-symbol-index status --root /path/to/repo --json
 ```
 
@@ -353,6 +356,52 @@ JavaScript, and TypeScript/TSX have tuned rules; other languages get a
 best-effort subset and otherwise fall back to `read`/`usage`. Treat `kind` as a
 strong hint, not a guarantee.
 
+## Call Chains
+
+`callers` and `callees` walk the transitive call graph from a symbol up to
+`--depth` (default 3, max 6), following actual `call` edges. They make it fast
+to find the real execution paths into or out of a function in a large codebase.
+
+```bash
+code-symbol-index callers handle_agent_job_run --root /path/to/repo --depth 3
+code-symbol-index callees handle_agent_job_run --root /path/to/repo --depth 3
+```
+
+`callers` groups the reachable **entry points** by type — `http_route`,
+`worker`, `tool`, `script`, `test` — and shows a representative call path back
+to the target:
+
+```text
+target:
+  name: handle_agent_job_run
+  ...
+direction: callers
+depth: 3
+confidence: low
+truncated: false
+entry_points:
+  http_route:
+    - run_agent_endpoint  app/api/agents.py:45
+        path: run_agent_endpoint -> dispatch_job -> handle_agent_job_run
+  worker:
+    - process_queue  app/workers/queue.py:88
+        path: process_queue -> handle_agent_job_run
+callers:
+  - dispatch_job  app/jobs.py:200
+      - run_agent_endpoint  app/api/agents.py:45  [http_route]
+  - process_queue  app/workers/queue.py:88  [worker]
+```
+
+Entry types are detected heuristically (path/name conventions + a decorator
+scan) and are Python-first. The traversal is **syntactic and name-based**
+(`confidence: low`): indirect/dynamic dispatch may be missed and same-named
+symbols can be conflated, so use it to narrow down, then confirm with `inspect`.
+`--limit` caps the fan-out expanded per node; `truncated: true` marks a capped
+result. Disambiguate a common name with `--path` / `--kind` / `--exact-only`.
+
+The Python API mirrors this: `callers(query, *, depth=3, limit=20, ...)` and
+`callees(...)` return a `CallGraph` (or text/JSON via `format=`).
+
 ## Python API
 
 ```python
@@ -460,6 +509,8 @@ Queries:
 - `inspect_text(query, *, root=".", kind=None, language=None, path=None, exact_only=False, anchors=False, sync=False, ...) -> str`
 - `refs(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, offset=0, sync=False, format="object", ref_kinds="behavioral") -> Page | str | dict`
 - `impls(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
+- `callers(query, *, root=".", kind=None, language=None, path=None, exact_only=False, depth=3, limit=20, sync=False, format="object") -> CallGraph | str | dict`
+- `callees(query, *, root=".", kind=None, language=None, path=None, exact_only=False, depth=3, limit=20, sync=False, format="object") -> CallGraph | str | dict`
 - `outline(path, *, root=".", symbol=None, max_symbols=200, sync=False, format="object") -> Page | str | dict`
 - `outline_text(path, *, root=".", symbol=None, max_symbols=200, sync=False) -> str`
 
@@ -471,6 +522,7 @@ Repository handle:
 - `Repository.search(...)`, `search_text(...)`
 - `Repository.inspect(...)`, `inspect_text(...)`
 - `Repository.refs(...)`, `impls(...)`
+- `Repository.callers(...)`, `callees(...)`
 - `Repository.outline(...)`, `outline_text(...)`
 - `Repository.clean() -> None`
 
@@ -482,3 +534,6 @@ Data classes:
 - `Inspection`
 - `InspectOptions`
 - `IndexStatus`
+- `CallGraph`
+- `CallNode`
+- `EntryPoint`
