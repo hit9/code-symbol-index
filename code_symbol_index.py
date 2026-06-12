@@ -23,7 +23,7 @@ from tree_sitter_language_pack import get_parser
 
 
 __version__ = "0.2.0"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
 TEXT_SAMPLE_BYTES = 8192
@@ -90,10 +90,20 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
 8. Find references or implementation candidates:
    `code-symbol-index refs Tool --root <repo>`
    `code-symbol-index impls Greeter --root <repo>`
+   Each reference is classified by behavior (`kind`): `call`, `read`, `write`,
+   `inherit`, `type`, `import`, `attribute`, or `usage`. By default `refs` and
+   `inspect` hide the noisy `import` and `attribute` (same-named member access)
+   kinds so you see the real behavioral dependency surface.
+   Narrow to specific kinds, or show everything:
+   `code-symbol-index refs Tool --root <repo> --ref-kind call,write`
+   `code-symbol-index refs Tool --root <repo> --all-kinds`
+   `inspect` reports a `reference_kinds` breakdown in its summary.
 
 ## Rules
 
 - Queries are symbol names or prefixes, not natural language.
+- Reference classification is syntactic (no type inference); treat `kind` as a
+  strong hint, not a guarantee. Use `--all-kinds` if a reference seems missing.
 - Use `outline` for file paths.
 - Use `--json` only when structured data is needed; readable text is preferred for LLM context.
 - Do not refresh the whole index automatically during ordinary status checks.
@@ -151,6 +161,30 @@ IDENTIFIER_NODE_TYPES = (
     "name",
     "variable_name",
 )
+
+# Identifier node types that denote member access (``obj.name``). Used to tell
+# an attribute/property reference apart from a plain identifier read.
+MEMBER_IDENTIFIER_NODE_TYPES = (
+    "property_identifier",
+    "field_identifier",
+    "shorthand_property_identifier",
+)
+
+# Reference classification taxonomy. ``usage`` is the fallback when nothing more
+# specific can be determined syntactically.
+REFERENCE_KINDS = frozenset(
+    {"call", "read", "write", "inherit", "type", "import", "attribute", "usage"}
+)
+
+# Kinds shown by default. We deny the two high-noise kinds rather than allow a
+# fixed behavioral set, so misclassified or unknown (``usage``) references stay
+# visible instead of being silently dropped.
+DEFAULT_REFERENCE_NOISE_KINDS = frozenset({"import", "attribute"})
+DEFAULT_REFERENCE_KINDS = frozenset(REFERENCE_KINDS - DEFAULT_REFERENCE_NOISE_KINDS)
+
+# Sentinel for the friendly ``ref_kinds`` API argument: keep the behavioral
+# default unless the caller asks for ``"all"`` or an explicit kind list.
+_REF_KINDS_DEFAULT = "behavioral"
 
 CONTAINER_KINDS = {
     "class",
@@ -283,6 +317,7 @@ class InspectOptions:
     max_references: int = DEFAULT_MAX_REFERENCES
     max_implementors: int = DEFAULT_MAX_IMPLEMENTORS
     max_imports: int = DEFAULT_MAX_IMPORTS
+    ref_kinds: str | tuple[str, ...] | None = _REF_KINDS_DEFAULT
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +371,20 @@ class LanguageSpec:
     extensions: tuple[str, ...]
     definitions: dict[str, str]
     identifier_node_types: tuple[str, ...] = IDENTIFIER_NODE_TYPES
+    # Node-type hints used to classify references. Untuned languages keep the
+    # shared defaults below and degrade gracefully to ``read``/``usage``.
+    call_node_types: tuple[str, ...] = ("call", "call_expression")
+    import_node_types: tuple[str, ...] = (
+        "import_statement",
+        "import_from_statement",
+        "import_declaration",
+        "import_spec",
+        "use_declaration",
+    )
+    inherit_node_types: tuple[str, ...] = ()
+    type_node_types: tuple[str, ...] = ("type_identifier",)
+    assignment_node_types: tuple[str, ...] = ()
+    member_node_types: tuple[str, ...] = ()
 
 
 LANGUAGES: tuple[LanguageSpec, ...] = (
@@ -346,6 +395,12 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "class_definition": "class",
             "function_definition": "function",
         },
+        call_node_types=("call",),
+        import_node_types=("import_statement", "import_from_statement", "future_import_statement"),
+        inherit_node_types=(),  # class bases handled specially in _child_reference_context
+        type_node_types=("type",),
+        assignment_node_types=("assignment", "augmented_assignment"),
+        member_node_types=("attribute",),
     ),
     LanguageSpec(
         name="javascript",
@@ -357,6 +412,12 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "method_definition": "method",
             "variable_declarator": "variable",
         },
+        call_node_types=("call_expression", "new_expression"),
+        import_node_types=("import_statement", "import_clause", "import_specifier", "namespace_import"),
+        inherit_node_types=("class_heritage", "extends_clause"),
+        type_node_types=("type_identifier",),
+        assignment_node_types=("assignment_expression", "augmented_assignment_expression", "variable_declarator"),
+        member_node_types=("member_expression",),
     ),
     LanguageSpec(
         name="typescript",
@@ -372,6 +433,12 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "type_alias_declaration": "type",
             "variable_declarator": "variable",
         },
+        call_node_types=("call_expression", "new_expression"),
+        import_node_types=("import_statement", "import_clause", "import_specifier", "namespace_import"),
+        inherit_node_types=("class_heritage", "extends_clause", "implements_clause", "extends_type_clause"),
+        type_node_types=("type_annotation", "type_arguments", "type_identifier", "predefined_type"),
+        assignment_node_types=("assignment_expression", "augmented_assignment_expression", "variable_declarator"),
+        member_node_types=("member_expression",),
     ),
     LanguageSpec(
         name="tsx",
@@ -387,6 +454,12 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "type_alias_declaration": "type",
             "variable_declarator": "variable",
         },
+        call_node_types=("call_expression", "new_expression"),
+        import_node_types=("import_statement", "import_clause", "import_specifier", "namespace_import"),
+        inherit_node_types=("class_heritage", "extends_clause", "implements_clause", "extends_type_clause"),
+        type_node_types=("type_annotation", "type_arguments", "type_identifier", "predefined_type"),
+        assignment_node_types=("assignment_expression", "augmented_assignment_expression", "variable_declarator"),
+        member_node_types=("member_expression",),
     ),
     LanguageSpec(
         name="go",
@@ -592,12 +665,14 @@ class CodeIndex:
         limit: int = DEFAULT_PAGE_LIMIT,
         anchors: bool = False,
         max_source_chars: int = DEFAULT_MAX_SOURCE_CHARS,
+        ref_kinds: str | Iterable[str] | None = _REF_KINDS_DEFAULT,
     ) -> Inspection:
         return self._inspect(
             _resolve_inspect_symbol(self, query, kind=kind, language=language, path=path, exact_only=exact_only),
             limit=limit,
             anchors=anchors,
             max_source_chars=max_source_chars,
+            ref_kinds=_resolve_ref_kinds(ref_kinds),
         )
 
     def refs(
@@ -610,8 +685,11 @@ class CodeIndex:
         exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
+        ref_kinds: str | Iterable[str] | None = _REF_KINDS_DEFAULT,
     ) -> Page:
-        return self.find_references(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit, offset=offset)
+        return self.find_references(
+            query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit, offset=offset, ref_kinds=ref_kinds
+        )
 
     def impls(
         self,
@@ -717,9 +795,10 @@ class CodeIndex:
         exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
+        ref_kinds: str | Iterable[str] | None = _REF_KINDS_DEFAULT,
     ) -> Page:
         symbol = self._resolve_symbol(query, kind=kind, language=language, path=path, exact_only=exact_only)
-        return self.storage.references_for(symbol, limit=limit, offset=offset)
+        return self.storage.references_for(symbol, limit=limit, offset=offset, ref_kinds=_resolve_ref_kinds(ref_kinds))
 
     def find_implementations(
         self,
@@ -742,8 +821,9 @@ class CodeIndex:
         limit: int = DEFAULT_PAGE_LIMIT,
         anchors: bool = False,
         max_source_chars: int = DEFAULT_MAX_SOURCE_CHARS,
+        ref_kinds: frozenset[str] | None = DEFAULT_REFERENCE_KINDS,
     ) -> Inspection:
-        references = self.storage.references_for(symbol, limit=limit, offset=0)
+        references = self.storage.references_for(symbol, limit=limit, offset=0, ref_kinds=ref_kinds)
         implementations = self.storage.implementation_candidates(symbol, limit=limit, offset=0)
         source = self.storage.file_source(self.root, symbol.path)
         source_range = _definition_range(self, symbol) or symbol.range
@@ -1040,9 +1120,10 @@ class Repository(CodeIndex):
         exact_only: bool = False,
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
+        ref_kinds: str | Iterable[str] | None = _REF_KINDS_DEFAULT,
     ) -> Page:
         symbol = self._resolve_symbol(query, kind=kind, language=language, path=path, exact_only=exact_only)
-        return self._references_for_symbol(symbol, limit=limit, offset=offset)
+        return self._references_for_symbol(symbol, limit=limit, offset=offset, ref_kinds=_resolve_ref_kinds(ref_kinds))
 
     def _inspect(
         self,
@@ -1051,8 +1132,9 @@ class Repository(CodeIndex):
         limit: int = DEFAULT_PAGE_LIMIT,
         anchors: bool = False,
         max_source_chars: int = DEFAULT_MAX_SOURCE_CHARS,
+        ref_kinds: frozenset[str] | None = DEFAULT_REFERENCE_KINDS,
     ) -> Inspection:
-        references = self._references_for_symbol(symbol, limit=limit, offset=0)
+        references = self._references_for_symbol(symbol, limit=limit, offset=0, ref_kinds=ref_kinds)
         implementations = self.storage.implementation_candidates(symbol, limit=limit, offset=0)
         source = self.storage.file_source(self.root, symbol.path)
         source_range = _definition_range(self, symbol) or symbol.range
@@ -1077,6 +1159,7 @@ class Repository(CodeIndex):
         *,
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
+        ref_kinds: frozenset[str] | None = None,
     ) -> Page:
         _validate_pagination(limit=limit, offset=offset)
         paths = self.storage.file_paths(language=symbol.language)
@@ -1091,6 +1174,8 @@ class Repository(CodeIndex):
                 continue
             for reference in indexed_file.references:
                 if reference.name != symbol.name:
+                    continue
+                if ref_kinds is not None and reference.reference_kind not in ref_kinds:
                     continue
                 if (
                     reference.path == symbol.path
@@ -1236,6 +1321,7 @@ def inspect(
     max_implementors: int = DEFAULT_MAX_IMPLEMENTORS,
     max_imports: int = DEFAULT_MAX_IMPORTS,
     anchors: bool = False,
+    ref_kinds: str | Iterable[str] | None = _REF_KINDS_DEFAULT,
 ) -> Any:
     output_format = _validate_api_format(format)
     repo = Repository(root, languages=_languages_filter(language))
@@ -1257,6 +1343,7 @@ def inspect(
                 max_references=max_references,
                 max_implementors=max_implementors,
                 max_imports=max_imports,
+                ref_kinds=_ref_kinds_option(ref_kinds),
             ),
             anchors=anchors,
         )
@@ -1269,6 +1356,7 @@ def inspect(
         limit=limit,
         anchors=anchors,
         max_source_chars=max_source_chars,
+        ref_kinds=ref_kinds,
     )
     if output_format == "object":
         return inspection
@@ -1293,6 +1381,7 @@ def inspect_text(
     max_imports: int = DEFAULT_MAX_IMPORTS,
     anchors: bool = False,
     sync: bool = False,
+    ref_kinds: str | Iterable[str] | None = _REF_KINDS_DEFAULT,
 ) -> str:
     repo = Repository(root, languages=_languages_filter(language))
     if sync:
@@ -1312,6 +1401,7 @@ def inspect_text(
             max_references=max_references,
             max_implementors=max_implementors,
             max_imports=max_imports,
+            ref_kinds=_ref_kinds_option(ref_kinds),
         ),
         anchors=anchors,
     )
@@ -1329,12 +1419,15 @@ def refs(
     offset: int = 0,
     sync: bool = False,
     format: str = "object",
+    ref_kinds: str | Iterable[str] | None = _REF_KINDS_DEFAULT,
 ) -> Any:
     output_format = _validate_api_format(format)
     repo = Repository(root, languages=_languages_filter(language))
     if sync:
         repo.refresh()
-    page = repo.refs(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit, offset=offset)
+    page = repo.refs(
+        query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit, offset=offset, ref_kinds=ref_kinds
+    )
     if output_format == "object":
         return page
     if output_format == "text":
@@ -1957,26 +2050,30 @@ class _Storage:
         *,
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
+        ref_kinds: frozenset[str] | None = None,
     ) -> Page:
         _validate_pagination(limit=limit, offset=offset)
+        params: list[object] = [
+            symbol.name,
+            symbol.language,
+            symbol.path.as_posix(),
+            symbol.range.start_byte,
+            symbol.range.end_byte,
+        ]
+        kind_clause, kind_params = _sql_in_clause("reference_kind", tuple(sorted(ref_kinds)) if ref_kinds is not None else ())
+        kind_sql = f"\n              AND {kind_clause}" if kind_clause else ""
+        params.extend(kind_params)
+        params.extend([limit + 1, offset])
         rows = self.connection.execute(
-            """
+            f"""
             SELECT * FROM refs
             WHERE name = ? AND language = ?
-              AND NOT (path = ? AND start_byte = ? AND end_byte = ?)
+              AND NOT (path = ? AND start_byte = ? AND end_byte = ?){kind_sql}
             ORDER BY path, start_byte
             LIMIT ?
             OFFSET ?
             """,
-            (
-                symbol.name,
-                symbol.language,
-                symbol.path.as_posix(),
-                symbol.range.start_byte,
-                symbol.range.end_byte,
-                limit + 1,
-                offset,
-            ),
+            tuple(params),
         ).fetchall()
         return _page_from_extra([_reference_from_row(row, symbol.id) for row in rows], limit=limit, offset=offset)
 
@@ -2136,6 +2233,34 @@ def _coerce_filter_values(value: str | Iterable[str] | None) -> tuple[str, ...]:
     return tuple(item for item in (raw.strip() for raw in raw_values) if item)
 
 
+def _ref_kinds_option(value: str | Iterable[str] | None) -> str | tuple[str, ...] | None:
+    """Coerce a friendly ``ref_kinds`` value into a hashable form for InspectOptions."""
+    if value is None or isinstance(value, str):
+        return value
+    return tuple(value)
+
+
+def _resolve_ref_kinds(value: str | Iterable[str] | None) -> frozenset[str] | None:
+    """Resolve a friendly ``ref_kinds`` value to an allow-set, or ``None`` for all.
+
+    ``"behavioral"`` (the default) hides the high-noise ``import``/``attribute``
+    kinds; ``"all"`` disables filtering; any other value is treated as an
+    explicit comma-separated or iterable allow-list.
+    """
+    if value is None or value == _REF_KINDS_DEFAULT:
+        return DEFAULT_REFERENCE_KINDS
+    if isinstance(value, str) and value.strip().lower() == "all":
+        return None
+    kinds = _coerce_filter_values(value)
+    if not kinds:
+        return DEFAULT_REFERENCE_KINDS
+    invalid = sorted(set(kinds) - REFERENCE_KINDS)
+    if invalid:
+        valid = ", ".join(sorted(REFERENCE_KINDS))
+        raise ValueError(f"unknown reference kind(s): {', '.join(invalid)}; valid kinds: {valid}")
+    return frozenset(kinds)
+
+
 def _sql_in_clause(column: str, values: tuple[str, ...]) -> tuple[str, list[object]]:
     if not values:
         return "", []
@@ -2268,13 +2393,145 @@ def _file_contains_bytes(path: Path, needle: bytes) -> bool:
     return False
 
 
+_PARSER_TLS = threading.local()
+
+
 def _parser_for_language(language: str):
     if language not in LANGUAGE_BY_NAME:
         raise UnsupportedLanguageError(f"Unsupported language: {language}")
-    try:
-        return get_parser(language)
-    except Exception as exc:
-        raise UnsupportedLanguageError(f"No parser available for language: {language}") from exc
+    # Cache parsers per thread: tree-sitter parsers are not safe to share across
+    # threads, and thread-local storage is released when a worker thread ends so
+    # we do not retain parsers across background refreshes.
+    cache = getattr(_PARSER_TLS, "parsers", None)
+    if cache is None:
+        cache = {}
+        _PARSER_TLS.parsers = cache
+    parser = cache.get(language)
+    if parser is None:
+        try:
+            parser = get_parser(language)
+        except Exception as exc:
+            raise UnsupportedLanguageError(f"No parser available for language: {language}") from exc
+        cache[language] = parser
+    return parser
+
+
+_CALLEE_FIELD_NAMES = ("function", "constructor")
+_MEMBER_NAME_FIELDS = ("attribute", "property", "field", "name")
+
+
+def _same_node(a: Node | None, b: Node | None) -> bool:
+    if a is None or b is None:
+        return False
+    return _node_start_byte(a) == _node_start_byte(b) and _node_end_byte(a) == _node_end_byte(b)
+
+
+def _field_child(node: Node | None, *names: str) -> Node | None:
+    if node is None:
+        return None
+    getter = getattr(node, "child_by_field_name", None)
+    if getter is None:
+        return None
+    for name in names:
+        child = getter(name)
+        if child is not None:
+            return child
+    return None
+
+
+def _member_name_node(member: Node | None, language: LanguageSpec) -> Node | None:
+    """The name part of a member access node (``obj.NAME``), not the receiver."""
+    field = _field_child(member, *_MEMBER_NAME_FIELDS)
+    if field is not None:
+        return field
+    # Fall back to the last identifier-like child (handles grammars without
+    # a dedicated property field).
+    name: Node | None = None
+    for child in _node_children(member) if member is not None else []:
+        if _node_kind(child) in language.identifier_node_types:
+            name = child
+    return name
+
+
+def _child_reference_context(
+    node: Node, parent: Node | None, ctx: frozenset[str], language: LanguageSpec
+) -> frozenset[str]:
+    """Context flags that ``node``'s subtree inherits (import / type / inherit)."""
+    added: set[str] = set()
+    node_kind = _node_kind(node)
+    if node_kind in language.import_node_types:
+        added.add("import")
+    if node_kind in language.type_node_types:
+        added.add("type")
+    if node_kind in language.inherit_node_types:
+        added.add("inherit")
+    elif (
+        language.name == "python"
+        and node_kind == "argument_list"
+        and parent is not None
+        and _node_kind(parent) == "class_definition"
+    ):
+        # Python encodes base classes as the class definition's argument list.
+        added.add("inherit")
+    if not added:
+        return ctx
+    return ctx | added
+
+
+def _is_call_callee(node: Node, parent: Node | None, grandparent: Node | None, language: LanguageSpec) -> bool:
+    if parent is None:
+        return False
+    parent_kind = _node_kind(parent)
+    if parent_kind in language.call_node_types:
+        return _same_node(_field_child(parent, *_CALLEE_FIELD_NAMES), node)
+    # Method call: ``obj.method()`` — node is the member of a member-access node
+    # that is itself the callee of the surrounding call.
+    if (
+        parent_kind in language.member_node_types
+        and grandparent is not None
+        and _node_kind(grandparent) in language.call_node_types
+    ):
+        callee = _field_child(grandparent, *_CALLEE_FIELD_NAMES)
+        return _same_node(callee, parent) and _same_node(_member_name_node(parent, language), node)
+    return False
+
+
+def _is_write_target(node: Node, parent: Node | None, language: LanguageSpec) -> bool:
+    if parent is None or _node_kind(parent) not in language.assignment_node_types:
+        return False
+    return _same_node(_field_child(parent, "left", "name"), node)
+
+
+def _is_attribute_ref(node: Node, parent: Node | None, language: LanguageSpec) -> bool:
+    if _node_kind(node) in MEMBER_IDENTIFIER_NODE_TYPES:
+        return True
+    if parent is not None and _node_kind(parent) in language.member_node_types:
+        return _same_node(_member_name_node(parent, language), node)
+    return False
+
+
+def _classify_reference(
+    node: Node,
+    parent: Node | None,
+    grandparent: Node | None,
+    ctx: frozenset[str],
+    language: LanguageSpec,
+) -> str:
+    if "import" in ctx:
+        return "import"
+    if "inherit" in ctx:
+        return "inherit"
+    if _is_call_callee(node, parent, grandparent, language):
+        return "call"
+    if _is_write_target(node, parent, language):
+        return "write"
+    if "type" in ctx or _node_kind(node) == "type_identifier":
+        return "type"
+    if _is_attribute_ref(node, parent, language):
+        return "attribute"
+    if parent is None:
+        return "usage"
+    return "read"
 
 
 def _extract_symbols_and_references(
@@ -2290,7 +2547,13 @@ def _extract_symbols_and_references(
     text = source.decode("utf-8", errors="replace")
     lines = text.splitlines()
 
-    def walk(node: Node, container: str | None) -> None:
+    def walk(
+        node: Node,
+        container: str | None,
+        parent: Node | None,
+        grandparent: Node | None,
+        ctx: frozenset[str],
+    ) -> None:
         symbol = _symbol_from_node(source, path, language, node, container)
         next_container = container
         if symbol is not None:
@@ -2307,13 +2570,15 @@ def _extract_symbols_and_references(
                     path=path,
                     range=_node_range(node),
                     context=_line_context(lines, node),
+                    reference_kind=_classify_reference(node, parent, grandparent, ctx, language),
                 )
             )
 
+        child_ctx = _child_reference_context(node, parent, ctx, language)
         for child in _node_children(node):
-            walk(child, next_container)
+            walk(child, next_container, node, parent, child_ctx)
 
-    walk(root_node, None)
+    walk(root_node, None, None, None, frozenset())
     if language.name == "python":
         symbols.extend(_python_top_level_symbols(source, path, language, root_node))
     return symbols, references
@@ -2678,7 +2943,9 @@ def _inspect_text(
     source_range = _definition_range(repo, symbol) or symbol.range
     imports = _imports_for_file(repo, symbol.path, limit=options.max_imports)
     members = _members_for_symbol(repo, symbol, limit=options.max_members)
-    references = _references_for_inspect(repo, symbol, limit=options.max_references)
+    references = _references_for_inspect(
+        repo, symbol, limit=options.max_references, ref_kinds=_resolve_ref_kinds(options.ref_kinds)
+    )
     implementors = (
         tuple(repo.storage.implementation_candidates(symbol, limit=options.max_implementors, offset=0).items)
         if options.max_implementors > 0
@@ -2844,12 +3111,14 @@ def _range_within(candidate: Range, container: Range) -> bool:
     )
 
 
-def _references_for_inspect(repo: CodeIndex, symbol: Symbol, *, limit: int) -> tuple[Reference, ...]:
+def _references_for_inspect(
+    repo: CodeIndex, symbol: Symbol, *, limit: int, ref_kinds: frozenset[str] | None = None
+) -> tuple[Reference, ...]:
     if limit <= 0:
         return ()
     if isinstance(repo, Repository):
-        return tuple(repo._references_for_symbol(symbol, limit=limit, offset=0).items)
-    return tuple(repo.storage.references_for(symbol, limit=limit, offset=0).items)
+        return tuple(repo._references_for_symbol(symbol, limit=limit, offset=0, ref_kinds=ref_kinds).items)
+    return tuple(repo.storage.references_for(symbol, limit=limit, offset=0, ref_kinds=ref_kinds).items)
 
 
 def _callers_for_symbol(
@@ -3030,8 +3299,23 @@ def _format_reference_item(reference: Reference, *, indent: int) -> list[str]:
         f"{prefix}- id: {_text_reference_id(reference)}",
         f"{prefix}  file: {reference.path.as_posix()}",
         f"{prefix}  range: {_line_range(reference.range)}",
+        f"{prefix}  kind: {reference.reference_kind}",
         f"{prefix}  context: {reference.context}",
     ]
+
+
+def _reference_kind_counts(references: tuple[Reference, ...]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for reference in references:
+        counts[reference.reference_kind] = counts.get(reference.reference_kind, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _reference_kind_breakdown(references: tuple[Reference, ...]) -> str:
+    counts = _reference_kind_counts(references)
+    if not counts:
+        return "{}"
+    return ", ".join(f"{kind}={count}" for kind, count in counts.items())
 
 
 def _format_relation_section(repo: CodeIndex, name: str, items: tuple[Any, ...], limit: int) -> list[str]:
@@ -3062,6 +3346,7 @@ def _format_summary_section(
         f"  callers: {len(callers)}",
         f"  callees: {len(callees)}",
         f"  references: {len(references)}",
+        f"  reference_kinds: {_reference_kind_breakdown(references)}",
         f"  implementors: {len(implementors)}",
     ]
 
@@ -3653,6 +3938,7 @@ def _readable_reference(reference: Reference) -> dict[str, Any]:
         "path": reference.path.as_posix(),
         "line": reference.range.start.line + 1,
         "column": reference.range.start.column + 1,
+        "kind": reference.reference_kind,
         "context": reference.context,
     }
 
@@ -3694,6 +3980,7 @@ def _readable_inspection(inspection: Inspection) -> dict[str, Any]:
         result["source_anchor"] = _readable_source_anchor(inspection.source_anchor)
     result["imports"] = [_readable_import(import_item) for import_item in inspection.imports]
     result["references"] = [_readable_reference(reference) for reference in inspection.references]
+    result["reference_kinds"] = _reference_kind_counts(inspection.references)
     result["references_has_more"] = inspection.references_has_more
     if inspection.references_next_offset is not None:
         result["references_next_offset"] = inspection.references_next_offset
@@ -3770,6 +4057,41 @@ def _add_page_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--offset", type=_non_negative_int, default=0)
 
 
+def _ref_kind_value(value: str) -> str:
+    unknown = sorted(set(_coerce_filter_values(value)) - REFERENCE_KINDS)
+    if unknown:
+        valid = ", ".join(sorted(REFERENCE_KINDS))
+        raise argparse.ArgumentTypeError(f"unknown reference kind(s): {', '.join(unknown)}; valid kinds: {valid}")
+    return value
+
+
+def _add_ref_kind_options(parser: argparse.ArgumentParser) -> None:
+    valid = ", ".join(sorted(REFERENCE_KINDS))
+    parser.add_argument(
+        "--ref-kind",
+        dest="ref_kind",
+        type=_ref_kind_value,
+        help=(
+            "Filter references by behavior. Comma-separated subset of: "
+            f"{valid}. Defaults to hiding import/attribute noise."
+        ),
+    )
+    parser.add_argument(
+        "--all-kinds",
+        action="store_true",
+        help="Show every reference kind, including imports and member-access noise.",
+    )
+
+
+def _ref_kinds_arg(args: argparse.Namespace) -> str | tuple[str, ...] | None:
+    if getattr(args, "all_kinds", False):
+        return "all"
+    ref_kind = getattr(args, "ref_kind", None)
+    if ref_kind:
+        return ref_kind
+    return _REF_KINDS_DEFAULT
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
@@ -3818,12 +4140,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--max-references", type=_non_negative_int, default=DEFAULT_MAX_REFERENCES)
     inspect.add_argument("--max-implementors", type=_non_negative_int, default=DEFAULT_MAX_IMPLEMENTORS)
     inspect.add_argument("--max-imports", type=_non_negative_int, default=DEFAULT_MAX_IMPORTS)
+    _add_ref_kind_options(inspect)
 
     refs = subparsers.add_parser("refs", help="Find references for the best symbol match.")
     _add_index_options(refs)
     refs.add_argument("query")
     _add_match_options(refs)
     _add_page_options(refs)
+    _add_ref_kind_options(refs)
     refs.add_argument("--json", action="store_true", help="Print JSON instead of LLM-friendly text.")
 
     impls = subparsers.add_parser("impls", help="Find implementation candidates for the best symbol match.")
@@ -3879,6 +4203,7 @@ def _inspect_options_from_args(args: argparse.Namespace) -> InspectOptions:
         max_references=args.max_references,
         max_implementors=args.max_implementors,
         max_imports=args.max_imports,
+        ref_kinds=_ref_kinds_arg(args),
     )
 
 
@@ -3983,6 +4308,7 @@ def main(argv: list[str] | None = None) -> int:
                         limit=args.limit,
                         anchors=args.anchors,
                         max_source_chars=args.max_source_chars,
+                        ref_kinds=_ref_kinds_arg(args),
                     )
                 )
             else:
@@ -4007,6 +4333,7 @@ def main(argv: list[str] | None = None) -> int:
                 exact_only=args.exact_only,
                 limit=args.limit,
                 offset=args.offset,
+                ref_kinds=_ref_kinds_arg(args),
             )
             if args.json:
                 _print_cli_json(page)

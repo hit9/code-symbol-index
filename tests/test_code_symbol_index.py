@@ -1420,3 +1420,162 @@ def test_cli_requires_existing_index(tmp_path: Path, capsys) -> None:
     captured = capsys.readouterr()
     assert exit_code == 2
     assert "code-symbol-index index" in captured.err
+
+
+_REF_KIND_SOURCE = """\
+from mod import widget
+
+
+class Thing:
+    pass
+
+
+class Child(widget.Base):
+    field: Thing = None
+
+    def run(self):
+        local = widget()
+        member = self.widget
+        widget = 5
+        return local
+
+
+def widget():
+    return 1
+"""
+
+
+def _kinds_by_name(references, name):
+    return {ref.reference_kind for ref in references if ref.name == name}
+
+
+def test_references_classified_by_behavior(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(_REF_KIND_SOURCE, encoding="utf-8")
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    every = repo.refs("widget", ref_kinds="all", limit=50)
+    kinds = _kinds_by_name(every, "widget")
+
+    assert "call" in kinds       # widget()
+    assert "write" in kinds      # widget = 5
+    assert "inherit" in kinds    # class Child(widget.Base)
+    assert "import" in kinds     # from mod import widget
+    assert "attribute" in kinds  # self.widget
+
+    type_refs = repo.refs("Thing", ref_kinds="all", limit=50)
+    assert "type" in _kinds_by_name(type_refs, "Thing")  # field: Thing
+
+
+def test_refs_default_hides_import_and_attribute_noise(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(_REF_KIND_SOURCE, encoding="utf-8")
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    default_kinds = _kinds_by_name(repo.refs("widget", limit=50), "widget")
+
+    assert "import" not in default_kinds
+    assert "attribute" not in default_kinds
+    assert "call" in default_kinds
+    assert "write" in default_kinds
+
+
+def test_refs_ref_kinds_explicit_filter(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(_REF_KIND_SOURCE, encoding="utf-8")
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    only_calls = repo.refs("widget", ref_kinds="call", limit=50)
+
+    assert only_calls
+    assert all(ref.reference_kind == "call" for ref in only_calls)
+
+
+def test_refs_storage_path_filters_by_kind(tmp_path: Path) -> None:
+    # CodeIndex (not Repository) reads persisted refs via SQL.
+    (tmp_path / "app.py").write_text(_REF_KIND_SOURCE, encoding="utf-8")
+    index = CodeIndex(tmp_path).build()
+
+    all_kinds = _kinds_by_name(index.refs("widget", ref_kinds="all", limit=50), "widget")
+    behavioral = _kinds_by_name(index.refs("widget", limit=50), "widget")
+
+    assert "import" in all_kinds
+    assert "import" not in behavioral
+    assert "call" in behavioral
+
+
+def test_refs_text_and_json_expose_kind(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(_REF_KIND_SOURCE, encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    text = code_symbol_index.refs("widget", root=tmp_path, format="text", limit=50)
+    payload = code_symbol_index.refs("widget", root=tmp_path, format="json", limit=50)
+
+    assert "kind:" in text
+    assert payload["items"]
+    # The Python API json mirrors the dataclass field name.
+    assert all("reference_kind" in item for item in payload["items"])
+
+    # The CLI --json output uses the readable "kind" key.
+    main(["refs", "widget", "--root", str(tmp_path), "--json", "--all-kinds", "--limit", "50"])
+    cli_payload = json.loads(capsys.readouterr().out)
+    assert all("kind" in item for item in cli_payload["items"])
+
+
+def test_inspect_summary_reports_reference_kinds(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(_REF_KIND_SOURCE, encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    text = code_symbol_index.inspect_text("widget", root=tmp_path)
+    assert "reference_kinds:" in text
+
+    main(["inspect", "widget", "--root", str(tmp_path), "--json", "--max-references", "50"])
+    payload = json.loads(capsys.readouterr().out)
+    assert "call" in payload["reference_kinds"]
+
+
+def test_refs_javascript_classification(tmp_path: Path) -> None:
+    (tmp_path / "app.js").write_text(
+        "import { widget } from './m';\n"
+        "class Child extends widget {\n"
+        "  run() {\n"
+        "    const value = widget();\n"
+        "    return obj.widget;\n"
+        "  }\n"
+        "}\n"
+        "function widget() { return 1; }\n",
+        encoding="utf-8",
+    )
+    repo = Repository(tmp_path, create_index=True).refresh()
+
+    kinds = _kinds_by_name(repo.refs("widget", ref_kinds="all", limit=50), "widget")
+
+    assert "call" in kinds
+    assert "inherit" in kinds
+    assert "import" in kinds
+
+
+def test_cli_ref_kind_flag_and_all_kinds(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(_REF_KIND_SOURCE, encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    exit_code = main(["refs", "widget", "--root", str(tmp_path), "--ref-kind", "call", "--limit", "50"])
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "kind: call" in out
+    assert "kind: import" not in out
+
+    exit_code = main(["refs", "widget", "--root", str(tmp_path), "--all-kinds", "--limit", "50"])
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "kind: import" in out
+
+
+def test_cli_ref_kind_rejects_unknown_kind(tmp_path: Path, capsys) -> None:
+    (tmp_path / "app.py").write_text(_REF_KIND_SOURCE, encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    try:
+        main(["refs", "widget", "--root", str(tmp_path), "--ref-kind", "bogus"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit for invalid --ref-kind")
+    assert "unknown reference kind" in capsys.readouterr().err

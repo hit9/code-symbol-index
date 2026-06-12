@@ -134,6 +134,8 @@ code-symbol-index inspect Tool --root /path/to/repo --anchors
 code-symbol-index outline src/app.py --root /path/to/repo
 code-symbol-index outline src/app.py --root /path/to/repo --symbol Tool
 code-symbol-index refs Tool --root /path/to/repo --limit 20 --offset 0
+code-symbol-index refs Tool --root /path/to/repo --ref-kind call,write
+code-symbol-index refs Tool --root /path/to/repo --all-kinds
 code-symbol-index impls Greeter --root /path/to/repo --kind trait --limit 20 --offset 0
 code-symbol-index clean --root /path/to/repo
 code-symbol-index install-skill
@@ -209,6 +211,7 @@ summary:
   callers: 1
   callees: 1
   references: 3
+  reference_kinds: call=2, read=1
   implementors: 0
 imports:
   - range: 0:1
@@ -315,6 +318,41 @@ assignment as `container`.
 
 All line ranges are `start:end`, 0-based, with `end` exclusive.
 
+## Reference Kinds
+
+`refs` classifies every reference by how it uses the symbol, so you can tell a
+real behavioral dependency apart from incidental noise. Each item carries a
+`kind`:
+
+| kind | meaning |
+| --- | --- |
+| `call` | the symbol is invoked (`f(...)`, method call) |
+| `read` | the value is read in an expression |
+| `write` | the symbol is an assignment / mutation target |
+| `inherit` | a base class / `extends` / `implements` / trait bound |
+| `type` | used in a type annotation position |
+| `import` | named in an import / `use` statement |
+| `attribute` | `obj.name` member access (can't be bound syntactically) |
+| `usage` | fallback when nothing more specific applies |
+
+By default `refs` and `inspect` hide the high-noise `import` and `attribute`
+kinds. Use `--ref-kind` to request an explicit comma-separated subset, or
+`--all-kinds` to show everything:
+
+```bash
+code-symbol-index refs Tool --root /path/to/repo --ref-kind call,write
+code-symbol-index refs Tool --root /path/to/repo --all-kinds
+```
+
+The Python API mirrors this with `ref_kinds=` on `refs(...)` / `inspect(...)`:
+pass an iterable or comma-separated string of kinds, or `"all"` to disable the
+filter. `inspect` reports a `reference_kinds` count breakdown in its summary.
+
+Classification is syntactic (tree-sitter, no type inference). Python,
+JavaScript, and TypeScript/TSX have tuned rules; other languages get a
+best-effort subset and otherwise fall back to `read`/`usage`. Treat `kind` as a
+strong hint, not a guarantee.
+
 ## Python API
 
 ```python
@@ -420,7 +458,7 @@ Queries:
 - `search_text(query: str | list[str], *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, sync=False) -> str`
 - `inspect(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, anchors=False, sync=False, format="object", ...) -> Inspection | str | dict`
 - `inspect_text(query, *, root=".", kind=None, language=None, path=None, exact_only=False, anchors=False, sync=False, ...) -> str`
-- `refs(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
+- `refs(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, offset=0, sync=False, format="object", ref_kinds="behavioral") -> Page | str | dict`
 - `impls(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
 - `outline(path, *, root=".", symbol=None, max_symbols=200, sync=False, format="object") -> Page | str | dict`
 - `outline_text(path, *, root=".", symbol=None, max_symbols=200, sync=False) -> str`

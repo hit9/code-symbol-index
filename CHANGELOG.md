@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Classified references by behavior: each `refs` result now carries a `kind`
+  (`call`, `read`, `write`, `inherit`, `type`, `import`, `attribute`, or
+  `usage`). Tuned rules for Python/JavaScript/TypeScript, best-effort elsewhere.
+- `refs` and `inspect` hide the noisy `import`/`attribute` kinds by default;
+  `--ref-kind <kinds>` filters to an explicit subset and `--all-kinds` shows
+  everything. The Python API exposes the same via `ref_kinds=`.
+- `inspect` summary now reports a `reference_kinds` count breakdown.
+
+### Changed
+
+- Bumped index schema to version 5 (references are re-extracted with kinds).
+
 ## 0.1.13 - 2026-05-23
 
 ### Changed
