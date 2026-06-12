@@ -113,6 +113,9 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
 - `callers`/`callees` are syntactic and name-based (`confidence: low`): indirect
   or dynamically dispatched calls may be missed, and same-named symbols can be
   conflated. Use them to narrow the search, then confirm with `inspect`.
+- `callees` resolves each call to a callable, preferring the same file/package
+  and dropping ambiguous cross-module matches on generic names (`get`, `add`,
+  ...). Pass `--loose` to include those lower-precision matches.
 - Use `outline` for file paths.
 - Use `--json` only when structured data is needed; readable text is preferred for LLM context.
 - Do not refresh the whole index automatically during ordinary status checks.
@@ -203,6 +206,9 @@ DEFAULT_CALL_DEPTH = 3
 MAX_CALL_DEPTH = 6
 DEFAULT_CALL_FANOUT = 20
 MAX_CALL_GRAPH_NODES = 200
+# Symbol kinds a call edge can resolve to. Restricting callee resolution to
+# these drops false matches against variables/constants/dict keys.
+CALLEE_KINDS = ("class", "function", "method", "constructor", "struct")
 
 CONTAINER_KINDS = {
     "class",
@@ -772,9 +778,10 @@ class CodeIndex:
         exact_only: bool = False,
         depth: int = DEFAULT_CALL_DEPTH,
         limit: int = DEFAULT_CALL_FANOUT,
+        loose: bool = False,
     ) -> CallGraph:
         symbol = _resolve_inspect_symbol(self, query, kind=kind, language=language, path=path, exact_only=exact_only)
-        return _build_call_graph(self, symbol, direction="callees", depth=_clamp_depth(depth), limit=limit)
+        return _build_call_graph(self, symbol, direction="callees", depth=_clamp_depth(depth), limit=limit, loose=loose)
 
     def inspect_symbol(
         self,
@@ -1563,10 +1570,11 @@ def callees(
     limit: int = DEFAULT_CALL_FANOUT,
     sync: bool = False,
     format: str = "object",
+    loose: bool = False,
 ) -> Any:
     return _call_chain(
         "callees", query, root=root, kind=kind, language=language, path=path,
-        exact_only=exact_only, depth=depth, limit=limit, sync=sync, format=format,
+        exact_only=exact_only, depth=depth, limit=limit, sync=sync, format=format, loose=loose,
     )
 
 
@@ -1583,13 +1591,15 @@ def _call_chain(
     limit: int,
     sync: bool,
     format: str,
+    loose: bool = False,
 ) -> Any:
     output_format = _validate_api_format(format)
     repo = Repository(root, languages=_languages_filter(language))
     if sync:
         repo.refresh()
+    extra = {"loose": loose} if direction == "callees" else {}
     method = repo.callers if direction == "callers" else repo.callees
-    graph = method(query, kind=kind, language=language, path=path, exact_only=exact_only, depth=depth, limit=limit)
+    graph = method(query, kind=kind, language=language, path=path, exact_only=exact_only, depth=depth, limit=limit, **extra)
     if output_format == "object":
         return graph
     if output_format == "text":
@@ -3341,9 +3351,9 @@ def _direct_callers(repo: CodeIndex, symbol: Symbol, *, limit: int) -> tuple[Sym
     return _callers_for_symbol(repo, symbol, references, limit=limit)
 
 
-def _direct_callees(repo: CodeIndex, symbol: Symbol, *, limit: int) -> tuple[Symbol, ...]:
+def _direct_callees(repo: CodeIndex, symbol: Symbol, *, limit: int, loose: bool = False) -> tuple[Symbol, ...]:
     source_range = _definition_range(repo, symbol) or symbol.range
-    return _callees_for_symbol(repo, symbol, source_range, limit=limit, ref_kinds=frozenset({"call"}))
+    return _callees_for_symbol(repo, symbol, source_range, limit=limit, ref_kinds=frozenset({"call"}), loose=loose)
 
 
 def _clamp_depth(depth: int) -> int:
@@ -3359,9 +3369,14 @@ def _build_call_graph(
     direction: str,
     depth: int,
     limit: int,
+    loose: bool = False,
     max_nodes: int = MAX_CALL_GRAPH_NODES,
 ) -> CallGraph:
-    step = _direct_callers if direction == "callers" else _direct_callees
+    def step(current: Symbol) -> tuple[Symbol, ...]:
+        if direction == "callers":
+            return _direct_callers(repo, current, limit=limit)
+        return _direct_callees(repo, current, limit=limit, loose=loose)
+
     source_cache: dict[Path, str] = {}
 
     visited: dict[str, int] = {symbol.id: 0}
@@ -3374,7 +3389,7 @@ def _build_call_graph(
     for level in range(1, depth + 1):
         next_frontier: list[Symbol] = []
         for current in frontier:
-            for neighbour in step(repo, current, limit=limit):
+            for neighbour in step(current):
                 if neighbour.id == symbol.id:
                     continue
                 if neighbour.id not in visited:
@@ -3488,7 +3503,13 @@ def _callers_for_symbol(
 
 
 def _callees_for_symbol(
-    repo: CodeIndex, symbol: Symbol, range_: Range, *, limit: int, ref_kinds: frozenset[str] | None = None
+    repo: CodeIndex,
+    symbol: Symbol,
+    range_: Range,
+    *,
+    limit: int,
+    ref_kinds: frozenset[str] | None = None,
+    loose: bool = False,
 ) -> tuple[Symbol, ...]:
     if limit <= 0:
         return ()
@@ -3515,12 +3536,44 @@ def _callees_for_symbol(
     callees: list[Symbol] = []
     seen_ids: set[str] = set()
     for name in names:
-        for candidate in repo.search_symbols(name, language=symbol.language, limit=1):
-            if candidate.id not in seen_ids:
-                callees.append(candidate)
-                seen_ids.add(candidate.id)
-            break
+        candidate = _resolve_callee(repo, name, symbol, loose=loose)
+        if candidate is not None and candidate.id not in seen_ids:
+            callees.append(candidate)
+            seen_ids.add(candidate.id)
     return tuple(callees)
+
+
+def _resolve_callee(repo: CodeIndex, name: str, symbol: Symbol, *, loose: bool) -> Symbol | None:
+    """Resolve a called name to a callable symbol, preferring locality.
+
+    Prefers a unique callable in the same file, then the same package
+    (directory), then a unique match anywhere. Cross-module ambiguous names are
+    dropped unless ``loose`` is set, in which case the first global match wins.
+    """
+    language = symbol.language
+
+    def exact(path: str | Path | None, fetch: int) -> list[Symbol]:
+        matches = repo.search_symbols(
+            name, language=language, path=path, kind=CALLEE_KINDS, exact_only=True, limit=fetch
+        )
+        return [candidate for candidate in matches if candidate.id != symbol.id]
+
+    same_file = exact(symbol.path, 3)
+    if same_file:
+        return same_file[0]
+
+    package = symbol.path.parent
+    if package != Path("."):
+        same_package = [c for c in exact(package, 5) if c.path.parent == package]
+        if len(same_package) == 1:
+            return same_package[0]
+
+    global_matches = exact(None, 2)
+    if len(global_matches) == 1:
+        return global_matches[0]
+    if loose and global_matches:
+        return global_matches[0]
+    return None
 
 
 def _enclosing_symbol(
@@ -4626,6 +4679,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         _add_match_options(chain_parser)
         chain_parser.add_argument("--depth", type=_depth, default=DEFAULT_CALL_DEPTH, help=f"Traversal depth (1-{MAX_CALL_DEPTH}).")
         chain_parser.add_argument("--limit", type=_positive_int, default=DEFAULT_CALL_FANOUT, help="Max neighbours expanded per node.")
+        if direction == "callees":
+            chain_parser.add_argument(
+                "--loose",
+                action="store_true",
+                help="Include ambiguous cross-module callee matches (lower precision).",
+            )
         chain_parser.add_argument("--json", action="store_true", help="Print JSON instead of LLM-friendly text.")
 
     outline_parser = subparsers.add_parser("outline", help="Print an indexed file outline.")
@@ -4828,6 +4887,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(_format_page_text(repo, "implementors", page), end="")
         elif args.command in ("callers", "callees"):
             method = repo.callers if args.command == "callers" else repo.callees
+            extra = {"loose": args.loose} if args.command == "callees" else {}
             graph = method(
                 args.query,
                 kind=args.kind,
@@ -4836,6 +4896,7 @@ def main(argv: list[str] | None = None) -> int:
                 exact_only=args.exact_only,
                 depth=args.depth,
                 limit=args.limit,
+                **extra,
             )
             if args.json:
                 _print_cli_json(graph)

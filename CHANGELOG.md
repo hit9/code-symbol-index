@@ -8,6 +8,9 @@
   transitive call graph up to `--depth` (default 3). `callers` groups reachable
   entry points by type (http_route / worker / tool / script / test) with a call
   path back to the target. Syntactic/name-based (`confidence: low`).
+- `callees` resolution is locality-aware (same file/package preferred) and
+  callable-kind filtered; ambiguous cross-module matches on generic names are
+  dropped by default. `--loose` (`loose=True`) includes them.
 
 - Classified references by behavior: each `refs` result now carries a `kind`
   (`call`, `read`, `write`, `inherit`, `type`, `import`, `attribute`, or

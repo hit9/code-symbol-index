@@ -1784,3 +1784,86 @@ def test_cli_callers_ambiguous_symbol_clean_error(tmp_path: Path, capsys) -> Non
     err = capsys.readouterr().err
     assert exit_code == 2
     assert "mbiguous" in err or "narrow with" in err
+
+
+def _write_callee_precision_fixture(tmp_path: Path) -> None:
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "syftpp").mkdir()
+    (tmp_path / "dash").mkdir()
+    (tmp_path / "pkg" / "tool.py").write_text(
+        "from other import create_thing\n\n"
+        "INFO = 1\n\n"
+        "def _helper():\n    return 1\n\n"
+        "def run():\n"
+        "    create_thing()\n"
+        "    obj.get()\n"
+        "    _helper()\n"
+        "    INFO\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "other.py").write_text("def create_thing():\n    return 1\n", encoding="utf-8")
+    # `get` defined in two unrelated packages -> ambiguous
+    (tmp_path / "syftpp" / "a.py").write_text("def get():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "dash" / "b.py").write_text("def get():\n    return 2\n", encoding="utf-8")
+
+
+def test_callees_drop_ambiguous_and_noncallable(tmp_path: Path) -> None:
+    _write_callee_precision_fixture(tmp_path)
+    code_symbol_index.index(tmp_path)
+    graph = code_symbol_index.callees("run", root=tmp_path, depth=1)
+    names = {node.symbol.name for node in graph.roots}
+
+    assert "create_thing" in names   # unique global match
+    assert "_helper" in names        # same-file match
+    assert "get" not in names        # ambiguous across syftpp/dash -> dropped
+    assert "INFO" not in names        # not a callable kind
+
+
+def test_callees_loose_includes_ambiguous(tmp_path: Path) -> None:
+    _write_callee_precision_fixture(tmp_path)
+    code_symbol_index.index(tmp_path)
+    graph = code_symbol_index.callees("run", root=tmp_path, depth=1, loose=True)
+    names = {node.symbol.name for node in graph.roots}
+
+    assert "get" in names
+    assert "create_thing" in names
+
+
+def test_callees_prefers_same_package(tmp_path: Path) -> None:
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "pkg" / "caller.py").write_text(
+        "def driver():\n    return shared()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pkg" / "near.py").write_text("def shared():\n    return 'near'\n", encoding="utf-8")
+    (tmp_path / "elsewhere" / "far.py").write_text("def shared():\n    return 'far'\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    graph = code_symbol_index.callees("driver", root=tmp_path, depth=1)
+    shared = [node for node in graph.roots if node.symbol.name == "shared"]
+    assert len(shared) == 1
+    assert shared[0].symbol.path == Path("pkg/near.py")
+
+
+def test_cli_callees_loose_flag(tmp_path: Path, capsys) -> None:
+    _write_callee_precision_fixture(tmp_path)
+    code_symbol_index.index(tmp_path)
+
+    assert main(["callees", "run", "--root", str(tmp_path), "--depth", "1"]) == 0
+    assert "get  " not in capsys.readouterr().out
+
+    assert main(["callees", "run", "--root", str(tmp_path), "--depth", "1", "--loose"]) == 0
+    assert "- get" in capsys.readouterr().out
+
+
+def test_cli_callers_has_no_loose_flag(tmp_path: Path) -> None:
+    _write_callee_precision_fixture(tmp_path)
+    code_symbol_index.index(tmp_path)
+    # --loose is callees-only; callers must reject it.
+    try:
+        main(["callers", "run", "--root", str(tmp_path), "--loose"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected SystemExit: callers should not accept --loose")

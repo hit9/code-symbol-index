@@ -399,8 +399,14 @@ symbols can be conflated, so use it to narrow down, then confirm with `inspect`.
 `--limit` caps the fan-out expanded per node; `truncated: true` marks a capped
 result. Disambiguate a common name with `--path` / `--kind` / `--exact-only`.
 
+`callees` resolves each call to a callable symbol, preferring the same file,
+then the same package, then a unique match anywhere; ambiguous cross-module
+matches on generic names (`get`, `add`, ...) are dropped for precision. Pass
+`--loose` (`loose=True` in the API) to include those lower-precision matches.
+
 The Python API mirrors this: `callers(query, *, depth=3, limit=20, ...)` and
-`callees(...)` return a `CallGraph` (or text/JSON via `format=`).
+`callees(query, *, depth=3, limit=20, loose=False, ...)` return a `CallGraph`
+(or text/JSON via `format=`).
 
 ## Python API
 

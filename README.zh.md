@@ -372,8 +372,13 @@ entry_points:
 混淆，因此用它来缩小范围，再用 `inspect` 确认。`--limit` 限制每个节点展开的扇出，
 `truncated: true` 表示结果被截断。同名歧义可用 `--path` / `--kind` / `--exact-only` 消解。
 
-Python API 同样提供 `callers(query, *, depth=3, limit=20, ...)` 与 `callees(...)`，
-返回 `CallGraph`（或通过 `format=` 返回文本/JSON）。
+`callees` 在解析每个调用时优先匹配同文件、其次同目录（包），最后取全局唯一匹配；
+对通用名（`get`、`add` 等）的跨模块歧义匹配会被丢弃以保证精度。加 `--loose`
+（API 中 `loose=True`）可纳入这些低精度匹配。
+
+Python API 同样提供 `callers(query, *, depth=3, limit=20, ...)` 与
+`callees(query, *, depth=3, limit=20, loose=False, ...)`，返回 `CallGraph`
+（或通过 `format=` 返回文本/JSON）。
 
 ## Python API
 
