@@ -989,7 +989,7 @@ def test_cli_query_does_not_sync_by_default(tmp_path: Path, capsys) -> None:
     assert "count: 0" in stale_output.out
     assert synced_exit == 0
     assert "name: second_cli_name" in synced_output.out
-    assert "indexing" in synced_output.err
+    assert "indexed" in synced_output.err
 
 
 def test_cli_bare_keyword_search_and_inspect_best_match(tmp_path: Path, capsys) -> None:
@@ -1171,7 +1171,7 @@ def test_cli_progress_goes_to_stderr(tmp_path: Path, capsys) -> None:
     captured = capsys.readouterr()
     assert exit_code == 0
     assert json.loads(captured.out)["root"] == str(tmp_path.resolve())
-    assert "indexing" in captured.err
+    assert "indexed" in captured.err
     assert "writing index" not in captured.err
 
 
@@ -1185,7 +1185,7 @@ def test_cli_index_command_refreshes_disk_index(tmp_path: Path, capsys) -> None:
     assert exit_code == 0
     assert payload["root"] == str(tmp_path.resolve())
     assert (tmp_path / ".code-symbol-index" / "index.sqlite").exists()
-    assert "indexing" in captured.err
+    assert "indexed" in captured.err
     assert "writing index" not in captured.err
 
 
@@ -1579,3 +1579,58 @@ def test_cli_ref_kind_rejects_unknown_kind(tmp_path: Path, capsys) -> None:
     else:
         raise AssertionError("expected SystemExit for invalid --ref-kind")
     assert "unknown reference kind" in capsys.readouterr().err
+
+
+class _FakeStream:
+    def __init__(self, interactive: bool) -> None:
+        self._interactive = interactive
+        self.writes: list[str] = []
+
+    def isatty(self) -> bool:
+        return self._interactive
+
+    def write(self, text: str) -> int:
+        self.writes.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+
+def test_cli_progress_compresses_when_non_tty() -> None:
+    stream = _FakeStream(interactive=False)
+    progress = code_symbol_index._CliProgress(stream)
+
+    progress("scan")
+    progress("start", done=0, total=3)
+    for done in range(1, 4):
+        progress("file", done=done, total=3)
+    progress("finish")
+
+    output = "".join(stream.writes)
+    assert output == "indexed 3 files\n"
+    assert "\r" not in output
+
+
+def test_cli_progress_silent_for_noop_sync_when_non_tty() -> None:
+    stream = _FakeStream(interactive=False)
+    progress = code_symbol_index._CliProgress(stream)
+
+    progress("scan")
+    progress("finish")
+
+    assert stream.writes == []
+
+
+def test_cli_progress_keeps_live_bar_when_interactive() -> None:
+    stream = _FakeStream(interactive=True)
+    progress = code_symbol_index._CliProgress(stream)
+
+    progress("start", done=0, total=2)
+    progress("file", done=1, total=2)
+    progress("finish")
+
+    output = "".join(stream.writes)
+    assert "\r" in output          # live, self-rewriting bar
+    assert "indexing" in output
+    assert "indexed 2 files" not in output

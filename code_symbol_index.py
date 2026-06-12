@@ -3995,6 +3995,10 @@ class _CliProgress:
     def __init__(self, stream: Any | None = None) -> None:
         self.stream = stream
         self.visible = False
+        self.last_total = 0
+        target = stream if stream is not None else sys.stderr
+        isatty = getattr(target, "isatty", None)
+        self.interactive = bool(isatty()) if callable(isatty) else False
 
     def __call__(
         self,
@@ -4004,7 +4008,19 @@ class _CliProgress:
         total: int = 0,
         path: str | None = None,
     ) -> None:
+        if total:
+            self.last_total = total
         stream = self.stream if self.stream is not None else sys.stderr
+
+        # When stderr is captured (non-TTY), the live `\r` bar does not collapse
+        # and floods the output, so suppress per-file updates and emit a single
+        # summary line on finish instead.
+        if not self.interactive:
+            if event == "finish" and self.last_total > 0:
+                stream.write(f"indexed {self.last_total} files\n")
+                stream.flush()
+            return
+
         if event == "scan":
             stream.write("\rscanning files...")
             stream.flush()
