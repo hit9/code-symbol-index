@@ -91,28 +91,35 @@ code-symbol-index outline src/app.py --root /path/to/repo --symbol Tool
 ```
 
 
-## Codex Skill
+## Agent Skill (Codex / Claude)
 
-Install the Codex skill so LLM coding agents can discover and use
-`code-symbol-index` automatically:
-
-```bash
-code-symbol-index install-skill
-```
-
-To override the Codex home directory or force overwrite an existing skill:
+Install the skill so LLM coding agents can discover and use
+`code-symbol-index` automatically. The same `SKILL.md` works for both Codex and
+Claude Code; choose the agent with `--target`:
 
 ```bash
-code-symbol-index install-skill --codex-home ~/.codex --force
+code-symbol-index install-skill                  # Codex (default)
+code-symbol-index install-skill --target claude  # Claude Code
 ```
 
-The command writes `SKILL.md` to
-`$CODEX_HOME/skills/code-symbol-index/`, or `~/.codex/skills/code-symbol-index/`
-when `CODEX_HOME` is not set.
+Install locations:
+
+- **Codex** → `$CODEX_HOME/skills/code-symbol-index/`, or
+  `~/.codex/skills/code-symbol-index/` when `CODEX_HOME` is not set. Override with
+  `--codex-home`.
+- **Claude** → `$CLAUDE_CONFIG_DIR/skills/code-symbol-index/`, or
+  `~/.claude/skills/code-symbol-index/` when `CLAUDE_CONFIG_DIR` is not set.
+  Override with `--claude-dir`.
+
+Use `--force` to overwrite an existing skill:
+
+```bash
+code-symbol-index install-skill --target claude --claude-dir ~/.claude --force
+```
 
 Once installed, the agent will know the skill rules for symbol search,
-inspection, references, file outlines, incremental updates, and index status
-checks.
+inspection, references, call chains, file outlines, incremental updates, and
+index status checks.
 
 ## CLI
 
@@ -141,6 +148,7 @@ code-symbol-index callers handle_job --root /path/to/repo --depth 3
 code-symbol-index callees handle_job --root /path/to/repo --depth 3
 code-symbol-index clean --root /path/to/repo
 code-symbol-index install-skill
+code-symbol-index install-skill --target claude
 ```
 
 JSON is available for structured consumers:
@@ -507,7 +515,7 @@ Index lifecycle:
 - `update(paths, *, root=".", language=None, progress=None) -> Repository`
   CLI: `code-symbol-index update <paths...> --root <repo>`
 - `refresh_async(root=".", *, language=None, db_path=None, progress=None, daemon=True) -> threading.Thread`
-- `install_skill(*, target="codex", codex_home=None, force=False) -> Path`
+- `install_skill(*, target="codex", codex_home=None, claude_dir=None, force=False) -> Path`
 - `clean(root=".") -> None`
 - `status(root=".", *, language=None, db_path=None, check=False, max_pending_files=50, format="object") -> IndexStatus | str | dict`
 - `status_text(root=".", *, language=None, db_path=None, check=False, max_pending_files=50) -> str`

@@ -1694,12 +1694,20 @@ def install_skill(
     *,
     target: str = "codex",
     codex_home: str | Path | None = None,
+    claude_dir: str | Path | None = None,
     force: bool = False,
 ) -> Path:
-    if target != "codex":
-        raise ValueError("only codex skill installation is supported")
-    home = Path(codex_home) if codex_home is not None else Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
-    skill_dir = home / "skills" / CODEX_SKILL_NAME
+    if target == "codex":
+        base = Path(codex_home) if codex_home is not None else Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+    elif target == "claude":
+        base = Path(claude_dir) if claude_dir is not None else Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+    else:
+        raise ValueError(f"unsupported skill target: {target}; expected codex or claude")
+    return _write_skill(base, force=force)
+
+
+def _write_skill(base: Path, *, force: bool) -> Path:
+    skill_dir = base / "skills" / CODEX_SKILL_NAME
     skill_file = skill_dir / "SKILL.md"
     content = CODEX_SKILL.rstrip() + "\n"
     if skill_file.exists():
@@ -4711,9 +4719,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     clean_parser = subparsers.add_parser("clean", help="Delete the on-disk code-symbol-index index.")
     clean_parser.add_argument("--root", default=".", help="Codebase root. Defaults to the current directory.")
 
-    install_skill_parser = subparsers.add_parser("install-skill", help="Install the Codex skill for code-symbol-index.")
-    install_skill_parser.add_argument("--target", default="codex", choices=("codex",), help="Skill target. Currently only codex is supported.")
+    install_skill_parser = subparsers.add_parser("install-skill", help="Install the code-symbol-index agent skill (Codex or Claude).")
+    install_skill_parser.add_argument("--target", default="codex", choices=("codex", "claude"), help="Skill target agent. Defaults to codex.")
     install_skill_parser.add_argument("--codex-home", help="Codex home directory. Defaults to $CODEX_HOME or ~/.codex.")
+    install_skill_parser.add_argument("--claude-dir", help="Claude config directory. Defaults to $CLAUDE_CONFIG_DIR or ~/.claude.")
     install_skill_parser.add_argument("--force", action="store_true", help="Overwrite an existing skill.")
 
     languages = subparsers.add_parser("languages", help="Print configured languages with available parsers.")
@@ -4771,8 +4780,8 @@ def main(argv: list[str] | None = None) -> int:
             clean(args.root)
             return 0
         if args.command == "install-skill":
-            path = install_skill(target=args.target, codex_home=args.codex_home, force=args.force)
-            print(f"installed codex skill: {path}")
+            path = install_skill(target=args.target, codex_home=args.codex_home, claude_dir=args.claude_dir, force=args.force)
+            print(f"installed {args.target} skill: {path}")
             return 0
         if args.command == "status":
             payload = _index_status(

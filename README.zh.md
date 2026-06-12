@@ -90,24 +90,31 @@ code-symbol-index outline src/app.py --root /path/to/repo
 code-symbol-index outline src/app.py --root /path/to/repo --symbol Tool
 ```
 
-## Codex 技能（Skill）
+## 代理技能（Codex / Claude）
 
-安装 Codex 技能，使 LLM 编程代理能够自动发现并使用 `code-symbol-index`：
-
-```bash
-code-symbol-index install-skill
-```
-
-如果需要指定 Codex 主目录或强制覆盖已有技能：
+安装技能，使 LLM 编程代理能够自动发现并使用 `code-symbol-index`。同一份
+`SKILL.md` 同时适用于 Codex 和 Claude Code，用 `--target` 选择代理：
 
 ```bash
-code-symbol-index install-skill --codex-home ~/.codex --force
+code-symbol-index install-skill                  # Codex（默认）
+code-symbol-index install-skill --target claude  # Claude Code
 ```
 
-该命令会将 `SKILL.md` 写入 `$CODEX_HOME/skills/code-symbol-index/`，
-若未设置 `CODEX_HOME`，则写入 `~/.codex/skills/code-symbol-index/`。
+安装位置：
 
-安装后，代理将了解符号搜索、查看、引用、文件大纲、增量更新及索引状态检查等技能规则。
+- **Codex** → `$CODEX_HOME/skills/code-symbol-index/`，未设置 `CODEX_HOME` 时为
+  `~/.codex/skills/code-symbol-index/`。可用 `--codex-home` 覆盖。
+- **Claude** → `$CLAUDE_CONFIG_DIR/skills/code-symbol-index/`，未设置
+  `CLAUDE_CONFIG_DIR` 时为 `~/.claude/skills/code-symbol-index/`。可用
+  `--claude-dir` 覆盖。
+
+用 `--force` 覆盖已有技能：
+
+```bash
+code-symbol-index install-skill --target claude --claude-dir ~/.claude --force
+```
+
+安装后，代理将了解符号搜索、查看、引用、调用链、文件大纲、增量更新及索引状态检查等技能规则。
 
 ## CLI
 
@@ -136,6 +143,7 @@ code-symbol-index callers handle_job --root /path/to/repo --depth 3
 code-symbol-index callees handle_job --root /path/to/repo --depth 3
 code-symbol-index clean --root /path/to/repo
 code-symbol-index install-skill
+code-symbol-index install-skill --target claude
 ```
 
 还支持 JSON 输出：
@@ -480,6 +488,6 @@ uv run pytest
 | `outline_text(path, root?, symbol?)` | `str` | 文本格式的文件大纲 |
 | `refs(symbol, root?, limit?, offset?)` | `list` | 对象格式的引用列表 |
 | `impls(symbol, root?, kind?, limit?, offset?)` | `list` | 对象格式的实现候选列表 |
-| `install_skill(target?, codex_home?, force?)` | `Path` | 安装 Codex 技能 |
+| `install_skill(target?, codex_home?, claude_dir?, force?)` | `Path` | 安装代理技能（Codex / Claude） |
 | `languages()` | `list` | 支持的语言列表 |
 | `version_text()` | `str` | 版本字符串 |

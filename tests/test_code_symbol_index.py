@@ -1867,3 +1867,58 @@ def test_cli_callers_has_no_loose_flag(tmp_path: Path) -> None:
         assert exc.code == 2
     else:
         raise AssertionError("expected SystemExit: callers should not accept --loose")
+
+
+def test_install_skill_writes_claude_skill(tmp_path: Path) -> None:
+    path = code_symbol_index.install_skill(target="claude", claude_dir=tmp_path)
+
+    assert path == tmp_path / "skills" / "code-symbol-index" / "SKILL.md"
+    text = path.read_text(encoding="utf-8")
+    assert "name: code-symbol-index" in text
+    assert "code-symbol-index search Tool Agent" in text
+
+    second = code_symbol_index.install_skill(target="claude", claude_dir=tmp_path)
+    assert second == path
+
+
+def test_install_skill_claude_honors_config_dir_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    path = code_symbol_index.install_skill(target="claude")
+    assert path == tmp_path / "skills" / "code-symbol-index" / "SKILL.md"
+    assert path.exists()
+
+
+def test_install_skill_claude_refuses_overwrite_without_force(tmp_path: Path) -> None:
+    path = tmp_path / "skills" / "code-symbol-index" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("custom skill\n", encoding="utf-8")
+
+    try:
+        code_symbol_index.install_skill(target="claude", claude_dir=tmp_path)
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("expected FileExistsError")
+
+    overwritten = code_symbol_index.install_skill(target="claude", claude_dir=tmp_path, force=True)
+    assert overwritten == path
+    assert "name: code-symbol-index" in path.read_text(encoding="utf-8")
+
+
+def test_install_skill_rejects_unknown_target(tmp_path: Path) -> None:
+    try:
+        code_symbol_index.install_skill(target="bogus", claude_dir=tmp_path)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for unknown target")
+
+
+def test_cli_install_skill_claude(tmp_path: Path, capsys) -> None:
+    exit_code = main(["install-skill", "--target", "claude", "--claude-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    skill_path = tmp_path / "skills" / "code-symbol-index" / "SKILL.md"
+    assert exit_code == 0
+    assert skill_path.exists()
+    assert "installed claude skill" in captured.out

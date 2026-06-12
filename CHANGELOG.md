@@ -4,6 +4,10 @@
 
 ### Added
 
+- `install-skill --target claude` installs the agent skill for Claude Code at
+  `~/.claude/skills/code-symbol-index/` (honoring `$CLAUDE_CONFIG_DIR`, override
+  with `--claude-dir`). The same `SKILL.md` serves Codex and Claude.
+
 - `callers` and `callees` commands (and Python `callers()`/`callees()`) walk the
   transitive call graph up to `--depth` (default 3). `callers` groups reachable
   entry points by type (http_route / worker / tool / script / test) with a call
