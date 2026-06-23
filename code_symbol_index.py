@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 SCHEMA_VERSION = 5
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -48,6 +48,7 @@ HASHLINE_HASH_CHARS = 8
 MAX_INSPECT_CANDIDATES = 20
 SYMBOL_QUERY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
 API_FORMATS = ("object", "text", "json")
+ANCHOR_FORMATS = ("legacy", "explicit")
 _DEFAULT_PROGRESS = object()
 CODEX_SKILL_NAME = "code-symbol-index"
 
@@ -368,6 +369,7 @@ class InspectOptions:
     max_implementors: int = DEFAULT_MAX_IMPLEMENTORS
     max_imports: int = DEFAULT_MAX_IMPORTS
     ref_kinds: str | tuple[str, ...] | None = _REF_KINDS_DEFAULT
+    anchor_format: str = "legacy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1400,9 +1402,11 @@ def inspect(
     max_implementors: int = DEFAULT_MAX_IMPLEMENTORS,
     max_imports: int = DEFAULT_MAX_IMPORTS,
     anchors: bool = False,
+    anchor_format: str = "legacy",
     ref_kinds: str | Iterable[str] | None = _REF_KINDS_DEFAULT,
 ) -> Any:
     output_format = _validate_api_format(format)
+    anchor_format = _validate_anchor_format(anchor_format)
     repo = Repository(root, languages=_languages_filter(language))
     if sync:
         repo.refresh()
@@ -1423,6 +1427,7 @@ def inspect(
                 max_implementors=max_implementors,
                 max_imports=max_imports,
                 ref_kinds=_ref_kinds_option(ref_kinds),
+                anchor_format=anchor_format,
             ),
             anchors=anchors,
         )
@@ -1459,9 +1464,11 @@ def inspect_text(
     max_implementors: int = DEFAULT_MAX_IMPLEMENTORS,
     max_imports: int = DEFAULT_MAX_IMPORTS,
     anchors: bool = False,
+    anchor_format: str = "legacy",
     sync: bool = False,
     ref_kinds: str | Iterable[str] | None = _REF_KINDS_DEFAULT,
 ) -> str:
+    anchor_format = _validate_anchor_format(anchor_format)
     repo = Repository(root, languages=_languages_filter(language))
     if sync:
         repo.refresh()
@@ -1481,6 +1488,7 @@ def inspect_text(
             max_implementors=max_implementors,
             max_imports=max_imports,
             ref_kinds=_ref_kinds_option(ref_kinds),
+            anchor_format=anchor_format,
         ),
         anchors=anchors,
     )
@@ -2348,6 +2356,12 @@ def _validate_api_format(format: str) -> str:
     return format
 
 
+def _validate_anchor_format(format: str) -> str:
+    if format not in ANCHOR_FORMATS:
+        raise ValueError(f"anchor_format must be one of: {', '.join(ANCHOR_FORMATS)}")
+    return format
+
+
 def _emit_progress(
     progress: Any | None,
     event: str,
@@ -3080,6 +3094,7 @@ def _inspect_text(
     options: InspectOptions,
     anchors: bool,
 ) -> str:
+    anchor_format = _validate_anchor_format(options.anchor_format)
     invalid_reason = _invalid_symbol_query_reason(query, repo.root)
     if invalid_reason is not None:
         return _bounded_text(f"invalid_input:\n  reason: {invalid_reason}\n", options.max_total_chars)
@@ -3113,7 +3128,7 @@ def _inspect_text(
     lines.extend(_format_symbol_fields(symbol, indent=2, range_=source_range))
     lines.extend(_format_summary_section(imports, members, callers, callees, references, implementors))
     lines.extend(_format_import_section(imports))
-    lines.extend(_format_source_block(source, source_range, options.max_source_chars, anchors=anchors))
+    lines.extend(_format_source_block(source, source_range, options.max_source_chars, anchors=anchors, anchor_format=anchor_format))
     lines.extend(_format_relation_section(repo, "members", members, options.max_members))
     lines.extend(_format_relation_section(repo, "callers", callers, options.max_callers))
     lines.extend(_format_relation_section(repo, "callees", callees, options.max_callees))
@@ -4133,7 +4148,8 @@ def _matched_query(queries: tuple[str, ...], symbol: Symbol) -> str:
     )
 
 
-def _format_source_block(source: str, range_: Range, max_source_chars: int, *, anchors: bool = False) -> list[str]:
+def _format_source_block(source: str, range_: Range, max_source_chars: int, *, anchors: bool = False, anchor_format: str = "legacy") -> list[str]:
+    anchor_format = _validate_anchor_format(anchor_format)
     start, end, shown_end, total_lines, shown_lines, status = _source_excerpt(source, range_, max_source_chars)
     lines = [
         "source:",
@@ -4143,12 +4159,18 @@ def _format_source_block(source: str, range_: Range, max_source_chars: int, *, a
         f"  total_lines: {total_lines}",
     ]
     if anchors:
-        lines.append("  note: Use line:hash as edit anchor; code starts after |")
+        note = (
+            "Use anchor=line:hash as edit anchor; hash = hash(line_content)."
+            if anchor_format == "explicit"
+            else "Use line:hash as edit anchor; code starts after |"
+        )
+        lines.append(f"  note: {note}")
     lines.append("")
 
     for line_number, line in enumerate(shown_lines, start=start):
         if anchors:
-            lines.append(f"{line_number}:{_hash_line(line)}|{line}")
+            anchor = f"{line_number}:{_hash_line(line)}"
+            lines.append(f"anchor={anchor} | {line}" if anchor_format == "explicit" else f"{anchor}|{line}")
         else:
             lines.append(f"  {line_number} |{line}")
     if status == "truncated":
@@ -4652,6 +4674,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--limit", type=_positive_int, default=DEFAULT_PAGE_LIMIT)
     inspect.add_argument("--json", action="store_true", help="Print JSON instead of LLM-friendly text.")
     inspect.add_argument("--anchors", action="store_true", help="Emit current-file line hashes for source snippets.")
+    inspect.add_argument("--anchor-format", choices=ANCHOR_FORMATS, default="legacy", help="Format for --anchors source lines.")
     inspect.add_argument("--max-source-chars", type=_positive_int, default=DEFAULT_MAX_SOURCE_CHARS)
     inspect.add_argument("--max-total-chars", type=_positive_int, default=DEFAULT_MAX_TOTAL_CHARS)
     inspect.add_argument("--max-members", type=_non_negative_int, default=DEFAULT_MAX_MEMBERS)
@@ -4743,6 +4766,7 @@ def _inspect_options_from_args(args: argparse.Namespace) -> InspectOptions:
         max_implementors=args.max_implementors,
         max_imports=args.max_imports,
         ref_kinds=_ref_kinds_arg(args),
+        anchor_format=args.anchor_format,
     )
 
 

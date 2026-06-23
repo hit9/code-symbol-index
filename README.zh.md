@@ -233,7 +233,7 @@ source:
   122 |        return 1
 ```
 
-使用 `inspect --anchors` 或 `inspect_text(..., anchors=True)` 输出当前文件内容中的 hash 行锚：
+使用 `inspect --anchors` 或 `inspect_text(..., anchors=True)` 输出当前文件内容中的 hash 行锚。默认文本格式为 legacy：
 
 ```text
 source:
@@ -246,6 +246,14 @@ source:
 120:a1b2c3d4|def foo():
 121:d4e5f6a7|    if ok:
 122:f6a7b8c9|        return 1
+```
+
+传入 `--anchor-format explicit`（或 `anchor_format="explicit"`）可输出自解释格式：
+
+```text
+anchor=120:a1b2c3d4 | def foo():
+anchor=121:d4e5f6a7 |     if ok:
+anchor=122:f6a7b8c9 |         return 1
 ```
 
 JSON 查看模式下使用 `anchors=True` 会包含 `source_anchor`，其中包含 `path`、
@@ -483,7 +491,7 @@ uv run pytest
 | `search(queries, root?, kind?, path?, exact_only?, limit?, offset?, format?)` | `list`, `dict`, `str` | 搜索符号 |
 | `search_text(queries, root?, ...)` | `str` | 文本格式的搜索结果 |
 | `inspect(symbol, root?, path?, exact_only?, anchors?, format?)` | `dict`, `str` | 查看一个符号 |
-| `inspect_text(symbol, root?, ...)` | `str` | 文本格式的查看结果 |
+| `inspect_text(symbol, root?, anchors?, anchor_format?, ...)` | `str` | 文本格式的查看结果 |
 | `outline(path, root?, symbol?)` | `dict` | 对象格式的文件大纲 |
 | `outline_text(path, root?, symbol?)` | `str` | 文本格式的文件大纲 |
 | `refs(symbol, root?, limit?, offset?)` | `list` | 对象格式的引用列表 |

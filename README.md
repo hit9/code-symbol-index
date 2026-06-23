@@ -239,7 +239,8 @@ source:
 ```
 
 Use `inspect --anchors` or `inspect_text(..., anchors=True)` to emit hashline
-source anchors from the current file contents:
+source anchors from the current file contents. The default text format is
+legacy:
 
 ```text
 source:
@@ -252,6 +253,15 @@ source:
 120:a1b2c3d4|def foo():
 121:d4e5f6a7|    if ok:
 122:f6a7b8c9|        return 1
+```
+
+Pass `--anchor-format explicit` (or `anchor_format="explicit"`) for
+self-describing anchors:
+
+```text
+anchor=120:a1b2c3d4 | def foo():
+anchor=121:d4e5f6a7 |     if ok:
+anchor=122:f6a7b8c9 |         return 1
 ```
 
 JSON inspect with `anchors=True` includes `source_anchor` with `path`,
@@ -524,8 +534,8 @@ Queries:
 
 - `search(query: str | list[str], *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, sync=False, format="object") -> list[Symbol] | str | dict`
 - `search_text(query: str | list[str], *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, sync=False) -> str`
-- `inspect(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, anchors=False, sync=False, format="object", ...) -> Inspection | str | dict`
-- `inspect_text(query, *, root=".", kind=None, language=None, path=None, exact_only=False, anchors=False, sync=False, ...) -> str`
+- `inspect(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, anchors=False, anchor_format="legacy", sync=False, format="object", ...) -> Inspection | str | dict`
+- `inspect_text(query, *, root=".", kind=None, language=None, path=None, exact_only=False, anchors=False, anchor_format="legacy", sync=False, ...) -> str`
 - `refs(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, offset=0, sync=False, format="object", ref_kinds="behavioral") -> Page | str | dict`
 - `impls(query, *, root=".", kind=None, language=None, path=None, exact_only=False, limit=20, offset=0, sync=False, format="object") -> Page | str | dict`
 - `callers(query, *, root=".", kind=None, language=None, path=None, exact_only=False, depth=3, limit=20, sync=False, format="object") -> CallGraph | str | dict`

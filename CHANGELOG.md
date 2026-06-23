@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 - 2026-06-23
+
+### Added
+
+- Added explicit inspect source anchor formatting with
+  `--anchor-format explicit` and Python `anchor_format="explicit"`, emitting
+  `anchor=line:hash | code` while keeping the legacy `line:hash|code` format as
+  the default.
+
 ## 0.3.0 - 2026-06-12
 
 ### Added
