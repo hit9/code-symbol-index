@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 SCHEMA_VERSION = 5
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -54,14 +54,25 @@ CODEX_SKILL_NAME = "code-symbol-index"
 
 CODEX_SKILL = """---
 name: code-symbol-index
-description: Use this skill when navigating a local codebase with the code-symbol-index CLI, including indexing, symbol search, symbol inspection, references (classified by behavior), call-chain queries (transitive callers/callees with entry-point grouping), implementations, file outlines, index status, and refreshing changed files.
+description: Reach for this the moment a code-navigation question is structural rather than textual — "who calls this", "what does this call" (transitive callers/callees with entry-point grouping), "where is this used and how" (references classified as call/read/write/inherit/type), "where is this defined", "what's in this file", or "who implements this interface". It answers these precisely over an index, without the false positives and whole-file reads that grep forces. Prefer grep only for plain string/text search; use this whenever call graphs, reference kinds, or exact symbol resolution matter, especially in large repos. Commands: search, inspect, refs, callers, callees, impls, outline, status, index, update.
 ---
 
 # Code Symbol Index
 
-Use `code-symbol-index` for bounded, indexed code navigation over a local repository.
+Use `code-symbol-index` for bounded, indexed code navigation over a local repository. Reach for it whenever a question is about *structure* — call graphs, references, definitions, implementations — not plain text. It resolves symbols precisely over an index, avoiding grep's false positives and whole-file reads.
 
-## Workflow
+## When to use this instead of grep
+
+- "Who calls X / what does X call" -> `callers` / `callees` (transitive, grouped by entry point). Grep cannot follow call chains.
+- "Where is X used, and how" -> `refs` (each hit classified `call`/`read`/`write`/`inherit`/`type`). Grep can't tell a call from an assignment.
+- "Where is X defined / what's in this file / who implements Y" -> `inspect` / `outline` / `impls`, precisely, without reading whole files.
+- Plain string search with no structural intent -> just use grep.
+
+## The fast path
+
+Assume the index is usually `ready`. Just run the query you need (`search`, `inspect`, `refs`, `callers`, `callees`, `impls`, `outline`) — most commands print a clear hint if the index is missing or stale, so you rarely need a separate `status` check first. Only fall into the setup path below when a command reports the index is missing.
+
+## Setup & freshness (only when needed)
 
 1. Check index state with a cheap read-only status:
    `code-symbol-index status --root <repo>`
@@ -76,6 +87,9 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
    Incremental update is expected to be fast even in large repositories. Do not ask for approval for incremental updates of known changed paths.
    If changed paths are unknown, ask before refreshing the whole index:
    `code-symbol-index index --root <repo>`
+
+## Query reference
+
 5. Search symbols by exact name or prefix:
    `code-symbol-index search Tool Agent --root <repo> --limit 20`
    Use filters when needed:

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2 - 2026-07-06
+
+### Changed
+
+- Rewrote the bundled agent skill (`SKILL.md`) to trigger on structural
+  code-navigation questions (callers/callees, reference kinds, definitions,
+  implementations) rather than a flat feature list, clarify when to prefer it
+  over grep, and lead with the fast path instead of index setup.
+
 ## 0.3.1 - 2026-06-23
 
 ### Added
