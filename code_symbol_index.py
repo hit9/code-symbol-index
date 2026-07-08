@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 SCHEMA_VERSION = 5
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -2516,7 +2516,7 @@ def _parse_file(
     except (OSError, UnicodeDecodeError, BinaryFileError):
         return None
 
-    tree = _parser_for_language(spec.name).parse(source_text)
+    tree = _parse_source(_parser_for_language(spec.name), source_text)
     root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
     source_bytes = source_text.encode("utf-8")
     symbols, references = _extract_symbols_and_references(
@@ -2577,6 +2577,16 @@ def _file_contains_bytes(path: Path, needle: bytes) -> bool:
 
 
 _PARSER_TLS = threading.local()
+
+
+def _parse_source(parser, source: str):
+    # tree-sitter's parse() signature varies across versions/builds: some accept str, others
+    # require bytes (raising "source must be a bytestring or a callable, not str"). Try str first,
+    # then fall back to encoded bytes so both bindings work. Byte offsets are identical either way.
+    try:
+        return parser.parse(source)
+    except TypeError:
+        return parser.parse(source.encode("utf-8"))
 
 
 def _parser_for_language(language: str):
@@ -3691,7 +3701,7 @@ def _definition_ranges_for_symbols(
         for symbol in symbols
     }
     ranges: dict[str, Range] = {}
-    tree = _parser_for_language(spec.name).parse(source)
+    tree = _parse_source(_parser_for_language(spec.name), source)
     root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
 
     def walk(node: Node) -> None:

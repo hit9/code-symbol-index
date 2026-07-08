@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.3 - 2026-07-08
+
+### Fixed
+
+- Parse files across tree-sitter binding variants: some builds require the
+  parse source as `bytes` (raising "source must be a bytestring or a callable,
+  not str"), others require `str`. Try `str` first and fall back to encoded
+  `bytes`, so indexing/search works on both without a hard tree-sitter pin.
+
 ## 0.3.2 - 2026-07-06
 
 ### Changed
