@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 SCHEMA_VERSION = 5
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -2761,8 +2761,8 @@ def _extract_symbols_and_references(
                     name=_node_text(source, node),
                     language=language.name,
                     path=path,
-                    range=_node_range(node),
-                    context=_line_context(lines, node),
+                    range=_node_range(source, node),
+                    context=_line_context(source, lines, node),
                     reference_kind=_classify_reference(node, parent, grandparent, ctx, language),
                 )
             )
@@ -2792,7 +2792,7 @@ def _python_top_level_symbols(source: bytes, path: Path, language: LanguageSpec,
         if not name or not _looks_like_symbol_name(name):
             continue
         kind = "constant" if name.isupper() else "variable"
-        range_ = _node_range(name_node)
+        range_ = _node_range(source, name_node)
         symbols.append(
             Symbol(
                 id=_symbol_id(language.name, path, kind, name, range_.start_byte),
@@ -2831,7 +2831,7 @@ def _python_dict_key_symbols(
         key_name, key_node = _python_dict_key_name(source, language, key)
         if not key_name or not _looks_like_symbol_name(key_name):
             continue
-        range_ = _node_range(key_node)
+        range_ = _node_range(source, key_node)
         symbols.append(
             Symbol(
                 id=_symbol_id(language.name, path, "dict_key", key_name, range_.start_byte),
@@ -2874,7 +2874,7 @@ def _symbol_from_node(
     name = _node_text(source, name_node)
     if not name or not _looks_like_symbol_name(name):
         return None
-    range_ = _node_range(name_node)
+    range_ = _node_range(source, name_node)
     return Symbol(
         id=_symbol_id(language.name, path, kind, name, range_.start_byte),
         name=name,
@@ -2923,25 +2923,28 @@ def _signature(source: bytes, node: Node) -> str:
     return first_line[:240]
 
 
-def _node_range(node: Node) -> Range:
-    start_line, start_column = _point(_node_start_point(node))
-    end_line, end_column = _point(_node_end_point(node))
+def _node_range(source: bytes, node: Node) -> Range:
+    start_byte = _node_start_byte(node)
+    end_byte = _node_end_byte(node)
+    start_line, start_column = _byte_position(source, start_byte)
+    end_line, end_column = _byte_position(source, end_byte)
     return Range(
         start=Position(line=start_line, column=start_column),
         end=Position(line=end_line, column=end_column),
-        start_byte=_node_start_byte(node),
-        end_byte=_node_end_byte(node),
+        start_byte=start_byte,
+        end_byte=end_byte,
     )
 
 
-def _point(point: Any) -> tuple[int, int]:
-    if hasattr(point, "row"):
-        return point.row, point.column
-    return point[0], point[1]
+def _byte_position(source: bytes, offset: int) -> tuple[int, int]:
+    prefix = source[:offset]
+    line = prefix.count(b"\n")
+    line_start = prefix.rfind(b"\n") + 1
+    return line, len(prefix) - line_start
 
 
-def _line_context(lines: list[str], node: Node) -> str:
-    line, _ = _point(_node_start_point(node))
+def _line_context(source: bytes, lines: list[str], node: Node) -> str:
+    line, _ = _byte_position(source, _node_start_byte(node))
     if 0 <= line < len(lines):
         return lines[line].strip()
     return ""
@@ -3695,6 +3698,7 @@ def _definition_ranges_for_symbols(
     spec = _spec_for_path(path, repo.languages)
     if spec is None:
         return {}
+    source_bytes = source.encode("utf-8")
 
     wanted: dict[tuple[str, int], Symbol] = {
         (symbol.kind, symbol.range.start_byte): symbol
@@ -3713,7 +3717,7 @@ def _definition_ranges_for_symbols(
             if name_node is not None:
                 symbol = wanted.get((kind, _node_start_byte(name_node)))
                 if symbol is not None:
-                    ranges[symbol.id] = _node_range(node)
+                    ranges[symbol.id] = _node_range(source_bytes, node)
         for child in _node_children(node):
             walk(child)
 

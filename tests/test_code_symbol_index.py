@@ -41,6 +41,42 @@ value = helper()
     assert "def helper" in (inspection.source_preview or "")
 
 
+def test_python_ranges_do_not_depend_on_tree_sitter_points(monkeypatch) -> None:
+    source = (
+        "def caller():\n"
+        "    return target()\n"
+        "\n"
+        + ("# padding\n" * 32)
+        + "    def target():\n"
+        "        return 1\n"
+    )
+    source_bytes = source.encode("utf-8")
+
+    def fail_point_access(*_args):
+        raise AssertionError("tree-sitter point access should not be used")
+
+    monkeypatch.setattr(code_symbol_index, "_node_start_point", fail_point_access)
+    monkeypatch.setattr(code_symbol_index, "_node_end_point", fail_point_access)
+
+    parser = code_symbol_index._parser_for_language("python")
+    tree = parser.parse(source_bytes)
+    root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
+    symbols, references = code_symbol_index._extract_symbols_and_references(
+        source=source_bytes,
+        root_node=root_node,
+        path=Path("app.py"),
+        language=code_symbol_index.LANGUAGE_BY_NAME["python"],
+        include_references=True,
+    )
+
+    target = next(symbol for symbol in symbols if symbol.name == "target")
+    target_line = source.splitlines().index("    def target():")
+    assert target.range.start.line == target_line
+    assert target.range.start.column == 8
+    assert target.range.start_byte == source_bytes.rindex(b"target")
+    assert any(reference.name == "target" and reference.context == "return target()" for reference in references)
+
+
 def test_indexes_python_top_level_constants_and_dict_keys(tmp_path: Path, capsys) -> None:
     (tmp_path / "settings.py").write_text(
         "MODEL_NAME = 'ask-syft'\n"

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.4 - 2026-07-08
+
+### Fixed
+
+- Avoid tree-sitter point access when building source ranges and reference
+  contexts. Some Python/tree-sitter builds can return unstable `Point` data for
+  valid nodes, which could corrupt memory and crash with SIGSEGV during
+  indexing. Ranges are now derived from source byte offsets instead.
+
 ## 0.3.3 - 2026-07-08
 
 ### Fixed
