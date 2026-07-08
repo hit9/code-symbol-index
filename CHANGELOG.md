@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.5 - 2026-07-08
+
+### Changed
+
+- Require the tree-sitter versions validated with the SIGSEGV fix
+  (`tree-sitter>=0.26.0`, `tree-sitter-language-pack>=1.12.5`) without adding
+  upper bounds, so downstream applications can still choose their own parser
+  stack constraints.
+
 ## 0.3.4 - 2026-07-08
 
 ### Fixed
