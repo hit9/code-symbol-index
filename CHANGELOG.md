@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.4.0 - 2026-08-09
+
+### Changed
+
+- **Breaking:** report every line number as 1-based, with ranges inclusive on
+  both ends. Output previously used 0-based numbering with an exclusive end,
+  which made it the only source of line numbers in an agent's context that did
+  not agree with `grep -n`, editors, tracebacks, and diffs. A symbol printed as
+  `21:250` is now `22:250`: the same span, counted the way every other tool
+  counts it. This covers text output, CLI `--json`, the Python API's
+  `format="json"`, and the `line` part of an edit anchor (`line:hash`).
+- `format="object"` is unchanged and still exposes 0-based `Position.line`. It
+  returns the library's internal dataclasses, where the line number is meant to
+  index into `source.splitlines()` directly.
+- Line numbers stay 0-based throughout the index internals (tree-sitter
+  positions, SQLite rows, source slicing) and are converted only on the way out,
+  so **no reindexing is required** — existing `.code-symbol-index` databases
+  keep working.
+
+### Fixed
+
+- Report a single line-number base in JSON. `line` on symbols and references was
+  1-based while `range`, `start_line`/`end_line`, and hash-line anchors in the
+  same response were 0-based, contradicting each other and the documented
+  contract.
+
+### Migration
+
+- Anything that pinned exact line numbers from text or JSON output — snapshot
+  tests, cached symbol IDs (which embed a range), scripts adding `+1` to work
+  around the old base — needs updating. Subtract the compensation rather than
+  adding one.
+- Agent sessions started before the upgrade may reuse an anchor captured under
+  the old numbering. Anchors carry a content hash, so a stale one is either
+  relocated to the correct line or rejected outright; it cannot silently apply
+  to the wrong line. Re-read the file when one is rejected.
+
 ## 0.3.5 - 2026-07-08
 
 ### Changed

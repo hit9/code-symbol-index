@@ -579,7 +579,7 @@ def test_top_level_api_search_text_is_llm_friendly(tmp_path: Path) -> None:
     assert "has_more: false" in output
     assert "symbols:" in output
     assert "name: target_tool" in output
-    assert "range: 0:2" in output
+    assert "range: 1:2" in output
     assert "score: prefix" in output
     assert "source:" not in output
 
@@ -653,6 +653,53 @@ def test_cli_search_filters_kind_path_exact(tmp_path: Path, capsys) -> None:
     assert output["symbols"][0]["path"] == "pkg/tools.py"
 
 
+def test_reported_line_numbers_are_one_based_and_inclusive(tmp_path: Path, capsys) -> None:
+    """Every line number leaving the library must match what `grep -n` would print for the same
+    line, and ranges must be inclusive on both ends. Positions stay 0-based in memory, so this
+    pins the one conversion that keeps output aligned with editors, tracebacks, and diffs."""
+    lines = [
+        "import os",  # grep -n 1
+        "",
+        "",
+        "class Greeter:",  # grep -n 4
+        "    def hello(self):",  # grep -n 5
+        "        return os.sep",  # grep -n 6
+    ]
+    (tmp_path / "app.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+
+    outline = code_symbol_index.outline_text("app.py", root=tmp_path)
+    assert "range: 1:6" in outline  # whole file, inclusive of the last line
+    assert "4:6 | class Greeter:" in outline  # class spans grep lines 4..6, inclusive
+    assert "5:6 |     def hello(self):" in outline
+
+    text = code_symbol_index.inspect_text("hello", root=tmp_path, anchors=True, anchor_format="explicit")
+    body_hash = hashlib.sha256("        return os.sep".encode("utf-8")).hexdigest()[:8]
+    assert "range: 5:6" in text
+    assert f"anchor=6:{body_hash} |         return os.sep" in text
+
+    api_json = code_symbol_index.inspect("hello", root=tmp_path, format="json", anchors=True)
+    # The stored symbol range covers the name token, so both ends land on the declaration line.
+    assert api_json["definition"]["range"]["start"]["line"] == 5
+    assert api_json["definition"]["range"]["end"]["line"] == 5
+    assert api_json["definition"]["range"]["start"]["column"] == 9  # columns are 1-based too
+    assert api_json["source_anchor"]["start_line"] == 5
+    assert api_json["source_anchor"]["end_line"] == 6
+    assert api_json["source_anchor"]["lines"][-1]["line"] == 6
+
+    assert main(["inspect", "hello", "--root", str(tmp_path), "--anchors", "--json"]) == 0
+    cli_json = json.loads(capsys.readouterr().out)
+    assert cli_json["definition"]["line"] == 5
+    assert cli_json["source_anchor"]["lines"][-1]["line"] == 6
+    assert cli_json["source_anchor"]["end_anchor"] == f"6:{body_hash}"
+
+    # The in-process object graph is the internal model and stays 0-based: `range.start.line` is a
+    # valid index into `source.splitlines()`, which is what callers slicing source actually need.
+    symbol = next(item for item in code_symbol_index.search("hello", root=tmp_path) if item.name == "hello")
+    assert symbol.range.start.line == 4
+    assert lines[symbol.range.start.line] == "    def hello(self):"
+
+
 def test_top_level_api_format_parameter(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("def target_tool():\n    return 1\n", encoding="utf-8")
     code_symbol_index.index(tmp_path)
@@ -668,7 +715,7 @@ def test_top_level_api_format_parameter(tmp_path: Path) -> None:
     assert "query: target" in search_text
     assert search_json["symbols"][0]["name"] == "target_tool"
     assert search_json["symbols"][0]["path"] == "app.py"
-    assert search_json["symbols"][0]["range"]["start"]["line"] == 0
+    assert search_json["symbols"][0]["range"]["start"]["line"] == 1
     assert search_json["has_more"] is False
     assert "source:" in inspect_text
     assert outline_json["items"][0]["name"] == "target_tool"
@@ -703,12 +750,12 @@ def main(argv=None):
     output = code_symbol_index.outline_text("app.py", root=tmp_path)
 
     assert "file: app.py" in output
-    assert "range: 0:6" in output
+    assert "range: 1:6" in output
     assert "count: 3" in output
     assert "outline:" in output
-    assert "0:3 | class Tool:" in output
-    assert "1:3 |     def cli_args(cls, args):" in output
-    assert "4:6 | def main(argv=None):" in output
+    assert "1:3 | class Tool:" in output
+    assert "2:3 |     def cli_args(cls, args):" in output
+    assert "5:6 | def main(argv=None):" in output
     assert "id:" not in output
     assert "source:" not in output
 
@@ -813,11 +860,11 @@ def helper():
 
     assert "symbol:\n" in output
     assert "name: handle" in output
-    assert "range: 1:3" in output
+    assert "range: 2:3" in output
     assert "source:\n" in output
     assert "status: full" in output
-    assert "  1 |    def handle(self):" in output
-    assert "  2 |        return helper()" in output
+    assert "  2 |    def handle(self):" in output
+    assert "  3 |        return helper()" in output
     assert "callees:" in output
 
 
@@ -834,9 +881,9 @@ def test_inspect_text_supports_hashline_anchors(tmp_path: Path) -> None:
     second_hash = hashlib.sha256("    return 1".encode("utf-8")).hexdigest()[:8]
 
     assert "note: Use line:hash as edit anchor; code starts after |" in output
-    assert f"0:{first_hash}|def helper():" in output
-    assert f"1:{second_hash}|    return 1" in output
-    assert "  0 |def helper():" not in output
+    assert f"1:{first_hash}|def helper():" in output
+    assert f"2:{second_hash}|    return 1" in output
+    assert "  1 |def helper():" not in output
 
 
 def test_inspect_json_includes_current_file_source_anchors(tmp_path: Path) -> None:
@@ -857,10 +904,10 @@ def test_inspect_json_includes_current_file_source_anchors(tmp_path: Path) -> No
     body_hash = hashlib.sha256("    return 2".encode("utf-8")).hexdigest()[:8]
 
     assert output["source_anchor"]["path"] == "app.py"
-    assert output["source_anchor"]["start_line"] == 0
+    assert output["source_anchor"]["start_line"] == 1
     assert output["source_anchor"]["end_line"] == 2
-    assert output["source_anchor"]["lines"][1] == {"line": 1, "hash": body_hash, "text": "    return 2"}
-    assert output["source_anchor"]["end_anchor"] == f"1:{body_hash}"
+    assert output["source_anchor"]["lines"][1] == {"line": 2, "hash": body_hash, "text": "    return 2"}
+    assert output["source_anchor"]["end_anchor"] == f"2:{body_hash}"
 
 
 def test_cli_inspect_json_supports_source_anchors(tmp_path: Path, capsys) -> None:
@@ -877,7 +924,7 @@ def test_cli_inspect_json_supports_source_anchors(tmp_path: Path, capsys) -> Non
 
     assert exit_code == 0
     assert output["source_anchor"]["path"] == "app.py"
-    assert output["source_anchor"]["lines"][0]["line"] == 0
+    assert output["source_anchor"]["lines"][0]["line"] == 1
     assert output["source_anchor"]["lines"][0]["text"] == "def helper():"
 
 
@@ -1053,7 +1100,7 @@ value = helper()
     assert "symbol:" in inspect_output
     assert "name: helper" in inspect_output
     assert "source:" in inspect_output
-    assert "  0 |def helper():" in inspect_output
+    assert "  1 |def helper():" in inspect_output
     assert "references:" in inspect_output
 
     json_exit = main(["inspect", "helper", "--root", str(tmp_path), "--language", "python", "--json"])
@@ -1159,8 +1206,8 @@ def main(argv=None):
     assert text_exit == 0
     assert "file: app.py" in text_output
     assert "outline:" in text_output
-    assert "0:3 | class Tool:" in text_output
-    assert "1:3 |     def cli_args(cls, args):" in text_output
+    assert "1:3 | class Tool:" in text_output
+    assert "2:3 |     def cli_args(cls, args):" in text_output
     assert "id:" not in text_output
     assert "source:" not in text_output
     assert json_exit == 0

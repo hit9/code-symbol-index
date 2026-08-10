@@ -206,7 +206,7 @@ symbols:
     matched_query: Tool
 ```
 
-Inspect returns bounded source with stable 0-based line ranges:
+Inspect returns bounded source with stable 1-based line ranges:
 
 ```text
 symbol:
@@ -337,7 +337,17 @@ Python indexes top-level constants, top-level variables, and top-level
 dictionary keys as symbols. Dictionary keys use `kind=dict_key` and the parent
 assignment as `container`.
 
-All line ranges are `start:end`, 0-based, with `end` exclusive.
+## Line Numbers
+
+All reported line numbers are **1-based**, and ranges are `start:end` with
+**both ends inclusive** — the same numbering `grep -n`, editors, tracebacks, and
+diffs use, so a line number can be carried between them without adjustment. This
+applies to text output, CLI `--json`, and the Python API's `format="json"`,
+including the `line` part of an edit anchor (`line:hash`).
+
+The one exception is `format="object"`, which returns the library's internal
+dataclasses: `Position.line` there stays **0-based**, because it is meant to
+index directly into `source.splitlines()`.
 
 ## Reference Kinds
 

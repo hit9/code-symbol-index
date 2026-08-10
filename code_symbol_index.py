@@ -12,7 +12,7 @@ import sqlite3
 import sys
 import threading
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.3.5"
+__version__ = "0.4.0"
 SCHEMA_VERSION = 5
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -122,6 +122,9 @@ Assume the index is usually `ready`. Just run the query you need (`search`, `ins
 
 ## Rules
 
+- Line numbers are 1-based and ranges include both ends, matching `grep -n`,
+  editors, tracebacks, and diffs — a line number can be carried between them
+  unchanged. Edit anchors (`line:hash`) use the same numbering.
 - Queries are symbol names or prefixes, not natural language.
 - Reference classification is syntactic (no type inference); treat `kind` as a
   strong hint, not a guarantee. Use `--all-kinds` if a reference seems missing.
@@ -294,6 +297,10 @@ class ImportItem:
 
 @dataclass(frozen=True, slots=True)
 class HashLine:
+    """One excerpt line. Unlike `Position`, which stays 0-based because it feeds slicing and
+    containment checks, `line` is already the 1-based number callers see — it is built for output
+    and is what the edit anchor `line:hash` carries."""
+
     line: int
     hash: str
     text: str
@@ -301,6 +308,8 @@ class HashLine:
 
 @dataclass(frozen=True, slots=True)
 class SourceAnchor:
+    """Excerpt bounds in the same 1-based, inclusive form as `HashLine.line`."""
+
     path: Path
     start_line: int
     end_line: int
@@ -3832,7 +3841,7 @@ def _format_page_text(repo: CodeIndex, name: str, page: Page) -> str:
 
 
 def _symbol_location(symbol: Symbol) -> str:
-    return f"{symbol.name}  {symbol.path.as_posix()}:{symbol.range.start.line}"
+    return f"{symbol.name}  {symbol.path.as_posix()}:{_display_line(symbol.range.start.line)}"
 
 
 def _format_call_graph_text(repo: CodeIndex, graph: CallGraph) -> str:
@@ -3928,7 +3937,7 @@ def _format_outline_text(repo: CodeIndex, path: Path, page: Page, *, symbol: str
     symbols = tuple(item for item in page.items if isinstance(item, Symbol))
     lines = [
         f"file: {path.as_posix()}",
-        f"range: 0:{total_lines}",
+        f"range: 1:{total_lines}",  # the whole file, 1-based and inclusive
         f"count: {len(symbols)}",
     ]
     if symbol is not None:
@@ -4182,8 +4191,8 @@ def _format_source_block(source: str, range_: Range, max_source_chars: int, *, a
     lines = [
         "source:",
         f"  status: {status}",
-        f"  range: {start}:{end}",
-        f"  shown_range: {start}:{shown_end}",
+        f"  range: {_display_line(start)}:{_display_line(end - 1)}",
+        f"  shown_range: {_display_line(start)}:{_display_line(shown_end - 1)}",
         f"  total_lines: {total_lines}",
     ]
     if anchors:
@@ -4195,7 +4204,7 @@ def _format_source_block(source: str, range_: Range, max_source_chars: int, *, a
         lines.append(f"  note: {note}")
     lines.append("")
 
-    for line_number, line in enumerate(shown_lines, start=start):
+    for line_number, line in enumerate(shown_lines, start=_display_line(start)):
         if anchors:
             anchor = f"{line_number}:{_hash_line(line)}"
             lines.append(f"anchor={anchor} | {line}" if anchor_format == "explicit" else f"{anchor}|{line}")
@@ -4210,12 +4219,12 @@ def _source_anchor(path: Path, source: str, range_: Range, max_source_chars: int
     start, _end, shown_end, _total_lines, shown_lines, _status = _source_excerpt(source, range_, max_source_chars)
     hash_lines = tuple(
         HashLine(line=line_number, hash=_hash_line(line), text=line)
-        for line_number, line in enumerate(shown_lines, start=start)
+        for line_number, line in enumerate(shown_lines, start=_display_line(start))
     )
     return SourceAnchor(
         path=path,
-        start_line=start,
-        end_line=shown_end,
+        start_line=_display_line(start),
+        end_line=_display_line(shown_end - 1),
         start_anchor=_anchor_for_line(hash_lines[0]) if hash_lines else None,
         end_anchor=_anchor_for_line(hash_lines[-1]) if hash_lines else None,
         lines=hash_lines,
@@ -4245,6 +4254,18 @@ def _hash_line(line: str) -> str:
     return hashlib.sha256(line.encode("utf-8")).hexdigest()[:HASHLINE_HASH_CHARS]
 
 
+def _display_line(index: int) -> int:
+    """Convert an internal 0-based line index to the 1-based number shown to callers.
+
+    Line numbers are 0-based everywhere inside the index (tree-sitter positions, SQLite rows,
+    containment checks, source slicing) and 1-based only once they leave through text, JSON, or a
+    result object, so they line up with grep, editors, tracebacks, and diffs. Ranges are inclusive
+    on both ends after conversion: an exclusive 0-based `end` is the same number as the inclusive
+    1-based last line, so pass `end - 1` when converting a half-open bound.
+    """
+    return index + 1
+
+
 def _anchor_for_line(line: HashLine) -> str:
     return f"{line.line}:{line.hash}"
 
@@ -4264,14 +4285,14 @@ def _format_chunks(start: int, end: int, shown_end: int) -> list[str]:
         chunk_end = min(end, chunk_start + chunk_size)
         if chunk_start >= chunk_end:
             break
-        lines.append(f"    - range: {chunk_start}:{chunk_end}")
+        lines.append(f"    - range: {_display_line(chunk_start)}:{_display_line(chunk_end - 1)}")
         lines.append(f"      label: {labels[index]}")
         cursor = chunk_end
     return lines
 
 
 def _line_range(range_: Range) -> str:
-    return f"{range_.start.line}:{range_.end.line + 1}"
+    return f"{_display_line(range_.start.line)}:{_display_line(range_.end.line)}"
 
 
 def _text_symbol_id(symbol: Symbol, range_: Range) -> str:
@@ -4367,11 +4388,15 @@ def _json_default(value: Any) -> Any:
 
 
 def _to_jsonable(value: Any) -> Any:
-    if isinstance(
-        value,
-        (Symbol, Reference, ImportItem, HashLine, SourceAnchor, Inspection, IndexStatus, Page, Position, Range, CallGraph, CallNode, EntryPoint),
-    ):
-        return _to_jsonable(asdict(value))
+    if isinstance(value, Position):
+        # The only place a raw Position leaves the library. Positions stay 0-based in memory
+        # because they index into source lines, and are converted here so that every serialized
+        # line number -- text, CLI JSON, API JSON -- is 1-based.
+        return {"line": _display_line(value.line), "column": _display_line(value.column)}
+    if is_dataclass(value) and not isinstance(value, type):
+        # Walked one level at a time rather than with asdict(), which would flatten nested
+        # dataclasses before the Position branch above could see them.
+        return {field.name: _to_jsonable(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, Path):
         return value.as_posix()
     if isinstance(value, dict):
@@ -4441,7 +4466,7 @@ def _readable_symbol(symbol: Symbol) -> dict[str, Any]:
         "kind": symbol.kind,
         "language": symbol.language,
         "path": symbol.path.as_posix(),
-        "line": symbol.range.start.line + 1,
+        "line": _display_line(symbol.range.start.line),
         "column": symbol.range.start.column + 1,
     }
     if symbol.container:
@@ -4455,7 +4480,7 @@ def _readable_reference(reference: Reference) -> dict[str, Any]:
     return {
         "name": reference.name,
         "path": reference.path.as_posix(),
-        "line": reference.range.start.line + 1,
+        "line": _display_line(reference.range.start.line),
         "column": reference.range.start.column + 1,
         "kind": reference.reference_kind,
         "context": reference.context,
