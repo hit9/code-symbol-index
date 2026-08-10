@@ -11,9 +11,14 @@
   `21:250` is now `22:250`: the same span, counted the way every other tool
   counts it. This covers text output, CLI `--json`, the Python API's
   `format="json"`, and the `line` part of an edit anchor (`line:hash`).
-- `format="object"` is unchanged and still exposes 0-based `Position.line`. It
-  returns the library's internal dataclasses, where the line number is meant to
-  index into `source.splitlines()` directly.
+- **Breaking:** the Python API's `format="json"` now reports 1-based `column`
+  too, so `range.start` reads `{"line": 5, "column": 9}` where it used to read
+  `{"line": 4, "column": 8}`. A 1-based line beside a 0-based column is a trap,
+  and the CLI's `--json` already reported columns 1-based; both JSON shapes now
+  agree.
+- `format="object"` is unchanged and still exposes 0-based `Position.line` and
+  `Position.column`. It returns the library's internal dataclasses, where the
+  line number is meant to index into `source.splitlines()` directly.
 - Line numbers stay 0-based throughout the index internals (tree-sitter
   positions, SQLite rows, source slicing) and are converted only on the way out,
   so **no reindexing is required** — existing `.code-symbol-index` databases

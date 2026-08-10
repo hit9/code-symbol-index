@@ -329,10 +329,10 @@ Python 索引将顶层常量、顶层变量和顶层字典键作为符号索引�
 所有对外报告的行号均为 **1 基**，区间 `start:end` **两端都包含**——与 `grep -n`、
 编辑器、traceback 和 diff 使用的编号一致，因此行号可以在它们之间直接传递而无需换算。
 文本输出、CLI `--json` 以及 Python API 的 `format="json"` 都遵循此约定，编辑锚点
-（`line:hash`）中的 `line` 部分同样如此。
+（`line:hash`）中的 `line` 部分同样如此。出于同样的理由，JSON 输出中的列号也是 1 基。
 
 唯一的例外是 `format="object"`，它返回库内部的 dataclass：其中的 `Position.line`
-仍为 **0 基**，因为它的用途是直接索引 `source.splitlines()`。
+和 `Position.column` 仍为 **0 基**，因为它们的用途是直接索引 `source.splitlines()`。
 
 ## 引用类型（Reference Kinds）
 

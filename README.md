@@ -343,11 +343,12 @@ All reported line numbers are **1-based**, and ranges are `start:end` with
 **both ends inclusive** — the same numbering `grep -n`, editors, tracebacks, and
 diffs use, so a line number can be carried between them without adjustment. This
 applies to text output, CLI `--json`, and the Python API's `format="json"`,
-including the `line` part of an edit anchor (`line:hash`).
+including the `line` part of an edit anchor (`line:hash`). Columns in JSON output
+are 1-based for the same reason.
 
 The one exception is `format="object"`, which returns the library's internal
-dataclasses: `Position.line` there stays **0-based**, because it is meant to
-index directly into `source.splitlines()`.
+dataclasses: `Position.line` and `Position.column` there stay **0-based**,
+because they are meant to index directly into `source.splitlines()`.
 
 ## Reference Kinds
 
