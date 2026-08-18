@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The `index` scan stage is dramatically faster on large trees. It now walks on
+  plain strings and builds a `Path` only for files it actually yields, tests the
+  file extension first (the cheapest and most selective filter), matches the
+  exclude list with one precompiled regex instead of an `fnmatch` call per
+  pattern, and scopes each `.gitignore` by string prefix instead of
+  `Path.relative_to` with exceptions for control flow. The old code tested every
+  `.gitignore` against every candidate path, so cost grew with
+  *files x nested-ignore-files*: a 18.6k-file tree with 200 nested `.gitignore`
+  files scanned in 18.0s and now takes 47ms. Scanning was 37% of a full build on
+  a mid-sized tree and is now under 15%. The set of indexed files is unchanged.
+- `dir/**` exclude patterns whose directory half contains a glob now prune the
+  directory during the walk. `bazel-*/**` matched `bazel-out/x.py` but not
+  `bazel-out`, so the walk descended into the whole tree only to exclude every
+  file in it one at a time. Indexed files are unchanged; the walk just stops
+  earlier.
+
 ## 0.5.0 - 2026-08-17
 
 ### Added

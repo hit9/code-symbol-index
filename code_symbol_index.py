@@ -792,8 +792,9 @@ class CodeIndex:
         self.languages = _normalize_languages(languages)
         self.include = tuple(include or ())
         self.exclude = tuple(DEFAULT_EXCLUDES) + tuple(exclude or ())
+        self._exclude_matcher = _compile_path_patterns(self.exclude)
         self.storage = _Storage(db_path, create=create_storage)
-        self._gitignore_specs: tuple[tuple[Path, pathspec.PathSpec], ...] | None = None
+        self._gitignore_specs: tuple[tuple[str, str, pathspec.PathSpec], ...] | None = None
 
     def build(self) -> CodeIndex:
         self.storage.clear()
@@ -1109,51 +1110,69 @@ class CodeIndex:
 
 
     def _iter_indexable_files(self) -> Iterable[Path]:
-        for dirpath, dirnames, filenames in os.walk(self.root):
-            current_dir = Path(dirpath)
-            relative_dir = current_dir.relative_to(self.root)
+        # The walk runs on posix strings and only builds a Path for files it
+        # actually yields. Constructing a Path per candidate dominated the scan
+        # on large trees, as did ``Path.relative_to`` inside the ignore checks.
+        root_text = str(self.root)
+        for dirpath, dirnames, filenames in os.walk(root_text):
+            relative_dir = os.path.relpath(dirpath, root_text)
+            prefix = "" if relative_dir == "." else relative_dir.replace(os.sep, "/") + "/"
             dirnames[:] = [
                 dirname
                 for dirname in dirnames
-                if not self._should_skip_dir(relative_dir / dirname)
+                if not self._should_skip_dir_text(prefix + dirname)
             ]
             for filename in filenames:
-                relative_path = relative_dir / filename
-                if self._should_index(relative_path):
-                    yield relative_path
+                path_text = prefix + filename
+                if self._should_index_text(path_text):
+                    yield Path(path_text)
 
     def _should_index(self, relative_path: Path) -> bool:
-        path_text = relative_path.as_posix()
+        return self._should_index_text(relative_path.as_posix())
+
+    def _should_index_text(self, path_text: str) -> bool:
+        # Extension first: it is the cheapest and most selective test, so most
+        # files never reach the pattern and gitignore matching below.
+        if _spec_for_extension(_extension_of(path_text), self.languages) is None:
+            return False
         if self.include and not any(fnmatch.fnmatch(path_text, pattern) for pattern in self.include):
             return False
-        if self._is_excluded(relative_path):
+        if self._is_excluded_text(path_text):
             return False
-        if self._is_gitignored(relative_path):
+        if self._is_gitignored_text(path_text):
             return False
-        return _spec_for_path(relative_path, self.languages) is not None
+        return True
 
     def _should_skip_dir(self, relative_path: Path) -> bool:
-        if relative_path == Path("."):
+        return self._should_skip_dir_text(relative_path.as_posix())
+
+    def _should_skip_dir_text(self, path_text: str) -> bool:
+        if path_text == ".":
             return False
-        path_text = relative_path.as_posix()
-        return self._is_excluded(relative_path) or self._is_gitignored(relative_path, is_dir=True)
+        return self._is_excluded_text(path_text) or self._is_gitignored_text(path_text, is_dir=True)
 
     def _is_excluded(self, relative_path: Path) -> bool:
-        path_text = relative_path.as_posix()
-        return any(_matches_path_pattern(path_text, pattern) for pattern in self.exclude)
+        return self._is_excluded_text(relative_path.as_posix())
+
+    def _is_excluded_text(self, path_text: str) -> bool:
+        return self._exclude_matcher(os.path.normcase(path_text)) is not None
 
     def _relative_path(self, path: Path) -> Path:
         full_path = path if path.is_absolute() else self.root / path
         return full_path.resolve().relative_to(self.root)
 
     def _is_gitignored(self, relative_path: Path, *, is_dir: bool = False) -> bool:
-        path_text = relative_path.as_posix()
-        if is_dir:
-            path_text = f"{path_text}/"
-        for base, spec in self._gitignore_specs_for_root():
-            try:
-                scoped_path = relative_path.relative_to(base).as_posix()
-            except ValueError:
+        return self._is_gitignored_text(relative_path.as_posix(), is_dir=is_dir)
+
+    def _is_gitignored_text(self, path_text: str, *, is_dir: bool = False) -> bool:
+        for base_text, base_prefix, spec in self._gitignore_specs_for_root():
+            if not base_text:
+                scoped_path = path_text
+            elif path_text == base_text:
+                scoped_path = "."
+            elif path_text.startswith(base_prefix):
+                scoped_path = path_text[len(base_prefix) :]
+            else:
                 continue
             if is_dir:
                 scoped_path = f"{scoped_path}/"
@@ -1161,26 +1180,28 @@ class CodeIndex:
                 return True
         return False
 
-    def _gitignore_specs_for_root(self) -> tuple[tuple[Path, pathspec.PathSpec], ...]:
+    def _gitignore_specs_for_root(self) -> tuple[tuple[str, str, pathspec.PathSpec], ...]:
         if self._gitignore_specs is not None:
             return self._gitignore_specs
 
-        specs: list[tuple[Path, pathspec.PathSpec]] = []
-        for dirpath, dirnames, filenames in os.walk(self.root):
-            current_dir = Path(dirpath)
-            relative_dir = current_dir.relative_to(self.root)
+        root_text = str(self.root)
+        specs: list[tuple[str, str, pathspec.PathSpec]] = []
+        for dirpath, dirnames, filenames in os.walk(root_text):
+            relative_dir = os.path.relpath(dirpath, root_text)
+            prefix = "" if relative_dir == "." else relative_dir.replace(os.sep, "/") + "/"
             dirnames[:] = [
                 dirname
                 for dirname in dirnames
-                if not self._is_excluded(relative_dir / dirname)
+                if not self._is_excluded_text(prefix + dirname)
             ]
             if ".gitignore" not in filenames:
                 continue
             try:
-                lines = (current_dir / ".gitignore").read_text(encoding="utf-8", errors="replace").splitlines()
+                lines = Path(dirpath, ".gitignore").read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 continue
-            specs.append((relative_dir, pathspec.PathSpec.from_lines("gitignore", lines)))
+            base_text = "" if relative_dir == "." else relative_dir.replace(os.sep, "/")
+            specs.append((base_text, prefix, pathspec.PathSpec.from_lines("gitignore", lines)))
 
         self._gitignore_specs = tuple(specs)
         return self._gitignore_specs
@@ -2629,7 +2650,11 @@ def _path_filter_clause(column: str, path: str | Path | Iterable[str | Path] | N
 
 
 def _spec_for_path(path: Path, languages: set[str] | None = None) -> LanguageSpec | None:
-    spec = LANGUAGE_BY_EXTENSION.get(path.suffix.lower())
+    return _spec_for_extension(path.suffix.lower(), languages)
+
+
+def _spec_for_extension(extension: str, languages: set[str] | None = None) -> LanguageSpec | None:
+    spec = LANGUAGE_BY_EXTENSION.get(extension)
     if spec is None:
         return None
     if languages is not None and spec.name not in languages:
@@ -4633,6 +4658,34 @@ def _delete_paths_chunked(
         connection.execute(f"DELETE FROM refs WHERE path IN ({placeholders})", values)
         connection.execute(f"DELETE FROM symbols WHERE path IN ({placeholders})", values)
         connection.execute(f"DELETE FROM files WHERE path IN ({placeholders})", values)
+
+
+def _compile_path_patterns(patterns: Iterable[str]) -> Any:
+    """One regex for a whole exclude list, matched instead of per-pattern fnmatch."""
+    alternatives: list[str] = []
+    for pattern in patterns:
+        normalised = os.path.normcase(pattern)
+        alternatives.append(fnmatch.translate(normalised))
+        if normalised.endswith("/**"):
+            # ``dir/**`` also covers ``dir`` itself, so the walk can prune the
+            # directory instead of descending into it and excluding each file
+            # separately. The directory half stays a glob, so ``bazel-*/**``
+            # prunes ``bazel-out`` and not only the paths beneath it.
+            directory = normalised[:-3].rstrip("/")
+            if directory:
+                alternatives.append(fnmatch.translate(directory))
+    if not alternatives:
+        return lambda _path_text: None
+    return re.compile("|".join(alternatives)).match
+
+
+def _extension_of(path_text: str) -> str:
+    """``Path(path_text).suffix.lower()`` without building a Path."""
+    dot = path_text.rfind(".")
+    # A dot leading the basename (``.gitignore``) is not a suffix.
+    if dot <= path_text.rfind("/") + 1:
+        return ""
+    return path_text[dot:].lower()
 
 
 def _matches_path_pattern(path_text: str, pattern: str) -> bool:

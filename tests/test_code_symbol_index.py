@@ -2449,3 +2449,52 @@ class Widget { public static function make($v) { return $v; } }
 
     callers = index.callers("helper", language="php", exact_only=True)
     assert [node.symbol.name for node in callers.roots] == ["greet"]
+
+
+def test_scan_honours_nested_gitignores_and_excludes(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("*.log\nsecret/\n", encoding="utf-8")
+    (tmp_path / "top.py").write_text("def top(): pass\n", encoding="utf-8")
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    # A nested .gitignore applies only below its own directory.
+    (pkg / ".gitignore").write_text("skipped.py\n", encoding="utf-8")
+    (pkg / "kept.py").write_text("def kept(): pass\n", encoding="utf-8")
+    (pkg / "skipped.py").write_text("def skipped(): pass\n", encoding="utf-8")
+
+    other = tmp_path / "other"
+    other.mkdir()
+    # Same basename, but the nested rule must not reach up here.
+    (other / "skipped.py").write_text("def elsewhere(): pass\n", encoding="utf-8")
+
+    secret = tmp_path / "secret"
+    secret.mkdir()
+    (secret / "hidden.py").write_text("def hidden(): pass\n", encoding="utf-8")
+
+    vendored = tmp_path / "node_modules" / "dep"
+    vendored.mkdir(parents=True)
+    (vendored / "dep.py").write_text("def vendored(): pass\n", encoding="utf-8")
+
+    index = CodeIndex(tmp_path).build()
+    found = {path.as_posix() for path in index._iter_indexable_files()}
+
+    assert found == {"top.py", "pkg/kept.py", "other/skipped.py"}
+    for name in ("skipped", "hidden", "vendored"):
+        assert not index.search_symbols(name), name
+    assert index.search_symbols("elsewhere")
+
+
+def test_exclude_matcher_matches_the_pattern_semantics(tmp_path: Path) -> None:
+    patterns = ("build/**", "bazel-*/**", "*.min.js")
+    matcher = code_symbol_index._compile_path_patterns(patterns)
+
+    # ``dir/**`` covers the directory itself, not just its contents.
+    for path_text in ("build", "build/x", "build/a/b.js", "bazel-out", "bazel-out/x", "a/b.min.js"):
+        assert matcher(path_text) is not None, path_text
+    for path_text in ("builder", "rebuild/x", "src/build.py", "bazel", "a.min.jsx"):
+        assert matcher(path_text) is None, path_text
+
+
+def test_extension_of_matches_path_suffix(tmp_path: Path) -> None:
+    for path_text in ("a.py", "a/b.PY", "a/b", ".gitignore", "a/.hidden", "a.b/c", "a.tar.gz", ""):
+        assert code_symbol_index._extension_of(path_text) == Path(path_text).suffix.lower(), path_text
