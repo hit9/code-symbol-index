@@ -362,8 +362,13 @@ Python API 通过 `refs(...)` / `inspect(...)` 上的 `ref_kinds=` 提供同样�
 传入可迭代对象或逗号分隔字符串，或传 `"all"` 关闭过滤。`inspect` 的摘要中会给出
 `reference_kinds` 计数明细。
 
-分类是语法级的（tree-sitter，无类型推断）。Python、JavaScript、TypeScript/TSX
-有调优规则，其它语言为尽力而为并回退到 `read`/`usage`。请把 `kind` 当作强提示而非保证。
+分类是语法级的（tree-sitter，无类型推断）。Python、JavaScript、TypeScript/TSX、
+Swift、Kotlin、Ruby、PHP 有调优规则，其它语言为尽力而为并回退到 `read`/`usage`。
+请把 `kind` 当作强提示而非保证。
+
+Ruby 有一处限制：无接收者且不带括号与参数的调用（`helper`）会被解析为普通标识符，
+在无语义分析的前提下与局部变量读取无法区分，因此不会产生调用边。`helper()`、
+`helper 1`、`self.helper`、`obj.helper` 均可正常解析。
 
 ## 调用链（Call Chains）
 

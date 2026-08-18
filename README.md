@@ -381,9 +381,14 @@ pass an iterable or comma-separated string of kinds, or `"all"` to disable the
 filter. `inspect` reports a `reference_kinds` count breakdown in its summary.
 
 Classification is syntactic (tree-sitter, no type inference). Python,
-JavaScript, and TypeScript/TSX have tuned rules; other languages get a
-best-effort subset and otherwise fall back to `read`/`usage`. Treat `kind` as a
-strong hint, not a guarantee.
+JavaScript, TypeScript/TSX, Swift, Kotlin, Ruby, and PHP have tuned rules; other
+languages get a best-effort subset and otherwise fall back to `read`/`usage`.
+Treat `kind` as a strong hint, not a guarantee.
+
+One Ruby caveat: a receiverless call written without parentheses or arguments
+(`helper`) parses as a plain identifier, indistinguishable from a local variable
+read without semantic analysis, so it produces no call edge. `helper()`,
+`helper 1`, `self.helper`, and `obj.helper` all resolve normally.
 
 ## Call Chains
 

@@ -2005,3 +2005,447 @@ def test_cli_install_skill_claude(tmp_path: Path, capsys) -> None:
     assert exit_code == 0
     assert skill_path.exists()
     assert "installed claude skill" in captured.out
+
+
+SWIFT_SOURCE = """
+protocol Greeter {
+    func greet(name: String) -> String
+}
+
+struct Point {
+    let x: Int
+    func norm() -> Int { return x * x }
+}
+
+class Base {
+    var count: Int = 0
+    init(count: Int) { self.count = count }
+    func run() { }
+}
+
+final class Impl: Base, Greeter {
+    func greet(name: String) -> String {
+        let p = Point(x: 1)
+        let n = p.norm()
+        run()
+        return name
+    }
+}
+
+extension Point {
+    func scaled(by k: Int) -> Point { Point(x: x * k) }
+}
+
+actor Worker {
+    func work() async { }
+}
+
+struct Table {
+    var rows: [Int] = []
+    func first() -> Int { return rows[0] }
+}
+""".strip() + "\n"
+
+
+def _swift_index(tmp_path: Path) -> CodeIndex:
+    (tmp_path / "app.swift").write_text(SWIFT_SOURCE, encoding="utf-8")
+    return CodeIndex(tmp_path).build()
+
+
+def test_swift_declaration_kinds_are_split_by_declaration_kind(tmp_path: Path) -> None:
+    index = _swift_index(tmp_path)
+
+    def kind_of(name: str) -> str:
+        return index.search_symbols(name, language="swift", exact_only=True)[0].kind
+
+    # Swift's grammar folds all five into one ``class_declaration`` node.
+    assert kind_of("Base") == "class"
+    assert kind_of("Worker") == "class"  # actor
+    assert kind_of("Greeter") == "interface"
+    assert {symbol.kind for symbol in index.search_symbols("Point", language="swift", exact_only=True)} == {
+        "struct",
+        "extension",
+    }
+
+
+def test_swift_extension_members_are_contained_by_the_extended_type(tmp_path: Path) -> None:
+    index = _swift_index(tmp_path)
+
+    scaled = index.search_symbols("scaled", language="swift", exact_only=True)[0]
+    assert scaled.container == "Point"
+
+
+def test_swift_resolves_direct_and_method_calls(tmp_path: Path) -> None:
+    index = _swift_index(tmp_path)
+
+    # ``run()`` has a positional callee; ``p.norm()`` goes through a
+    # navigation_expression/navigation_suffix pair.
+    for callee in ("run", "norm"):
+        graph = index.callers(callee, language="swift", exact_only=True)
+        assert [node.symbol.name for node in graph.roots] == ["greet"], callee
+
+
+def test_swift_locals_do_not_shadow_the_enclosing_function(tmp_path: Path) -> None:
+    index = _swift_index(tmp_path)
+
+    # ``let p`` / ``let n`` share ``property_declaration`` with real properties.
+    assert index.search_symbols("n", language="swift", exact_only=True) == []
+    assert index.search_symbols("count", language="swift", exact_only=True)[0].container == "Base"
+
+
+def test_swift_subscripts_are_not_calls(tmp_path: Path) -> None:
+    index = _swift_index(tmp_path)
+
+    # ``rows[0]`` parses as a call_expression, same as ``f(0)``.
+    page = index.refs("rows", language="swift", exact_only=True, ref_kinds="all")
+    kinds = {reference.reference_kind for reference in page.items}
+    assert kinds and "call" not in kinds
+
+
+def test_swift_impls_finds_conformances(tmp_path: Path) -> None:
+    index = _swift_index(tmp_path)
+
+    implementations = index.impls("Greeter", language="swift", kind="interface")
+    assert "Impl" in {symbol.name for symbol in implementations}
+
+
+def test_c_locals_do_not_shadow_the_enclosing_function(tmp_path: Path) -> None:
+    (tmp_path / "app.c").write_text(
+        """
+int helper(void) { return 1; }
+
+int global_value = 0;
+
+int caller(void) {
+    int n = helper();
+    return n;
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(tmp_path).build()
+
+    # ``declaration`` matches both file-scope variables and function-body locals.
+    graph = index.callers("helper", language="c", exact_only=True)
+    assert [node.symbol.name for node in graph.roots] == ["caller"]
+    assert index.search_symbols("n", language="c", exact_only=True) == []
+    assert index.search_symbols("global_value", language="c", exact_only=True)[0].kind == "variable"
+
+
+def test_cpp_locals_do_not_shadow_the_enclosing_method(tmp_path: Path) -> None:
+    (tmp_path / "app.cpp").write_text(
+        """
+int helper() { return 1; }
+
+struct Widget {
+    int run() {
+        int n = helper();
+        return n;
+    }
+};
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(tmp_path).build()
+
+    graph = index.callers("helper", language="cpp", exact_only=True)
+    assert [node.symbol.name for node in graph.roots] == ["run"]
+
+
+def test_go_locals_do_not_shadow_the_enclosing_function(tmp_path: Path) -> None:
+    (tmp_path / "app.go").write_text(
+        """
+package main
+
+var Registry = 0
+
+func helper() int { return 1 }
+
+func caller() int {
+	var n = helper()
+	return n
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(tmp_path).build()
+
+    # ``var_spec`` matches package-level and function-body declarations alike.
+    graph = index.callers("helper", language="go", exact_only=True)
+    assert [node.symbol.name for node in graph.roots] == ["caller"]
+    assert index.search_symbols("n", language="go", exact_only=True) == []
+    assert index.search_symbols("Registry", language="go", exact_only=True)[0].kind == "variable"
+
+
+KOTLIN_SOURCE = """
+package com.example.app
+
+import kotlin.math.max
+
+interface Greeter {
+    fun greet(name: String): String
+}
+
+enum class Color { RED, GREEN }
+
+data class Point(val x: Int, var y: Int) {
+    fun norm(): Int = x * x + y * y
+}
+
+open class Base(var count: Int) {
+    fun run() { }
+}
+
+@Deprecated("old")
+class Impl : Base(0), Greeter {
+    override fun greet(name: String): String {
+        val p = Point(1, 2)
+        val n = p.norm()
+        count = n
+        run()
+        return name
+    }
+}
+
+object Singleton {
+    fun instance(): Int = 1
+}
+
+fun Point.scaled(k: Int): Point = Point(x * k, y * k)
+
+val globalValue = 42
+""".strip() + "\n"
+
+
+def _kotlin_index(tmp_path: Path) -> CodeIndex:
+    (tmp_path / "app.kt").write_text(KOTLIN_SOURCE, encoding="utf-8")
+    return CodeIndex(tmp_path).build()
+
+
+def test_kotlin_class_declaration_kinds(tmp_path: Path) -> None:
+    index = _kotlin_index(tmp_path)
+
+    def kind_of(name: str) -> str:
+        return index.search_symbols(name, language="kotlin", exact_only=True)[0].kind
+
+    # ``class_declaration`` covers classes, interfaces, and enum classes alike.
+    assert kind_of("Greeter") == "interface"
+    assert kind_of("Color") == "enum"
+    assert kind_of("Point") == "class"
+    assert kind_of("Singleton") == "class"  # object declaration
+
+
+def test_kotlin_name_lookup_skips_annotations_and_receivers(tmp_path: Path) -> None:
+    index = _kotlin_index(tmp_path)
+
+    # ``@Deprecated`` precedes the class name, and ``Point.`` precedes ``scaled``.
+    assert index.search_symbols("Impl", language="kotlin", exact_only=True)[0].kind == "class"
+    assert index.search_symbols("Deprecated", language="kotlin", exact_only=True) == []
+    scaled = index.search_symbols("scaled", language="kotlin", exact_only=True)
+    assert [symbol.kind for symbol in scaled] == ["function"]
+
+
+def test_kotlin_primary_constructor_parameters_are_properties(tmp_path: Path) -> None:
+    index = _kotlin_index(tmp_path)
+
+    x = index.search_symbols("x", language="kotlin", exact_only=True)[0]
+    assert (x.kind, x.container) == ("property", "Point")
+
+
+def test_kotlin_resolves_direct_and_method_calls(tmp_path: Path) -> None:
+    index = _kotlin_index(tmp_path)
+
+    # ``run()`` has a positional callee; ``p.norm()`` goes through a
+    # navigation_expression/navigation_suffix pair with no field names at all.
+    for callee in ("run", "norm"):
+        graph = index.callers(callee, language="kotlin", exact_only=True)
+        assert [node.symbol.name for node in graph.roots] == ["greet"], callee
+
+
+def test_kotlin_classifies_positional_assignment_targets(tmp_path: Path) -> None:
+    index = _kotlin_index(tmp_path)
+
+    page = index.refs("count", language="kotlin", exact_only=True, ref_kinds="all")
+    assert "write" in {reference.reference_kind for reference in page.items}
+
+
+def test_kotlin_locals_do_not_shadow_the_enclosing_function(tmp_path: Path) -> None:
+    index = _kotlin_index(tmp_path)
+
+    assert index.search_symbols("n", language="kotlin", exact_only=True) == []
+    assert index.search_symbols("globalValue", language="kotlin", exact_only=True)[0].kind == "property"
+
+
+def test_kotlin_impls_finds_conformances(tmp_path: Path) -> None:
+    index = _kotlin_index(tmp_path)
+
+    implementations = index.impls("Greeter", language="kotlin", kind="interface")
+    assert "Impl" in {symbol.name for symbol in implementations}
+
+
+def test_js_local_functions_survive_the_local_filter(tmp_path: Path) -> None:
+    (tmp_path / "app.js").write_text(
+        """
+function helper() { return 1; }
+
+const CONFIG = { a: 1 };
+
+function caller() {
+  const n = helper();
+  const inner = () => helper() + n;
+  return inner();
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(tmp_path).build()
+
+    # ``const n`` is a local and must not shadow ``caller``, but ``const inner``
+    # is a function and has to stay in the call graph.
+    assert index.search_symbols("n", language="javascript", exact_only=True) == []
+    assert index.search_symbols("inner", language="javascript", exact_only=True)[0].kind == "function"
+    assert index.search_symbols("CONFIG", language="javascript", exact_only=True)[0].kind == "variable"
+
+    graph = index.callers("helper", language="javascript", exact_only=True)
+    assert {node.symbol.name for node in graph.roots} == {"caller", "inner"}
+
+
+def test_ts_local_functions_survive_the_local_filter(tmp_path: Path) -> None:
+    (tmp_path / "app.ts").write_text(
+        """
+function helper(): number { return 1; }
+
+function caller(): number {
+  const n = helper();
+  const inner = (): number => helper() + n;
+  return inner();
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(tmp_path).build()
+
+    assert index.search_symbols("n", language="typescript", exact_only=True) == []
+    assert index.search_symbols("inner", language="typescript", exact_only=True)[0].kind == "function"
+
+    graph = index.callers("helper", language="typescript", exact_only=True)
+    assert {node.symbol.name for node in graph.roots} == {"caller", "inner"}
+
+
+def test_annotations_do_not_swallow_the_signature(tmp_path: Path) -> None:
+    (tmp_path / "App.java").write_text(
+        """
+interface Greeter { String greet(); }
+
+@Deprecated
+class Impl implements Greeter {
+    public String greet() { return "x"; }
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "App.cs").write_text(
+        """
+interface IGreeter { string Greet(); }
+
+[Obsolete]
+class Impl : IGreeter {
+    public string Greet() { return "x"; }
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(tmp_path).build()
+
+    # Annotations sit inside the declaration node, so the first line of the node
+    # is the annotation. ``impls`` matches on signature text and needs the real
+    # declaration line.
+    for language, interface in (("java", "Greeter"), ("csharp", "IGreeter")):
+        symbol = index.search_symbols("Impl", language=language, exact_only=True)[0]
+        assert symbol.signature.startswith("class Impl"), language
+        assert "Impl" in {found.name for found in index.impls(interface, language=language)}, language
+
+
+def test_kotlin_annotated_class_keeps_its_declaration_signature(tmp_path: Path) -> None:
+    index = _kotlin_index(tmp_path)
+
+    impl = index.search_symbols("Impl", language="kotlin", exact_only=True)[0]
+    assert impl.signature == "class Impl : Base(0), Greeter {"
+
+
+def test_ruby_resolves_call_edges(tmp_path: Path) -> None:
+    (tmp_path / "app.rb").write_text(
+        """
+class Base; end
+
+module M
+  class Handler < Base
+    def handle(x)
+      y = helper(x)
+      render(y)
+      obj.transform(y)
+      y
+    end
+
+    def render(v); v; end
+  end
+end
+
+def helper(n); n; end
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(tmp_path).build()
+
+    # Ruby names the callee ``method``, not ``function``; one ``call`` node
+    # covers both ``helper(x)`` and ``obj.transform(y)``.
+    graph = index.callees("handle", language="ruby", exact_only=True)
+    assert {node.symbol.name for node in graph.roots} == {"helper", "render"}
+    for callee in ("helper", "render"):
+        callers = index.callers(callee, language="ruby", exact_only=True)
+        assert [node.symbol.name for node in callers.roots] == ["handle"], callee
+
+    page = index.refs("Base", language="ruby", exact_only=True, ref_kinds="all")
+    assert {reference.reference_kind for reference in page.items} == {"inherit"}
+
+
+def test_php_resolves_all_four_call_forms(tmp_path: Path) -> None:
+    (tmp_path / "app.php").write_text(
+        """
+<?php
+namespace App;
+
+class Handler {
+    public function greet(): string {
+        $y = helper(1);
+        $this->render($y);
+        Widget::make($y);
+        $w = new Widget($y);
+        return $y;
+    }
+    public function render($v) { return $v; }
+}
+
+function helper($n) { return $n; }
+class Widget { public static function make($v) { return $v; } }
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(tmp_path).build()
+
+    # function_call_expression, member_call_expression, scoped_call_expression,
+    # and object_creation_expression -- the last names its callee no field.
+    graph = index.callees("Handler.greet", language="php")
+    assert {node.symbol.name for node in graph.roots} == {"helper", "render", "make", "Widget"}
+
+    callers = index.callers("helper", language="php", exact_only=True)
+    assert [node.symbol.name for node in callers.roots] == ["greet"]

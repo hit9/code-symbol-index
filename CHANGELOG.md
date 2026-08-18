@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.5.0 - 2026-08-17
+
+### Added
+
+- Swift support (`.swift`), with tuned reference classification. Swift folds
+  class/struct/enum/actor/extension into one grammar node, marks call callees by
+  position rather than by field, and reuses its call node for subscripts; each is
+  handled so `callers`/`callees`, `impls`, and `refs --kind` behave the same way
+  they do for the other tuned languages. Local `let`/`var` bindings inside a
+  function body are deliberately not indexed, so a call's reported caller is the
+  enclosing function rather than the local it was assigned to.
+- Kotlin support (`.kt`, `.kts`), with tuned reference classification. Kotlin's
+  grammar carries almost no field names, so callees and assignment targets are
+  read positionally; `class_declaration` covers classes, interfaces, and enum
+  classes alike; and annotations, receivers, and type parameters are skipped when
+  resolving a declaration's name (`fun Point.scaled()` is `scaled`, not `Point`).
+  Primary-constructor `val`/`var` parameters are indexed as properties.
+
+### Changed
+
+- **Breaking:** in JavaScript and TypeScript/TSX, a declarator holding a function
+  (`const f = () => {}`, `const g = function () {}`) now has kind `function`
+  rather than `variable`. It is a function in all but spelling, and the old kind
+  kept such declarations from being treated as call-graph nodes. Saved queries
+  that filter these with `--kind variable` need updating to `--kind function`.
+
+### Fixed
+
+- C, C++, and Go no longer index function-body locals as symbols. Their `var`,
+  `const`, and `declaration` nodes match locals and file-scope declarations
+  alike, so `int n = helper();` produced a `variable` symbol that sat inside the
+  enclosing function's range. Caller attribution picks the innermost enclosing
+  definition, so `callers helper` reported `n` instead of `caller`. File-scope
+  and package-level declarations are still indexed.
+- JavaScript and TypeScript/TSX no longer index function-body locals either.
+  Declarators holding a function (`const inner = () => {}`) are now reported with
+  kind `function` instead of `variable` and stay indexed at any scope, so local
+  closures remain in the call graph while plain locals stop shadowing their
+  enclosing function.
+- Ruby and PHP now produce call edges at all. Neither grammar names its callee
+  `function`, and PHP's call node types (`function_call_expression`,
+  `member_call_expression`, `scoped_call_expression`,
+  `object_creation_expression`) did not overlap the defaults, so `callers` and
+  `callees` returned nothing for both languages. Ruby names the callee `method`;
+  PHP's `new Widget()` names it nothing at all and is now read positionally.
+  Inheritance, assignment, and import classification are tuned for both too.
+- Java and C# no longer report an annotation as a declaration's whole signature.
+  Annotations and attributes live inside the declaration node, so `@Deprecated`
+  on its own line became the entire signature of the class below it. Because
+  `impls` matches on signature text, `impls Greeter` silently returned nothing
+  for annotated implementors.
+
 ## 0.4.0 - 2026-08-09
 
 ### Changed

@@ -22,7 +22,7 @@ from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
 
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 SCHEMA_VERSION = 5
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
@@ -192,6 +192,10 @@ IDENTIFIER_NODE_TYPES = (
     "variable_name",
 )
 
+# Default field names holding a call node's callee. Grammars that name it
+# differently override this per language.
+_CALLEE_FIELD_NAMES = ("function", "constructor")
+
 # Identifier node types that denote member access (``obj.name``). Used to tell
 # an attribute/property reference apart from a plain identifier read.
 MEMBER_IDENTIFIER_NODE_TYPES = (
@@ -231,6 +235,7 @@ CALLEE_KINDS = ("class", "function", "method", "constructor", "struct")
 CONTAINER_KINDS = {
     "class",
     "enum",
+    "extension",
     "function",
     "impl",
     "interface",
@@ -241,8 +246,13 @@ CONTAINER_KINDS = {
     "trait",
 }
 
+# Symbol kinds that introduce a local scope: definitions nested inside one of
+# these are locals, not declarations.
+FUNCTION_KINDS = {"function", "method", "constructor"}
+
 IMPLEMENTATION_KINDS = {
     "class",
+    "extension",
     "impl",
     "interface",
     "method",
@@ -460,6 +470,35 @@ class LanguageSpec:
     type_node_types: tuple[str, ...] = ("type_identifier",)
     assignment_node_types: tuple[str, ...] = ()
     member_node_types: tuple[str, ...] = ()
+    # Field names holding a call's callee, tried in order.
+    callee_field_names: tuple[str, ...] = _CALLEE_FIELD_NAMES
+    # How to find the callee when the grammar gives it no field name at all.
+    # ``"first_child"``  -- the callee expression leads the call node (Swift,
+    #                       Kotlin); it may be a member access, not a bare name.
+    # ``"first_name"``   -- a keyword leads the node, so take the first
+    #                       identifier child instead (PHP's ``new Widget()``).
+    callee_position: str | None = None
+    # Wrapper nodes that carry no meaning for reference classification. They are
+    # skipped when computing a child's parent/grandparent, so a nested
+    # identifier still sees the node that actually decides its kind.
+    transparent_node_types: tuple[str, ...] = ()
+    # Definition kinds that only mean something at file or type scope. Grammars
+    # that reuse one node type for both declarations and local bindings (Swift's
+    # ``property_declaration``) list them here so locals stay out of the index --
+    # otherwise a local would shadow its function as a reference's caller.
+    non_local_kinds: tuple[str, ...] = ()
+    # Grammars that mark an assignment's target by position instead of by a
+    # named field (Kotlin's ``assignment``). The target is the first child.
+    positional_assignment_target: bool = False
+    # Subtrees to ignore when searching a definition node for its name. Kotlin
+    # puts annotations, receivers, and type parameters ahead of the name, and a
+    # plain left-to-right scan would return one of those identifiers instead.
+    name_skip_node_types: tuple[str, ...] = ()
+    # Take the signature from the line holding the name rather than the first
+    # line of the definition. Kotlin keeps annotations inside the declaration
+    # node, so ``@Deprecated("old")`` would otherwise be the whole signature --
+    # which also breaks ``impls``, since it matches on signature text.
+    signature_starts_at_name: bool = False
 
 
 LANGUAGES: tuple[LanguageSpec, ...] = (
@@ -493,6 +532,9 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
         type_node_types=("type_identifier",),
         assignment_node_types=("assignment_expression", "augmented_assignment_expression", "variable_declarator"),
         member_node_types=("member_expression",),
+        # ``variable_declarator`` also matches function-body locals. Declarators
+        # holding a function keep kind ``function`` and are indexed either way.
+        non_local_kinds=("variable",),
     ),
     LanguageSpec(
         name="typescript",
@@ -514,6 +556,9 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
         type_node_types=("type_annotation", "type_arguments", "type_identifier", "predefined_type"),
         assignment_node_types=("assignment_expression", "augmented_assignment_expression", "variable_declarator"),
         member_node_types=("member_expression",),
+        # ``variable_declarator`` also matches function-body locals. Declarators
+        # holding a function keep kind ``function`` and are indexed either way.
+        non_local_kinds=("variable",),
     ),
     LanguageSpec(
         name="tsx",
@@ -535,6 +580,9 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
         type_node_types=("type_annotation", "type_arguments", "type_identifier", "predefined_type"),
         assignment_node_types=("assignment_expression", "augmented_assignment_expression", "variable_declarator"),
         member_node_types=("member_expression",),
+        # ``variable_declarator`` also matches function-body locals. Declarators
+        # holding a function keep kind ``function`` and are indexed either way.
+        non_local_kinds=("variable",),
     ),
     LanguageSpec(
         name="go",
@@ -546,6 +594,8 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "type_spec": "type",
             "var_spec": "variable",
         },
+        # ``var``/``const`` specs also match function-body declarations.
+        non_local_kinds=("variable", "constant"),
     ),
     LanguageSpec(
         name="rust",
@@ -574,6 +624,8 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "method_declaration": "method",
             "record_declaration": "class",
         },
+        # Annotations/attributes live inside the declaration node.
+        signature_starts_at_name=True,
     ),
     LanguageSpec(
         name="c",
@@ -585,6 +637,8 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "struct_specifier": "struct",
             "type_definition": "type",
         },
+        # ``declaration`` also matches locals and for-loop initialisers.
+        non_local_kinds=("variable",),
     ),
     LanguageSpec(
         name="cpp",
@@ -598,6 +652,8 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "struct_specifier": "struct",
             "type_definition": "type",
         },
+        # ``declaration`` also matches locals and for-loop initialisers.
+        non_local_kinds=("variable",),
     ),
     LanguageSpec(
         name="csharp",
@@ -612,6 +668,8 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "property_declaration": "property",
             "struct_declaration": "struct",
         },
+        # Annotations/attributes live inside the declaration node.
+        signature_starts_at_name=True,
     ),
     LanguageSpec(
         name="ruby",
@@ -622,6 +680,66 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "module": "module",
             "singleton_method": "method",
         },
+        # One ``call`` node covers ``f(x)``, ``obj.f(x)``, and bare ``obj.f``;
+        # the callee is always the ``method`` field.
+        call_node_types=("call",),
+        callee_field_names=("method",),
+        import_node_types=(),
+        inherit_node_types=("superclass",),
+        assignment_node_types=("assignment", "operator_assignment"),
+    ),
+    LanguageSpec(
+        name="swift",
+        extensions=(".swift",),
+        definitions={
+            # ``class_declaration`` covers class/struct/enum/actor/extension;
+            # the concrete kind comes from the ``declaration_kind`` field.
+            "class_declaration": "class",
+            "protocol_declaration": "interface",
+            "function_declaration": "function",
+            "protocol_function_declaration": "function",
+            "init_declaration": "constructor",
+            "typealias_declaration": "type",
+            "associatedtype_declaration": "type",
+            "property_declaration": "property",
+            "protocol_property_declaration": "property",
+            "enum_entry": "enum_case",
+        },
+        call_node_types=("call_expression",),
+        import_node_types=("import_declaration",),
+        inherit_node_types=("inheritance_specifier",),
+        type_node_types=("type_annotation", "type_identifier", "user_type", "type_arguments"),
+        assignment_node_types=("assignment",),
+        member_node_types=("navigation_expression",),
+        callee_position="first_child",
+        transparent_node_types=("navigation_suffix", "directly_assignable_expression"),
+        non_local_kinds=("property",),
+    ),
+    LanguageSpec(
+        name="kotlin",
+        extensions=(".kt", ".kts"),
+        definitions={
+            # ``class_declaration`` also covers interfaces and enum classes.
+            "class_declaration": "class",
+            "object_declaration": "class",
+            "function_declaration": "function",
+            "property_declaration": "property",
+            "class_parameter": "property",
+            "type_alias": "type",
+            "enum_entry": "enum_case",
+        },
+        call_node_types=("call_expression", "constructor_invocation"),
+        import_node_types=("import_header",),
+        inherit_node_types=("delegation_specifier",),
+        type_node_types=("user_type", "type_identifier", "type_arguments"),
+        assignment_node_types=("assignment",),
+        member_node_types=("navigation_expression",),
+        callee_position="first_child",
+        positional_assignment_target=True,
+        transparent_node_types=("navigation_suffix", "directly_assignable_expression"),
+        non_local_kinds=("property",),
+        name_skip_node_types=("modifiers", "receiver_type", "type_parameters"),
+        signature_starts_at_name=True,
     ),
     LanguageSpec(
         name="php",
@@ -633,6 +751,21 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "method_declaration": "method",
             "trait_declaration": "trait",
         },
+        # PHP splits calls across four node types. Three name the callee
+        # (``function`` or ``name``); ``new Widget()`` names nothing and leads
+        # with the ``new`` keyword.
+        call_node_types=(
+            "function_call_expression",
+            "member_call_expression",
+            "scoped_call_expression",
+            "object_creation_expression",
+        ),
+        callee_field_names=("function", "name"),
+        callee_position="first_name",
+        import_node_types=("namespace_use_declaration",),
+        inherit_node_types=("base_clause", "class_interface_clause"),
+        assignment_node_types=("assignment_expression", "augmented_assignment_expression"),
+        member_node_types=("member_access_expression",),
     ),
 )
 
@@ -2618,8 +2751,7 @@ def _parser_for_language(language: str):
     return parser
 
 
-_CALLEE_FIELD_NAMES = ("function", "constructor")
-_MEMBER_NAME_FIELDS = ("attribute", "property", "field", "name")
+_MEMBER_NAME_FIELDS = ("attribute", "property", "field", "name", "suffix")
 
 
 def _same_node(a: Node | None, b: Node | None) -> bool:
@@ -2645,14 +2777,19 @@ def _member_name_node(member: Node | None, language: LanguageSpec) -> Node | Non
     """The name part of a member access node (``obj.NAME``), not the receiver."""
     field = _field_child(member, *_MEMBER_NAME_FIELDS)
     if field is not None:
-        return field
-    # Fall back to the last identifier-like child (handles grammars without
-    # a dedicated property field).
-    name: Node | None = None
-    for child in _node_children(member) if member is not None else []:
-        if _node_kind(child) in language.identifier_node_types:
-            name = child
-    return name
+        # The field may be a wrapper (Swift's ``navigation_suffix``) rather than
+        # the identifier itself.
+        if _node_kind(field) in language.identifier_node_types:
+            return field
+        return _first_identifier(field, language) or field
+    # Fall back to the rightmost identifier, descending into wrappers (handles
+    # grammars without a dedicated property field, such as Kotlin's
+    # ``navigation_expression`` -> ``navigation_suffix`` pair).
+    for child in reversed(_node_children(member) if member is not None else []):
+        found = _first_identifier(child, language)
+        if found is not None:
+            return found
+    return None
 
 
 def _child_reference_context(
@@ -2680,12 +2817,42 @@ def _child_reference_context(
     return ctx | added
 
 
+def _opens_with_bracket(node: Node) -> bool:
+    """Whether ``node``'s leftmost delimiter is ``[`` rather than ``(``."""
+    for child in _node_children(node):
+        kind = _node_kind(child)
+        if kind in ("[", "("):
+            return kind == "["
+        return _opens_with_bracket(child)
+    return False
+
+
+def _callee_node(call: Node, language: LanguageSpec) -> Node | None:
+    """The callee expression of a call node."""
+    field = _field_child(call, *language.callee_field_names)
+    if field is not None:
+        return field
+    children = _node_children(call)
+    if language.callee_position == "first_name":
+        for child in children:
+            if _node_kind(child) in language.identifier_node_types:
+                return child
+        return None
+    if language.callee_position != "first_child" or len(children) < 2:
+        return None
+    # Swift parses subscripts (``a[i]``) with the same node as calls (``f(i)``);
+    # only the argument delimiter tells them apart.
+    if _opens_with_bracket(children[1]):
+        return None
+    return children[0]
+
+
 def _is_call_callee(node: Node, parent: Node | None, grandparent: Node | None, language: LanguageSpec) -> bool:
     if parent is None:
         return False
     parent_kind = _node_kind(parent)
     if parent_kind in language.call_node_types:
-        return _same_node(_field_child(parent, *_CALLEE_FIELD_NAMES), node)
+        return _same_node(_callee_node(parent, language), node)
     # Method call: ``obj.method()`` — node is the member of a member-access node
     # that is itself the callee of the surrounding call.
     if (
@@ -2693,15 +2860,26 @@ def _is_call_callee(node: Node, parent: Node | None, grandparent: Node | None, l
         and grandparent is not None
         and _node_kind(grandparent) in language.call_node_types
     ):
-        callee = _field_child(grandparent, *_CALLEE_FIELD_NAMES)
+        callee = _callee_node(grandparent, language)
         return _same_node(callee, parent) and _same_node(_member_name_node(parent, language), node)
     return False
+
+
+def _assignment_target_node(assignment: Node, language: LanguageSpec) -> Node | None:
+    field = _field_child(assignment, "left", "name", "target")
+    if field is not None:
+        return field
+    if not language.positional_assignment_target:
+        return None
+    for child in _node_children(assignment):
+        return child
+    return None
 
 
 def _is_write_target(node: Node, parent: Node | None, language: LanguageSpec) -> bool:
     if parent is None or _node_kind(parent) not in language.assignment_node_types:
         return False
-    return _same_node(_field_child(parent, "left", "name"), node)
+    return _same_node(_assignment_target_node(parent, language), node)
 
 
 def _is_attribute_ref(node: Node, parent: Node | None, language: LanguageSpec) -> bool:
@@ -2755,9 +2933,13 @@ def _extract_symbols_and_references(
         parent: Node | None,
         grandparent: Node | None,
         ctx: frozenset[str],
+        in_function: bool = False,
     ) -> None:
         symbol = _symbol_from_node(source, path, language, node, container)
         next_container = container
+        next_in_function = in_function or (symbol is not None and symbol.kind in FUNCTION_KINDS)
+        if symbol is not None and in_function and symbol.kind in language.non_local_kinds:
+            symbol = None  # a local binding, not a declaration
         if symbol is not None:
             symbols.append(symbol)
             if symbol.kind in CONTAINER_KINDS:
@@ -2777,8 +2959,12 @@ def _extract_symbols_and_references(
             )
 
         child_ctx = _child_reference_context(node, parent, ctx, language)
+        if _node_kind(node) in language.transparent_node_types:
+            child_parent, child_grandparent = parent, grandparent
+        else:
+            child_parent, child_grandparent = node, parent
         for child in _node_children(node):
-            walk(child, next_container, node, parent, child_ctx)
+            walk(child, next_container, child_parent, child_grandparent, child_ctx, next_in_function)
 
     walk(root_node, None, None, None, frozenset())
     if language.name == "python":
@@ -2874,7 +3060,7 @@ def _symbol_from_node(
     node: Node,
     container: str | None,
 ) -> Symbol | None:
-    kind = language.definitions.get(_node_kind(node))
+    kind = _definition_kind(source, language, node)
     if kind is None:
         return None
     name_node = _name_node(node, language)
@@ -2884,6 +3070,11 @@ def _symbol_from_node(
     if not name or not _looks_like_symbol_name(name):
         return None
     range_ = _node_range(source, name_node)
+    signature = (
+        _signature_at_name(source, node, name_node)
+        if language.signature_starts_at_name
+        else _signature(source, node)
+    )
     return Symbol(
         id=_symbol_id(language.name, path, kind, name, range_.start_byte),
         name=name,
@@ -2891,9 +3082,68 @@ def _symbol_from_node(
         language=language.name,
         path=path,
         range=range_,
-        signature=_signature(source, node),
+        signature=signature,
         container=container,
     )
+
+
+_SWIFT_DECLARATION_KINDS = {
+    "class": "class",
+    "struct": "struct",
+    "enum": "enum",
+    "actor": "class",
+    "extension": "extension",
+}
+
+
+# Node types a ``variable_declarator`` can hold that make it a function in all
+# but name. Keeping these as callable symbols matters for the call graph.
+_JS_FUNCTION_VALUE_NODE_TYPES = (
+    "arrow_function",
+    "function",
+    "function_expression",
+    "generator_function",
+)
+_JS_LANGUAGE_NAMES = ("javascript", "typescript", "tsx")
+
+
+def _kotlin_class_kind(node: Node, default: str) -> str:
+    """Kotlin's ``class_declaration`` also covers interfaces and enum classes."""
+    for child in _node_children(node):
+        child_kind = _node_kind(child)
+        if child_kind == "interface":
+            return "interface"
+        if child_kind == "enum":
+            return "enum"
+        if child_kind == "class":
+            break
+    return default
+
+
+def _js_declarator_kind(node: Node, default: str) -> str:
+    """``const f = () => {}`` declares a function, not a variable."""
+    value = _field_child(node, "value")
+    if value is not None and _node_kind(value) in _JS_FUNCTION_VALUE_NODE_TYPES:
+        return "function"
+    return default
+
+
+def _definition_kind(source: bytes, language: LanguageSpec, node: Node) -> str | None:
+    """The symbol kind ``node`` defines, or ``None`` if it defines nothing."""
+    node_kind = _node_kind(node)
+    kind = language.definitions.get(node_kind)
+    if kind is None:
+        return None
+    if language.name == "swift" and node_kind == "class_declaration":
+        # Swift folds class/struct/enum/actor/extension into one node type.
+        marker = _field_child(node, "declaration_kind")
+        if marker is not None:
+            return _SWIFT_DECLARATION_KINDS.get(_node_text(source, marker), kind)
+    if language.name == "kotlin" and node_kind == "class_declaration":
+        return _kotlin_class_kind(node, kind)
+    if language.name in _JS_LANGUAGE_NAMES and node_kind == "variable_declarator":
+        return _js_declarator_kind(node, kind)
+    return kind
 
 
 def _name_node(node: Node, language: LanguageSpec) -> Node | None:
@@ -2916,6 +3166,8 @@ def _first_identifier(node: Node, language: LanguageSpec) -> Node | None:
     if _node_kind(node) in language.identifier_node_types:
         return node
     for child in _node_children(node):
+        if _node_kind(child) in language.name_skip_node_types:
+            continue
         found = _first_identifier(child, language)
         if found is not None:
             return found
@@ -2930,6 +3182,19 @@ def _signature(source: bytes, node: Node) -> str:
     text = _node_text(source, node).strip()
     first_line = text.splitlines()[0] if text else ""
     return first_line[:240]
+
+
+def _signature_at_name(source: bytes, node: Node, name_node: Node) -> str:
+    """The signature line anchored at the name, skipping leading annotations."""
+    start = _node_start_byte(node)
+    name_start = _node_start_byte(name_node)
+    line_start = source.rfind(b"\n", start, name_start) + 1
+    if line_start <= start:
+        line_start = start
+    line_end = source.find(b"\n", name_start)
+    if line_end == -1:
+        line_end = len(source)
+    return source[line_start:line_end].decode("utf-8", errors="replace").strip()[:240]
 
 
 def _node_range(source: bytes, node: Node) -> Range:
@@ -3720,7 +3985,7 @@ def _definition_ranges_for_symbols(
     def walk(node: Node) -> None:
         if len(ranges) >= len(wanted):
             return
-        kind = spec.definitions.get(_node_kind(node))
+        kind = _definition_kind(source_bytes, spec, node)
         if kind is not None:
             name_node = _name_node(node, spec)
             if name_node is not None:
