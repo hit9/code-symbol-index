@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
+import random
+import subprocess
 import threading
 from pathlib import Path
+from unittest import mock
+
+import pytest
 
 import code_symbol_index
 from code_symbol_index import CodeIndex, IndexNotFoundError, Repository, main
@@ -2498,3 +2504,109 @@ def test_exclude_matcher_matches_the_pattern_semantics(tmp_path: Path) -> None:
 def test_extension_of_matches_path_suffix(tmp_path: Path) -> None:
     for path_text in ("a.py", "a/b.PY", "a/b", ".gitignore", "a/.hidden", "a.b/c", "a.tar.gz", ""):
         assert code_symbol_index._extension_of(path_text) == Path(path_text).suffix.lower(), path_text
+
+
+# --- Randomized scan differential -------------------------------------------
+#
+# Ignore-rule bugs fail silently: the scan yields too many or too few files and
+# nothing raises. These tests generate trees of nested .gitignore files and
+# check the scan against git itself, which is the behaviour being approximated.
+
+_FUZZ_DIRS = ("src", "lib", "core", "apps", "pkg", "deep", "cache", "priv", "sub")
+_FUZZ_EXTS = (".py", ".js", ".ts", ".go", ".swift", ".kt", ".rb", ".md", ".txt", "")
+_FUZZ_BASENAMES = ("mod", "keep", "cache", "root_only", "index", "note")
+_FUZZ_PATTERNS = (
+    "*.log",
+    "cache/",
+    "*.tmp",
+    "priv/",
+    "!keep.py",
+    "*.min.js",
+    "/root_only.py",
+    "deep/**",
+    "sub/",
+    "**/cache/",
+)
+
+
+def _build_fuzz_tree(seed: int, root: Path) -> None:
+    """A tree of nested .gitignore files. Directory names stay clear of the
+    built-in exclude list so that gitignore alone decides what is indexed."""
+    rnd = random.Random(seed)
+    root.mkdir(parents=True, exist_ok=True)
+    directories = [root]
+    for _ in range(rnd.randint(8, 30)):
+        parent = rnd.choice(directories)
+        if len(parent.relative_to(root).parts) > 3:
+            continue
+        child = parent / rnd.choice(_FUZZ_DIRS)
+        child.mkdir(exist_ok=True)
+        directories.append(child)
+    for directory in directories:
+        if rnd.random() < 0.4:
+            chosen = rnd.sample(_FUZZ_PATTERNS, rnd.randint(1, 4))
+            (directory / ".gitignore").write_text("\n".join(chosen) + "\n", encoding="utf-8")
+        for _ in range(rnd.randint(0, 5)):
+            candidate = directory / (rnd.choice(_FUZZ_BASENAMES) + rnd.choice(_FUZZ_EXTS))
+            if candidate.is_dir():
+                continue
+            candidate.write_text("def f(): pass\n", encoding="utf-8")
+
+
+def _git_visible_source_files(root: Path) -> set[str] | None:
+    """Files git would not ignore, limited to languages the index supports."""
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
+        listed = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return {
+        path
+        for path in listed
+        if Path(path).suffix.lower() in code_symbol_index.LANGUAGE_BY_EXTENSION
+    }
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_scan_matches_git_on_generated_trees(tmp_path: Path, seed: int) -> None:
+    tree = tmp_path / "tree"
+    _build_fuzz_tree(seed, tree)
+
+    scanned = {path.as_posix() for path in Repository(tree, create_index=True)._iter_indexable_files()}
+    expected = _git_visible_source_files(tree)
+    if expected is None:
+        pytest.skip("git is not available")
+
+    assert scanned == expected
+
+
+def test_scan_prunes_ignored_directories_instead_of_descending(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    (tmp_path / "keep.py").write_text("def keep(): pass\n", encoding="utf-8")
+    buried = tmp_path / "cache" / "a" / "b"
+    buried.mkdir(parents=True)
+    (buried / "buried.py").write_text("def buried(): pass\n", encoding="utf-8")
+    # A .gitignore inside an ignored directory must not resurrect anything:
+    # git cannot re-include a file whose parent directory is excluded.
+    (tmp_path / "cache" / ".gitignore").write_text("!buried.py\n", encoding="utf-8")
+
+    repo = Repository(tmp_path, create_index=True)
+    visited: list[str] = []
+    real_walk = os.walk
+
+    def counting_walk(top, *args, **kwargs):
+        for entry in real_walk(top, *args, **kwargs):
+            visited.append(entry[0])
+            yield entry
+
+    with mock.patch.object(code_symbol_index.os, "walk", counting_walk):
+        scanned = {path.as_posix() for path in repo._iter_indexable_files()}
+
+    assert scanned == {"keep.py"}
+    assert not any("cache" in entry for entry in visited), visited
