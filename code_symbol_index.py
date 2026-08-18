@@ -794,7 +794,11 @@ class CodeIndex:
         self.exclude = tuple(DEFAULT_EXCLUDES) + tuple(exclude or ())
         self._exclude_matcher = _compile_path_patterns(self.exclude)
         self.storage = _Storage(db_path, create=create_storage)
-        self._gitignore_specs: tuple[tuple[str, str, pathspec.PathSpec], ...] | None = None
+        # Gitignore specs in force for a directory, keyed by its posix prefix
+        # ("" for the root, "src/pkg/" otherwise). Each entry is the parent's
+        # stack plus that directory's own .gitignore, so a lookup costs one dict
+        # hit and a match tests only the path's own ancestors.
+        self._gitignore_specs: dict[str, tuple[tuple[str, str, pathspec.PathSpec], ...]] = {}
 
     def build(self) -> CodeIndex:
         self.storage.clear()
@@ -1110,27 +1114,38 @@ class CodeIndex:
 
 
     def _iter_indexable_files(self) -> Iterable[Path]:
-        # The walk runs on posix strings and only builds a Path for files it
-        # actually yields. Constructing a Path per candidate dominated the scan
-        # on large trees, as did ``Path.relative_to`` inside the ignore checks.
+        # One walk, on posix strings, building a Path only for files actually
+        # yielded. Gitignore specs are collected as the walk descends: a
+        # separate pass to find .gitignore files could not prune ignored
+        # directories (it had no specs yet), so it visited an order of magnitude
+        # more directories than the scan itself needed.
         root_text = str(self.root)
         for dirpath, dirnames, filenames in os.walk(root_text):
             relative_dir = os.path.relpath(dirpath, root_text)
             prefix = "" if relative_dir == "." else relative_dir.replace(os.sep, "/") + "/"
-            dirnames[:] = [
-                dirname
-                for dirname in dirnames
-                if not self._should_skip_dir_text(prefix + dirname)
-            ]
+            specs = self._gitignore_specs_for_dir(prefix, has_gitignore=".gitignore" in filenames)
+            kept: list[str] = []
+            for dirname in dirnames:
+                child = prefix + dirname
+                if self._is_excluded_text(child):
+                    continue
+                if self._matches_gitignore(specs, child, is_dir=True):
+                    continue
+                kept.append(dirname)
+            dirnames[:] = kept
             for filename in filenames:
                 path_text = prefix + filename
-                if self._should_index_text(path_text):
+                if self._should_index_text(path_text, specs):
                     yield Path(path_text)
 
     def _should_index(self, relative_path: Path) -> bool:
         return self._should_index_text(relative_path.as_posix())
 
-    def _should_index_text(self, path_text: str) -> bool:
+    def _should_index_text(
+        self,
+        path_text: str,
+        specs: tuple[tuple[str, str, pathspec.PathSpec], ...] | None = None,
+    ) -> bool:
         # Extension first: it is the cheapest and most selective test, so most
         # files never reach the pattern and gitignore matching below.
         if _spec_for_extension(_extension_of(path_text), self.languages) is None:
@@ -1139,7 +1154,7 @@ class CodeIndex:
             return False
         if self._is_excluded_text(path_text):
             return False
-        if self._is_gitignored_text(path_text):
+        if self._is_gitignored_text(path_text, specs=specs):
             return False
         return True
 
@@ -1164,8 +1179,26 @@ class CodeIndex:
     def _is_gitignored(self, relative_path: Path, *, is_dir: bool = False) -> bool:
         return self._is_gitignored_text(relative_path.as_posix(), is_dir=is_dir)
 
-    def _is_gitignored_text(self, path_text: str, *, is_dir: bool = False) -> bool:
-        for base_text, base_prefix, spec in self._gitignore_specs_for_root():
+    def _is_gitignored_text(
+        self,
+        path_text: str,
+        *,
+        is_dir: bool = False,
+        specs: tuple[tuple[str, str, pathspec.PathSpec], ...] | None = None,
+    ) -> bool:
+        if specs is None:
+            cut = path_text.rfind("/")
+            specs = self._gitignore_specs_for_dir(path_text[: cut + 1] if cut != -1 else "")
+        return self._matches_gitignore(specs, path_text, is_dir=is_dir)
+
+    @staticmethod
+    def _matches_gitignore(
+        specs: tuple[tuple[str, str, pathspec.PathSpec], ...],
+        path_text: str,
+        *,
+        is_dir: bool = False,
+    ) -> bool:
+        for base_text, base_prefix, spec in specs:
             if not base_text:
                 scoped_path = path_text
             elif path_text == base_text:
@@ -1180,31 +1213,32 @@ class CodeIndex:
                 return True
         return False
 
-    def _gitignore_specs_for_root(self) -> tuple[tuple[str, str, pathspec.PathSpec], ...]:
-        if self._gitignore_specs is not None:
-            return self._gitignore_specs
+    def _gitignore_specs_for_dir(
+        self, prefix: str, *, has_gitignore: bool | None = None
+    ) -> tuple[tuple[str, str, pathspec.PathSpec], ...]:
+        """Gitignore specs in force for a directory: its ancestors', plus its own."""
+        cached = self._gitignore_specs.get(prefix)
+        if cached is not None:
+            return cached
 
-        root_text = str(self.root)
-        specs: list[tuple[str, str, pathspec.PathSpec]] = []
-        for dirpath, dirnames, filenames in os.walk(root_text):
-            relative_dir = os.path.relpath(dirpath, root_text)
-            prefix = "" if relative_dir == "." else relative_dir.replace(os.sep, "/") + "/"
-            dirnames[:] = [
-                dirname
-                for dirname in dirnames
-                if not self._is_excluded_text(prefix + dirname)
-            ]
-            if ".gitignore" not in filenames:
-                continue
+        parent = _parent_prefix(prefix)
+        inherited = () if prefix == "" else self._gitignore_specs_for_dir(parent)
+        specs = inherited
+        if has_gitignore is not False:
             try:
-                lines = Path(dirpath, ".gitignore").read_text(encoding="utf-8", errors="replace").splitlines()
+                lines = (self.root / prefix / ".gitignore").read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
             except OSError:
-                continue
-            base_text = "" if relative_dir == "." else relative_dir.replace(os.sep, "/")
-            specs.append((base_text, prefix, pathspec.PathSpec.from_lines("gitignore", lines)))
+                lines = None
+            if lines is not None:
+                base_text = prefix[:-1] if prefix else ""
+                specs = inherited + (
+                    (base_text, prefix, pathspec.PathSpec.from_lines("gitignore", lines)),
+                )
 
-        self._gitignore_specs = tuple(specs)
-        return self._gitignore_specs
+        self._gitignore_specs[prefix] = specs
+        return specs
 
 
 class Repository(CodeIndex):
@@ -4677,6 +4711,14 @@ def _compile_path_patterns(patterns: Iterable[str]) -> Any:
     if not alternatives:
         return lambda _path_text: None
     return re.compile("|".join(alternatives)).match
+
+
+def _parent_prefix(prefix: str) -> str:
+    """``"a/b/"`` -> ``"a/"``; ``"a/"`` and ``""`` -> ``""``."""
+    if not prefix:
+        return ""
+    cut = prefix.rfind("/", 0, len(prefix) - 1)
+    return "" if cut == -1 else prefix[: cut + 1]
 
 
 def _extension_of(path_text: str) -> str:

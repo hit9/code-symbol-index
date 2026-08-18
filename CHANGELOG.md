@@ -4,6 +4,18 @@
 
 ### Changed
 
+- `index` no longer walks the tree twice. Collecting `.gitignore` files was a
+  separate pass that ran before the scan, and it could not prune ignored
+  directories because it was the pass building the ignore rules -- so it
+  descended into every gitignored build and cache directory. Whenever such a
+  directory is not also covered by the built-in exclude list, that pass
+  dominated the runtime of an up-to-date `index`: on a tree whose ignored cache
+  directories hold 10.8k files, it visited 3,724 directories where the scan
+  itself needed 2. Ignore rules are now gathered as the single walk descends
+  (each directory inherits its parent's stack and adds its own), so ignored
+  directories are pruned on contact and never entered. Matching a path also
+  tests only its own ancestors' rules instead of every `.gitignore` in the
+  repo. That tree's scan went from 119ms to 2ms.
 - The `index` scan stage is dramatically faster on large trees. It now walks on
   plain strings and builds a `Path` only for files it actually yields, tests the
   file extension first (the cheapest and most selective filter), matches the
