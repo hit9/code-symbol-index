@@ -1357,9 +1357,9 @@ class Repository(CodeIndex):
             summary_updates=summary_updates,
             indexed_files=indexed_results,
             schema_version=SCHEMA_VERSION,
-            git_baseline=_git_baseline(self.root, git_before if len(indexed_results) == len(to_index) else None),
+            git_baseline=_git_baseline(self.root, git_before),
         )
-        _emit_progress(progress_callback, "finish", done=total, total=total)
+        _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total)
         return self
 
     def build(self, *, progress: Any = _DEFAULT_PROGRESS) -> Repository:
@@ -1375,9 +1375,9 @@ class Repository(CodeIndex):
             deleted_paths=(),
             indexed_files=indexed_results,
             schema_version=SCHEMA_VERSION,
-            git_baseline=_git_baseline(self.root, git_before if len(indexed_results) == len(paths) else None),
+            git_baseline=_git_baseline(self.root, git_before),
         )
-        _emit_progress(progress_callback, "finish", done=total, total=total)
+        _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total)
         return self
 
     def update(
@@ -1407,7 +1407,7 @@ class Repository(CodeIndex):
             indexed_files=indexed_results,
             schema_version=SCHEMA_VERSION,
         )
-        _emit_progress(progress_callback, "finish", done=total, total=total)
+        _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total)
         return self
 
     def _parse_files(
@@ -5437,6 +5437,13 @@ class _CliProgress:
     ) -> None:
         # Agent/tool captures need results, not progress logs. In a terminal,
         # emit bounded percentage milestones without cursor control.
+        if event == "finish" and done < total:
+            stream = self.stream if self.stream is not None else sys.stderr
+            stream.write(f"warning: {total - done}/{total} files could not be indexed; "
+                         "check file readability/encoding or exclude unsupported files. "
+                         "Git freshness only tracks the checkout.\n")
+            stream.flush()
+            return
         if not self.interactive or total <= 0:
             return
         if event not in {"start", "file", "summary"}:

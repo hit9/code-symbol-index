@@ -338,6 +338,11 @@ A fetch that changes only remote-tracking refs does not trigger a warning.
 
 `status` includes `git_freshness`: `unchanged`, `changed`, `unknown`, or
 `not-applicable`. **Unchanged Git state does not mean unchanged source files.**
+With a subdirectory `--root`, the nearest enclosing Git repository is monitored;
+commits elsewhere in that repository can also trigger the hint.
+Files that cannot be parsed do not erase the Git baseline: index/update report
+their count separately on stderr, including in captured calls. Git freshness
+does not certify that every file was successfully indexed.
 Uncommitted edits, changed ignore rules, nested repositories/submodules and
 same-size/same-mtime replacements are not covered by the Git hint. Missing or
 unreadable metadata, reftable HEADs without loose refs, and packed refs over

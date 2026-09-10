@@ -320,7 +320,10 @@ index:
 
 `status` 新增 `git_freshness`：`unchanged`、`changed`、`unknown` 或
 `not-applicable`。**Git 未变化不代表源码未变化。** 未提交的编辑、忽略规则变化、
-嵌套仓库/子模块以及同大小同 mtime 替换不在 Git 提示的检测范围。元数据缺失或
+嵌套仓库/子模块以及同大小同 mtime 替换不在 Git 提示的检测范围。
+`--root` 指向子目录时监视最近的所属 Git 仓库，该仓库其他目录的提交也可能触发提示。
+无法解析的文件不会清空 Git 基线；index/update 会在 stderr 单独报告失败数量，
+包括非终端调用。Git 新鲜度不保证所有文件均成功索引。元数据缺失或
 不可读、无 loose ref 的 reftable 布局、超过 256 KiB 的 packed refs 都降级为
 `unknown`，不误报最新。
 

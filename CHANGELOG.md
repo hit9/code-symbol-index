@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Keep Git baseline recording independent of skipped source files; report
+  incomplete indexing separately, including in captured calls.
 - Defer process-pool, Tree-sitter, hashing and argument-parser imports until
   needed; plain `version` bypasses parser construction. Captured index/update
   calls emit no progress. Terminals show file counts and percentages at 10% milestones without cursor control.

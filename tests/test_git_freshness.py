@@ -154,9 +154,35 @@ def test_git_check_does_not_load_manifest_or_scan_sources(repository):
     assert metadata.call_args.kwargs['include_files'] is False
 
 
-def test_failed_parse_does_not_publish_known_git_baseline(repository):
+@pytest.mark.parametrize('operation', ['refresh', 'build'])
+@pytest.mark.parametrize('content', [b'\xff\n', b'\x00\n'])
+def test_failed_parse_preserves_git_detection(repository, operation, content, capsys):
     repo = repository
-    (repo.root / 'app.py').write_text('def changed():\n    return 22\n')
-    with mock.patch.object(repo, '_parse_files', return_value=[]):
-        repo.refresh()
-    assert c.status(repo.root).git_freshness == 'unknown'
+    (repo.root / 'bad.py').write_bytes(content)
+    for branch in ('second', 'third'):
+        git(repo.root, 'checkout', '-b', branch)
+        assert c.status(repo.root).git_freshness == 'changed'
+        getattr(repo, operation)(progress=c._CliProgress())
+        warning = capsys.readouterr().err
+        assert 'files could not be indexed' in warning
+        assert 'Git freshness unknown' not in warning
+        assert c.status(repo.root).git_freshness == 'unchanged'
+        assert c.status(repo.root, check=True).status == 'stale'
+
+
+def test_unreadable_file_reports_separately_from_git(repository, capsys):
+    repo = repository
+    read = c._read_text_file
+    def unreadable(path):
+        if path.name == 'bad.py':
+            raise PermissionError('fixture')
+        return read(path)
+    (repo.root / 'bad.py').write_text('def bad(): pass\n')
+    with mock.patch.object(c, '_read_text_file', side_effect=unreadable):
+        repo.refresh(progress=c._CliProgress())
+        assert '1/1 files could not be indexed' in capsys.readouterr().err
+        repo.update(['bad.py'], progress=c._CliProgress())
+        assert '1/1 files could not be indexed' in capsys.readouterr().err
+    assert c.status(repo.root).git_freshness == 'unchanged'
+    git(repo.root, 'checkout', '-b', 'second')
+    assert c.status(repo.root).git_freshness == 'changed'
