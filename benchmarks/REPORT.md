@@ -31,3 +31,34 @@ acceleration. No schema or stored-data change: the benchmark compares files,
 symbols and refs rows after every write case, and query stdout against master.
 Existing and new tests: 145 passed. This step does not resolve the full real-world
 query bottleneck or implement automatic stale warnings.
+
+## Step 2: extract only the queried reference name
+
+The query-only extractor prunes AST subtrees without the requested bytes and
+retains the full extractor's classification/ancestor rules. It does not persist
+references, change the schema, or change refresh/update processing.
+
+179 tests passed, including differential extraction across 13 languages,
+pagination/kinds, live edits, and assertions that queries do not construct
+unrelated symbols or classify unrelated identifiers.
+
+Write guard: `python benchmarks/bench_restart.py --samples 15 --write-only
+--output /tmp/write-guard.json` (one shell command). Python 3.13.13,
+Linux 6.8 aarch64. Median CLI milliseconds:
+
+| Fixture / command | master | step 2 |
+| --- | ---: | ---: |
+| small / new index | 113.46 | 114.88 |
+| small / unchanged index | 87.84 | 87.61 |
+| small / update one | 89.91 | 90.39 |
+| small / update two | 109.81 | 112.94 |
+| large / new index | 269.61 | 179.65 |
+| large / unchanged index | 89.26 | 89.97 |
+| large / update one | 215.19 | 125.40 |
+| large / update two | 251.20 | 160.21 |
+
+Small/startup-dominated cases vary by 0–3%; these measurements do not establish
+a repeatable regression or an absolute no-regression guarantee on every machine.
+The query change adds no work to the write path. Large-file writes are faster
+and files/symbols/refs rows remain identical to master.
+

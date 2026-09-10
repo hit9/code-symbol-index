@@ -39,6 +39,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--baseline", default="55e843a")
+    parser.add_argument("--write-only", action="store_true", help="repeat only index/update guards")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.samples < 2:
@@ -76,6 +77,8 @@ def main() -> None:
                 "missing": ["search", "no_such_symbol"], "version": ["version"],
             }
             for name, command in cases.items():
+                if args.write_only and name not in ("index_new", "index_no_change", "update_one", "update_two"):
+                    continue
                 times = {key: [] for key in scripts}
                 outputs = {}
                 for sample in range(args.samples):

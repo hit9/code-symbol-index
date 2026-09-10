@@ -1462,7 +1462,7 @@ class Repository(CodeIndex):
         for path in paths:
             if not _file_contains_bytes(self.root / path, needle):
                 continue
-            indexed_file = _parse_file(self.root, path, self.languages)
+            indexed_file = _parse_file(self.root, path, self.languages, reference_name=symbol.name)
             if indexed_file is None:
                 continue
             for reference in indexed_file.references:
@@ -2706,6 +2706,8 @@ def _parse_file(
     relative_path: Path,
     languages: set[str] | None = None,
     include_references: bool = True,
+    *,
+    reference_name: str | None = None,
 ) -> _IndexedFile | None:
     full_path = root / relative_path
     spec = _spec_for_path(relative_path, languages)
@@ -2721,13 +2723,17 @@ def _parse_file(
     tree = _parse_source(_parser_for_language(spec.name), source_text)
     root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
     source_bytes = source_text.encode("utf-8")
-    symbols, references = _extract_symbols_and_references(
-        source=source_bytes,
-        root_node=root_node,
-        path=relative_path,
-        language=spec,
-        include_references=include_references,
-    )
+    if reference_name is not None:
+        symbols = []
+        references = _extract_named_references(source_bytes, root_node, relative_path, spec, reference_name)
+    else:
+        symbols, references = _extract_symbols_and_references(
+            source=source_bytes,
+            root_node=root_node,
+            path=relative_path,
+            language=spec,
+            include_references=include_references,
+        )
     return _IndexedFile(
         path=relative_path,
         language=spec.name,
@@ -2972,6 +2978,44 @@ def _classify_reference(
     if parent is None:
         return "usage"
     return "read"
+
+
+def _extract_named_references(
+    source: bytes, root_node: Node, path: Path, language: LanguageSpec, name: str,
+) -> list[Reference]:
+    """Extract one name without building unrelated symbols or references.
+
+    Prune only subtrees whose byte span cannot contain the name. Visit the
+    remaining ancestors normally to preserve import/type/inheritance context
+    and transparent-node handling from the full extractor.
+    """
+    needle = name.encode("utf-8")
+    line_starts = _line_starts(source)
+    lines = source.decode("utf-8", errors="replace").splitlines()
+    references: list[Reference] = []
+
+    def walk(node: Node, parent: Node | None, grandparent: Node | None, ctx: frozenset[str]) -> None:
+        start, end = _node_start_byte(node), _node_end_byte(node)
+        if source.find(needle, start, end) < 0:
+            return
+        kind = _node_kind(node)
+        if kind in language.identifier_node_types and source[start:end] == needle:
+            references.append(Reference(
+                symbol_id="", name=name, language=language.name, path=path,
+                range=_node_range(source, node, line_starts),
+                context=_line_context(source, lines, node, line_starts),
+                reference_kind=_classify_reference(node, parent, grandparent, ctx, language),
+            ))
+        child_ctx = _child_reference_context(node, parent, ctx, language)
+        if kind in language.transparent_node_types:
+            child_parent, child_grandparent = parent, grandparent
+        else:
+            child_parent, child_grandparent = node, parent
+        for child in _node_children(node):
+            walk(child, child_parent, child_grandparent, child_ctx)
+
+    walk(root_node, None, None, frozenset())
+    return references
 
 
 def _extract_symbols_and_references(

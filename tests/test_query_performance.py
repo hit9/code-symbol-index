@@ -23,3 +23,69 @@ def test_symbol_only_index_skips_reference_work(tmp_path):
         after = repo.storage.connection.execute("SELECT * FROM symbols ORDER BY id").fetchall()
         assert [tuple(row) for row in before] == [tuple(row) for row in after]
         assert repo.storage.connection.execute("SELECT count(*) FROM refs").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("language,source", [
+    ("python", "from pkg import Target\n@decorator(Target)\nclass Derived(Target):\n    def call(self, x: Target):\n        Target = x\n        return obj.Target(Target), TargetExtra, 'Target', '名字'\n"),
+    ("javascript", "import {Target} from 'pkg'; class Derived extends Target { call() { const x = Target(); return obj.Target(x); } }"),
+    ("typescript", "interface Target {} class Derived implements Target { call(x: Target) { return Target(x); } }"),
+    ("rust", "use pkg::Target; fn call(x: Target) { let y = Target::new(); x.Target(); }"),
+    ("go", "package main\nfunc Target() {}\nfunc call() { Target(); obj.Target() }\n"),
+    ("c", "int Target(int x) { return x; } int call() { return Target(1); }"),
+    ("cpp", "class Target {}; int call() { Target x; return obj.Target(); }"),
+    ("java", "class Derived extends Target { Target call(Target x) { return x.Target(); } }"),
+    ("csharp", "class Derived : Target { Target Call(Target x) { return x.Target(); } }"),
+    ("swift", "class Derived: Target { func call(_ x: Target) { Target(); x.Target(); let y = x[Target] } }"),
+    ("kotlin", "class Derived : Target { fun call(x: Target) { Target(); x.Target(); var y = Target } }"),
+    ("ruby", "class Derived < Target\n def call(x)\n  Target.new\n  x.Target()\n end\nend\n"),
+    ("php", "<?php class Derived extends Target { function call($x) { Target(); $x->Target(); Target::make(); } }"),
+])
+def test_named_extraction_matches_full_extraction(language, source):
+    spec = c.LANGUAGE_BY_NAME[language]
+    for text in (source, source.replace("\n", "\r\n")):
+        data = text.encode()
+        tree = c._parse_source(c._parser_for_language(language), text)
+        node = tree.root_node() if callable(tree.root_node) else tree.root_node
+        _, references = c._extract_symbols_and_references(source=data, root_node=node, path=Path("sample"), language=spec)
+        assert references
+        for name in {ref.name for ref in references} | {"missing", "TargetExtra", "Target"}:
+            assert c._extract_named_references(data, node, Path("sample"), spec, name) == [
+                ref for ref in references if ref.name == name
+            ]
+
+
+def test_named_query_prunes_unrelated_nodes_and_builds_no_symbols(tmp_path):
+    source = "def target():\n    return 1\n" + "".join(
+        f"def unrelated_{i}():\n    return other(value + {i})\n" for i in range(100)
+    ) + "def caller():\n    return target()\n"
+    (tmp_path / "app.py").write_text(source)
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    with mock.patch.object(c, "_symbol_from_node", side_effect=AssertionError("query extracts unrelated symbols")), \
+         mock.patch.object(c, "_classify_reference", wraps=c._classify_reference) as classify:
+        refs = repo.refs("target", limit=100)
+    assert len(refs.items) == 1
+    # Only the declaration and call, rather than hundreds of identifiers.
+    assert classify.call_count == 2
+
+
+@pytest.mark.parametrize("limit,offset", [(0, 0), (1, 0), (2, 1), (10, 0), (2, 20)])
+@pytest.mark.parametrize("kinds", [None, "call", "read", "import,attribute"])
+def test_named_query_keeps_pagination_and_live_source(tmp_path, limit, offset, kinds):
+    source = "def target():\n    pass\n\ndef caller():\n    target()\n    x = target\n    obj.target()\n"
+    (tmp_path / "app.py").write_text(source)
+    (tmp_path / "other.py").write_text("from app import target\ndef another():\n    target()\n")
+    memory = c.CodeIndex(tmp_path).build()
+    disk = c.Repository(tmp_path, create_index=True).refresh()
+    if limit == 0:
+        for repo in (memory, disk):
+            with pytest.raises(ValueError, match="limit must be >= 1"):
+                repo.refs("target", limit=limit, offset=offset, ref_kinds=kinds)
+        return
+    assert disk.refs("target", limit=limit, offset=offset, ref_kinds=kinds) == memory.refs(
+        "target", limit=limit, offset=offset, ref_kinds=kinds
+    )
+    (tmp_path / "other.py").write_text("def another():\n    target()\n    target()\n")
+    memory.build()
+    assert disk.refs("target", limit=limit, offset=offset, ref_kinds=kinds) == memory.refs(
+        "target", limit=limit, offset=offset, ref_kinds=kinds
+    )
