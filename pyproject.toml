@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "ruff>=0.14"]
 
 [project.scripts]
 code-symbol-index = "code_symbol_index:main"
@@ -28,3 +28,13 @@ py-modules = ["code_symbol_index"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Trace-callback lambdas intentionally capture loop variables.
+"tests/test_code_symbol_index.py" = ["B023"]

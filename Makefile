@@ -4,13 +4,14 @@ MODULE := code_symbol_index
 PACKAGE := code-symbol-index
 VERSION := $(shell $(PYTHON) -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
 
-.PHONY: help venv install test check smoke clean build publish-check publish
+.PHONY: help venv install test lint check smoke clean build publish-check publish
 
 help:
 	@printf '%s\n' \
 		'Targets:' \
 		'  make install        Install editable package with dev dependencies' \
 		'  make test           Run tests' \
+		'  make lint           Run ruff lint' \
 		'  make check          Run syntax check and tests' \
 		'  make smoke          Run a small CLI smoke test' \
 		'  make build          Build package artifacts' \
@@ -26,6 +27,9 @@ install: venv
 
 test:
 	$(PYTHON) -m pytest -q
+
+lint:
+	$(UV) run ruff check $(MODULE).py tests
 
 check:
 	$(PYTHON) -m py_compile $(MODULE).py

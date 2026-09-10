@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import random
 import subprocess
@@ -172,7 +172,7 @@ impl Greeter for Person {
     )
 
     index = CodeIndex(tmp_path).build()
-    trait = index.search_symbols("Greeter", kind="trait", language="rust")[0]
+    index.search_symbols("Greeter", kind="trait", language="rust")
 
     implementations = index.impls("Greeter", kind="trait", language="rust")
     assert any(symbol.kind == "impl" and "Greeter" in symbol.signature for symbol in implementations)
@@ -680,7 +680,7 @@ def test_reported_line_numbers_are_one_based_and_inclusive(tmp_path: Path, capsy
     assert "5:6 |     def hello(self):" in outline
 
     text = code_symbol_index.inspect_text("hello", root=tmp_path, anchors=True, anchor_format="explicit")
-    body_hash = hashlib.sha256("        return os.sep".encode("utf-8")).hexdigest()[:8]
+    body_hash = hashlib.sha256(b"        return os.sep").hexdigest()[:8]
     assert "range: 5:6" in text
     assert f"anchor=6:{body_hash} |         return os.sep" in text
 
@@ -883,8 +883,8 @@ def test_inspect_text_supports_hashline_anchors(tmp_path: Path) -> None:
     code_symbol_index.index(tmp_path)
 
     output = code_symbol_index.inspect_text("helper", root=tmp_path, anchors=True)
-    first_hash = hashlib.sha256("def helper():".encode("utf-8")).hexdigest()[:8]
-    second_hash = hashlib.sha256("    return 1".encode("utf-8")).hexdigest()[:8]
+    first_hash = hashlib.sha256(b"def helper():").hexdigest()[:8]
+    second_hash = hashlib.sha256(b"    return 1").hexdigest()[:8]
 
     assert "note: Use line:hash as edit anchor; code starts after |" in output
     assert f"1:{first_hash}|def helper():" in output
@@ -907,7 +907,7 @@ def test_inspect_json_includes_current_file_source_anchors(tmp_path: Path) -> No
     )
 
     output = code_symbol_index.inspect("helper", root=tmp_path, format="json", anchors=True)
-    body_hash = hashlib.sha256("    return 2".encode("utf-8")).hexdigest()[:8]
+    body_hash = hashlib.sha256(b"    return 2").hexdigest()[:8]
 
     assert output["source_anchor"]["path"] == "app.py"
     assert output["source_anchor"]["start_line"] == 1

@@ -25,41 +25,12 @@ machine-readable response is better.
 This is syntactic code navigation, not a language server. It does not provide
 type-aware rename safety or full semantic call graph accuracy.
 
-Query optimizations keep the schema-5 symbol index unchanged. Reference queries
-still read current source files, but extract only the requested name and skip
-unrelated AST subtrees. They do not persist references or require an index
-rebuild. Filesystem scanning and candidate parsing still have a cost on large
-repositories. See [measured query and indexing results](benchmarks/REPORT.md).
-
-### File name summaries
-
-Reference and caller queries can skip unchanged files using compact name
-membership summaries. Possible matches still scan and parse live source. The
-first 32 file checks use the original scanner so early results do not load a
-summary manifest. Per-request summary data is bounded; missing summaries,
-unusual names and files over 1 MiB keep the original path.
-
-The next write adds a nullable `files.name_summary` column to schema 5. Reads
-of old databases do not migrate them. A normal `index` fills missing summaries
-for unchanged files **without rebuilding their ASTs**, with a brief terminal stage message;
-subsequent refreshes only refill missing or stat-invalidated summaries, including
-after permission changes or same-size/same-mtime replacements. Explicit-path `update` only
-maintains the selected files. Existing symbols/references keep their formats.
-This trades a small amount of storage and indexing time for fewer query reads.
-Files changed within the last second defer summary generation until a later
-refresh, preventing timestamp-granularity collisions from hiding live edits.
-Captured/non-TTY index and update calls emit no progress, keeping agent output
-small. Interactive terminals refresh file counts and percentages on the same line
-at 10% milestones, retaining the final line without erasing it. Results remain on
-stdout; actionable hints remain on stderr.
-The file percentage measures parsing. Terminal-only messages then identify
-index writing and transaction commit; public progress callback events are unchanged.
-
-Negative matches are trusted only while device, inode, size, mtime and ctime
-match. Checks are shared only within one request, not across calls on a reused
-Repository. This is not an atomic snapshot against concurrent source edits.
-On Windows this shortcut is disabled because [ctime still means creation time](https://docs.python.org/3/library/os.html#os.stat_result.st_ctime);
-queries use the original scanner there. No full reference/context database is stored.
+Reference queries read current source files, extract only the requested name, and
+skip unrelated AST subtrees; the schema-5 symbol index stays unchanged, references
+are not persisted, and no rebuild is needed. Name summaries let reference and caller
+queries skip unchanged files (see [File name summaries](#file-name-summaries)); large
+repositories still pay for filesystem scanning and candidate parsing — see
+[measured query and indexing results](benchmarks/REPORT.md).
 
 ## Install
 
@@ -199,6 +170,13 @@ code-symbol-index impls Tool --root /path/to/repo --json
 code-symbol-index callers handle_job --root /path/to/repo --json
 code-symbol-index status --root /path/to/repo --json
 ```
+
+Progress output: captured or non-TTY `index` / `update` calls emit no progress, keeping
+agent output small. Interactive terminals refresh file counts and percentages on one
+line at 10% milestones and keep the final line; the file percentage measures parsing,
+and terminal-only messages then report index writing and transaction commit. Public
+progress callback events are unchanged. Results stay on stdout; actionable hints stay
+on stderr.
 
 ## Output Formats
 
@@ -399,6 +377,24 @@ Python indexes top-level constants, top-level variables, and top-level
 dictionary keys as symbols. Dictionary keys use `kind=dict_key` and the parent
 assignment as `container`.
 
+### File name summaries
+
+Reference and caller queries can skip unchanged files using compact name membership
+summaries. A nullable `files.name_summary` column is added to schema 5 on the next
+write; old databases are not migrated, but a normal `index` backfills summaries for
+unchanged files without rebuilding their ASTs, and later refreshes only refill missing
+or stat-invalidated entries. Explicit-path `update` maintains only the selected files.
+This trades a small amount of storage and indexing time for fewer query reads.
+
+The original scanner is kept for the first 32 file checks, missing summaries, unusual
+names, files over 1 MiB, and files changed within the last second. Negative matches are
+trusted only while device, inode, size, mtime and ctime match; checks are shared within
+one request only, and this is not an atomic snapshot against concurrent edits. On
+Windows, where [ctime still means creation
+time](https://docs.python.org/3/library/os.html#os.stat_result.st_ctime), the shortcut
+is disabled. Per-request summary data is bounded; no full reference/context database
+is stored.
+
 ## Line Numbers
 
 All reported line numbers are **1-based**, and ranges are `start:end` with
@@ -592,6 +588,7 @@ Search text and JSON formats include `has_more` when more matches exist beyond
 ```bash
 make install
 make check
+make lint
 make smoke
 make clean
 ```

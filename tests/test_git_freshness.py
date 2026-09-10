@@ -1,7 +1,6 @@
 """Git hint coverage uses only disposable local repositories; no remotes."""
 import json
 import subprocess
-from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -111,7 +110,8 @@ def test_packed_refs_detached_reset_and_worktree(repository, tmp_path):
     assert c.status(linked.root).git_freshness == 'unchanged'
     git(worktree, 'checkout', '-b', 'linked-second')
     assert c.status(linked.root).git_freshness == 'changed'
-    sub = worktree / 'sub'; sub.mkdir()
+    sub = worktree / 'sub'
+    sub.mkdir()
     assert c._git_state(sub) == c._git_state(worktree)
 
 

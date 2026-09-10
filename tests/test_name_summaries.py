@@ -62,9 +62,11 @@ def test_summary_query_matches_scanner_for_graph_and_clears_context(tmp_path):
             expected = method()
         assert method() == expected
         assert repo._name_filter is None
-    with mock.patch.object(c._NameFilter, 'may_contain', side_effect=RuntimeError('interrupted')):
-        with pytest.raises(RuntimeError):
-            repo.callers('target')
+    with (
+        mock.patch.object(c._NameFilter, 'may_contain', side_effect=RuntimeError('interrupted')),
+        pytest.raises(RuntimeError),
+    ):
+        repo.callers('target')
     assert repo._name_filter is None
     assert repo.callers('target')
 
@@ -154,7 +156,7 @@ def test_ascii_names_have_no_false_negatives(tmp_path):
     path.write_bytes(source)
     summary = c._file_name_summary(source, path.stat())
     repo = fixture_repo(tmp_path)
-    for needle in names + [b'alpha', b'target']:
+    for needle in [*names, b'alpha', b'target']:
         name_filter = c._NameFilter(repo)
         name_filter.rows = {'names.py': summary}
         assert name_filter.may_contain(Path('names.py'), (needle,))

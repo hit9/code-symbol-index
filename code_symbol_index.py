@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import argparse
     import concurrent.futures
+
     import pathspec
     from tree_sitter import Node
 
@@ -366,7 +367,7 @@ class CallNode:
     symbol: Symbol
     depth: int
     entry_type: str | None = None
-    children: tuple["CallNode", ...] = ()
+    children: tuple[CallNode, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1187,9 +1188,7 @@ class CodeIndex:
             return False
         if self._is_excluded_text(path_text):
             return False
-        if self._is_gitignored_text(path_text, specs=specs):
-            return False
-        return True
+        return not self._is_gitignored_text(path_text, specs=specs)
 
     def _should_skip_dir(self, relative_path: Path) -> bool:
         return self._should_skip_dir_text(relative_path.as_posix())
@@ -1268,9 +1267,7 @@ class CodeIndex:
                 import pathspec
 
                 base_text = prefix[:-1] if prefix else ""
-                specs = inherited + (
-                    (base_text, prefix, pathspec.PathSpec.from_lines("gitignore", lines)),
-                )
+                specs = (*inherited, (base_text, prefix, pathspec.PathSpec.from_lines("gitignore", lines)))
 
         self._gitignore_specs[prefix] = specs
         return specs
@@ -4663,7 +4660,7 @@ def _format_outline_text(repo: CodeIndex, path: Path, page: Page, *, symbol: str
     if symbol is not None:
         lines.append(f"symbol: {symbol}")
     if page.has_more:
-        lines.append(f"has_more: true")
+        lines.append("has_more: true")
         lines.append(f"limit: {page.limit}")
     lines.extend(["", "outline:"])
     if not symbols:
@@ -4836,8 +4833,8 @@ def _index_status(
     schema_version = data["schema_version"]
     is_schema_stale = schema_version != SCHEMA_VERSION
     git_freshness = _git_freshness(root, data["git_baseline"])
-    is_stale = (is_schema_stale or isinstance(pending_changes, int) and pending_changes > 0
-                or not check and git_freshness == "changed")
+    is_stale = (is_schema_stale or (isinstance(pending_changes, int) and pending_changes > 0)
+                or (not check and git_freshness == "changed"))
     if is_schema_stale:
         reason = "index schema is out of date"
     elif isinstance(pending_changes, int) and pending_changes > 0:
@@ -5918,12 +5915,12 @@ __all__ = [
     "CodeIndex",
     "CodeSymbolIndexError",
     "EntryPoint",
-    "IndexNotFoundError",
-    "IndexStatus",
-    "Inspection",
-    "InspectOptions",
     "HashLine",
     "ImportItem",
+    "IndexNotFoundError",
+    "IndexStatus",
+    "InspectOptions",
+    "Inspection",
     "Page",
     "Position",
     "Range",
@@ -5941,9 +5938,9 @@ __all__ = [
     "clean",
     "impls",
     "index",
-    "install_skill",
     "inspect",
     "inspect_text",
+    "install_skill",
     "main",
     "outline",
     "outline_text",
