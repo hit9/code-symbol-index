@@ -38,7 +38,8 @@ code-symbol-index
 
 下次写入时，schema 5 的 `files` 表会增加一个可空的 `name_summary` 字段；
 读取旧库不会迁移。正常 `index` 会为未变化文件补摘要，**不重新构建 AST**，
-交互终端显示简短阶段提示；以后不会重复补齐。指定路径的 `update` 只维护所选文件。
+交互终端显示简短阶段提示；后续只补齐缺失或 stat 失效的摘要，包括权限变化和
+同大小同 mtime 文件替换。指定路径的 `update` 只维护所选文件。
 符号、引用的存储格式不变，以少量空间和索引时间换取更少的查询文件读取。
 最近一秒内变化的文件暂不生成摘要，后续刷新再补齐，避免时间戳精度导致漏掉编辑。
 非 TTY／被 Codex、Claude 等工具捕获时，index/update 不输出进度，减少 token。
@@ -501,6 +502,7 @@ repo.update(["src/app.py"], progress=on_progress)
 ```
 
 稳定的进度事件为 `scan`、`start`、`file` 和 `finish`。
+`finish` 的 `done` 是成功解析文件数，`total` 是尝试解析文件数。
 
 仅当 stderr 为交互式终端时，CLI 才每跨过 10% 显示文件计数和百分比。当 stderr 被捕获（管道，或被
 agent 读取）时，不输出进度，

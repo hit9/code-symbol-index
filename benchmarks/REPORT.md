@@ -297,3 +297,29 @@ Final compatibility check on Linux/aarch64: Python 3.11.15, 3.12.3, 3.13.13,
 3.14.4 and 3.15.0a8 each passed all 239 tests in separate environments. No
 Windows/macOS runtime matrix was run; the Windows summary shortcut remains
 disabled as described above.
+
+### Review follow-up: invalidated summary repair
+
+Refresh now compares the first 41 stored summary bytes with the stat results
+already collected by its scan. Only missing/invalidated summaries read source
+again; unchanged ASTs are not rebuilt. Query fallback semantics are unchanged.
+
+Seven alternating independent-process samples against 9440636, Python 3.13.13,
+local temporary storage, warm filesystem/bytecode, synthetic fixtures only:
+
+| Command | Small after/before | Large after/before |
+| --- | ---: | ---: |
+| index new | 1.028 | 1.006 |
+| index unchanged | 0.966 | 1.018 |
+| update one | 1.002 | 0.993 |
+| update two | 0.998 | 0.953 |
+
+Reproduce: `python benchmarks/bench_restart.py --samples 7 --baseline 9440636
+--write-only --fixture all --output /tmp/summary-repair.json`. Small is 16 files
+with 8 functions each; large is 4 files with 1000 functions each. Common indexed
+rows and stdout matched. These small differences do not establish a speedup or
+bound performance on large file-count repositories or shared mounts.
+
+The follow-up suite passed 248 tests on Python 3.13.13, including failed parsing
+with usable Git metadata, invalidated summaries, and the production prefix/age
+defaults together. The earlier five-version matrix predates these fixes.

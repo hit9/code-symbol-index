@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Refill stat-invalidated name summaries on refresh without rebuilding unchanged
+  ASTs; compare only stored headers against the existing scan's stat results.
 - Keep Git baseline recording independent of skipped source files; report
   incomplete indexing separately, including in captured calls.
 - Defer process-pool, Tree-sitter, hashing and argument-parser imports until

@@ -8,6 +8,31 @@ import pytest
 import code_symbol_index as c
 
 
+def test_summary_defaults_defer_then_filter_after_prefix(tmp_path, monkeypatch):
+    # Use the production 32-check budget and one-second age guard together.
+    assert c.NAME_SUMMARY_SCAN_PREFIX == 32
+    assert c.NAME_SUMMARY_MIN_AGE_NS == 1_000_000_000
+    for i in range(40):
+        (tmp_path / f'file_{i:02}.py').write_text(f'def unused_{i}(): return 1\n')
+    monkeypatch.setattr(c, 'MAX_WORKERS', 1)
+    monkeypatch.setattr(c, 'time_ns', lambda: 0)
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    assert repo.storage.connection.execute('SELECT count(*) FROM files WHERE name_summary IS NULL').fetchone()[0] == 40
+    latest = max(path.stat().st_ctime_ns for path in tmp_path.glob('*.py'))
+    monkeypatch.setattr(c, 'time_ns', lambda: latest + c.NAME_SUMMARY_MIN_AGE_NS)
+    with mock.patch.object(c, '_parse_file', side_effect=AssertionError('AST rebuilt')):
+        repo.refresh()
+    names = c._NameFilter(repo)
+    for i in range(32):
+        assert names.may_contain(Path(f'file_{i:02}.py'), (b'missing',))
+        assert names.rows is None
+    assert not names.may_contain(Path('file_32.py'), (b'missing',))
+    assert names.rows is not None
+    # Changed files after the prefix must fall back to the live scanner.
+    (tmp_path / 'file_39.py').write_text('def caller(): return missing()\n')
+    assert names.may_contain(Path('file_39.py'), (b'missing',))
+
+
 @pytest.mark.parametrize("source", [b"", b"\n", b"a\r\nb\n", "名字 = 'é'\nend".encode(), b"no newline"])
 def test_line_table_matches_byte_positions(source):
     starts = c._line_starts(source)

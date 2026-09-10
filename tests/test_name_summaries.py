@@ -102,6 +102,31 @@ def test_partial_update_only_populates_its_own_summary(tmp_path):
     assert repo.storage.connection.execute('SELECT count(*) FROM files WHERE name_summary IS NOT NULL').fetchone()[0] == 1
 
 
+@pytest.mark.parametrize('change', ['utime', 'chmod', 'replace'])
+def test_refresh_repairs_metadata_invalidated_summary_without_parsing(tmp_path, change):
+    repo = fixture_repo(tmp_path)
+    path = tmp_path / 'b.py'
+    before = path.stat()
+    if change == 'replace':
+        replacement = tmp_path / 'replacement'
+        replacement.write_bytes(path.read_bytes())
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        replacement.replace(path)
+    elif change == 'chmod':
+        path.chmod(before.st_mode ^ 0o100)
+    else:
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    # Some filesystems can give consecutive mutations the same timestamp tick.
+    if (path.stat().st_ino, path.stat().st_ctime_ns) == (before.st_ino, before.st_ctime_ns):
+        pytest.skip('filesystem timestamp tick did not advance')
+    assert c._NameFilter(repo).may_contain(Path('b.py'), (b'missing',))
+    with mock.patch.object(c, '_parse_file', side_effect=AssertionError('unchanged AST rebuilt')):
+        repo.refresh()
+    assert not c._NameFilter(repo).may_contain(Path('b.py'), (b'missing',))
+    with mock.patch.object(c, '_file_name_summary', side_effect=AssertionError('backfill repeated')):
+        repo.refresh()
+
+
 @pytest.mark.parametrize('bad', [None, b'', b'\x00', b'\x02' + b'\0' * 104, 'not bytes'])
 def test_unknown_or_missing_summary_falls_back(tmp_path, bad):
     repo = fixture_repo(tmp_path)

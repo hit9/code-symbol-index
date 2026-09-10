@@ -1326,7 +1326,7 @@ class Repository(CodeIndex):
         for path_text, (path, stat) in current_files.items():
             old = indexed_files.get(path_text)
             if old is not None and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size:
-                if not old["has_summary"]:
+                if not _name_summary_current(old["summary_header"], stat):
                     to_summarize.append((path, stat))
                 continue
             to_index.append(path)
@@ -2071,11 +2071,12 @@ class _Storage:
     def files(self) -> dict[str, sqlite3.Row]:
         try:
             rows = self.connection.execute(
-                "SELECT path, language, mtime_ns, size, name_summary IS NOT NULL AS has_summary FROM files",
+                "SELECT path, language, mtime_ns, size, name_summary IS NOT NULL AS has_summary, "
+                "substr(name_summary, 1, 41) AS summary_header FROM files",
             ).fetchall()
         except sqlite3.OperationalError:
             rows = self.connection.execute(
-                "SELECT path, language, mtime_ns, size, 0 AS has_summary FROM files",
+                "SELECT path, language, mtime_ns, size, 0 AS has_summary, NULL AS summary_header FROM files",
             ).fetchall()
         return {row["path"]: row for row in rows}
 
@@ -2797,6 +2798,18 @@ def _spec_for_extension(extension: str, languages: set[str] | None = None) -> La
     except UnsupportedLanguageError:
         return None
     return spec
+
+
+def _name_summary_current(header: bytes | None, stat: os.stat_result) -> bool:
+    if header == b"\x00":
+        return True  # Intentionally unsupported; do not retry every refresh.
+    if not isinstance(header, bytes) or len(header) != 41 or header[0] != 1:
+        return False
+    import struct
+
+    return struct.unpack("<QQQqq", header[1:]) == (
+        stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+    )
 
 
 def _file_name_summary(source: bytes, stat: os.stat_result) -> bytes | None:

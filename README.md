@@ -42,7 +42,8 @@ unusual names and files over 1 MiB keep the original path.
 The next write adds a nullable `files.name_summary` column to schema 5. Reads
 of old databases do not migrate them. A normal `index` fills missing summaries
 for unchanged files **without rebuilding their ASTs**, with a brief terminal stage message;
-subsequent refreshes do not repeat the backfill. Explicit-path `update` only
+subsequent refreshes only refill missing or stat-invalidated summaries, including
+after permission changes or same-size/same-mtime replacements. Explicit-path `update` only
 maintains the selected files. Existing symbols/references keep their formats.
 This trades a small amount of storage and indexing time for fewer query reads.
 Files changed within the last second defer summary generation until a later
@@ -548,6 +549,7 @@ repo.update(["src/app.py"], progress=on_progress)
 ```
 
 Stable progress events are `scan`, `start`, `file`, and `finish`.
+For `finish`, `done` counts successfully parsed files; `total` counts attempted files.
 
 The CLI shows file counts and percentages at 10% milestones only when stderr is an interactive terminal.
 When stderr is captured (piped, or read by an agent), progress is suppressed,
