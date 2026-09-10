@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.4 - 2026-09-10
+
 ### Fixed
 
 - Show terminal-only index-writing and transaction-commit stages after file
