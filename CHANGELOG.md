@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.2 - 2026-09-10
+
 ### Changed
 
 - Refill stat-invalidated name summaries on refresh without rebuilding unchanged
