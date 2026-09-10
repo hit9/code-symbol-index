@@ -240,6 +240,8 @@ NAME_SUMMARY_MAX_QUERY_BYTES = 16 * 1024 * 1024
 NAME_SUMMARY_SCAN_PREFIX = 32
 NAME_SUMMARY_MIN_AGE_NS = 1_000_000_000
 NAME_SUMMARY_SIZES = (64, 128, 256, 512, 1024, 2048, 4096)
+SERIAL_PARSE_MAX_FILES = 16
+SERIAL_PARSE_MAX_BYTES = 64 * 1024
 # Symbol kinds a call edge can resolve to. Restricting callee resolution to
 # these drops false matches against variables/constants/dict keys.
 CALLEE_KINDS = ("class", "function", "method", "constructor", "struct")
@@ -1418,7 +1420,19 @@ class Repository(CodeIndex):
     ) -> list[_IndexedFile]:
         if not paths:
             return []
-        if len(paths) == 1 or MAX_WORKERS <= 1:
+        serial = len(paths) == 1 or MAX_WORKERS <= 1
+        if not serial and len(paths) <= SERIAL_PARSE_MAX_FILES:
+            total_bytes = 0
+            for path in paths:
+                try:
+                    total_bytes += (self.root / path).stat().st_size
+                except OSError:
+                    break
+                if total_bytes > SERIAL_PARSE_MAX_BYTES:
+                    break
+            else:
+                serial = True
+        if serial:
             results = []
             for done, path in enumerate(paths, start=1):
                 result = _parse_file(self.root, path, self.languages, include_references=include_references)
@@ -3554,7 +3568,7 @@ def _node_kind(node: Node) -> str:
 def _node_children(node: Node) -> list[Node]:
     children = getattr(node, "children", None)
     if children is not None:
-        return list(children)
+        return children if isinstance(children, list) else list(children)
     child_count = _node_value(node, "child_count")
     return [node.child(index) for index in range(child_count)]
 

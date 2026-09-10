@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Parse small batches directly (up to 16 files / 64 KiB); keep process workers
+  for larger work. Avoid copying AST child lists that are already lists.
 - Add compact per-file name summaries for live reference/caller prefiltering.
   Old schema-5 reads remain usable; writes add one nullable column, and normal
   index fills missing summaries without reparsing unchanged files. Missing or

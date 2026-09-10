@@ -244,3 +244,22 @@ index +5.5% and one-file update +7.4%; other commands were broadly unchanged.
 These costs are reported explicitly, rather than claiming all writes fit 3–5%.
 The many-file query improvement motivates further write-path optimization.
 No private repository cases or measurements are included here.
+
+## Step 9: small parse batches and AST child lists
+
+Up to 16 files totaling at most 64 KiB parse directly, avoiding process startup.
+Larger work retains the process pool. Native AST children already arrive as a
+list; traversal no longer copies that list again.
+
+Against step 8, seven independent samples on local storage measured small new
+index 74.50 -> 60.58 ms and two-file update 62.35 -> 52.67 ms. The shared-mount
+guard measured small new index -12.6% and two-file update -15.4%. Large-case
+timings varied: a first seven-sample mounted run showed two-file update +10.9%;
+an eleven-sample repeat showed -7.8%, with large new index essentially unchanged
+(-0.3%). Do not interpret this variability as a consistent large-file speedup.
+Common indexed rows matched in every run. Large writes remain parallel.
+
+Reproduce with `bench_restart.py --baseline d5cf6c8 --samples 7 --write-only
+--output /tmp/batching.json`, optionally with `--with-git --temp-parent
+<mounted-directory>`. Tests cover both size and count boundaries for retaining
+the pool, in addition to the existing symbol/output checks.

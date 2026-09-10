@@ -240,3 +240,19 @@ def test_native_ranges_handle_live_shortened_name_and_wide_results(tmp_path):
             assert actual == c._definition_ranges_for_symbols(repo, path, [target], source=text)
     invalid = replace(target, range=replace(target.range, start_byte=len(source) + 1))
     assert c._definition_ranges_for_symbols(repo, path, [invalid], source=source) == {}
+
+
+@pytest.mark.parametrize("count,size,parallel", [(2, 128, False), (2, 65536, True), (17, 128, True)])
+def test_parse_pool_reserved_for_large_batches(tmp_path, monkeypatch, count, size, parallel):
+    monkeypatch.setattr(c, "MAX_WORKERS", 2)
+    paths = []
+    for i in range(count):
+        path = Path(f"file_{i}.py")
+        (tmp_path / path).write_text(f"def worker_{i}():\n    return 1\n#" + "x" * size)
+        paths.append(path)
+    repo = c.Repository(tmp_path, create_index=True)
+    with mock.patch.object(c.concurrent.futures, "ProcessPoolExecutor", wraps=c.concurrent.futures.ProcessPoolExecutor) as pool:
+        results = repo._parse_files(paths, include_references=False)
+    assert pool.called is parallel
+    assert {result.path for result in results} == set(paths)
+    assert all(len(result.symbols) == 1 and not result.references for result in results)
