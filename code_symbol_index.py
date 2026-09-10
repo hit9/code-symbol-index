@@ -1356,6 +1356,7 @@ class Repository(CodeIndex):
             deleted_paths=deleted,
             summary_updates=summary_updates,
             indexed_files=indexed_results,
+            progress=getattr(progress_callback, "_storage_progress", None),
             schema_version=SCHEMA_VERSION,
             git_baseline=_git_baseline(self.root, git_before),
         )
@@ -1374,6 +1375,7 @@ class Repository(CodeIndex):
         self.storage.replace_files(
             deleted_paths=(),
             indexed_files=indexed_results,
+            progress=getattr(progress_callback, "_storage_progress", None),
             schema_version=SCHEMA_VERSION,
             git_baseline=_git_baseline(self.root, git_before),
         )
@@ -1405,6 +1407,7 @@ class Repository(CodeIndex):
         self.storage.replace_files(
             deleted_paths=relative_paths,
             indexed_files=indexed_results,
+            progress=getattr(progress_callback, "_storage_progress", None),
             schema_version=SCHEMA_VERSION,
         )
         _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total)
@@ -5440,6 +5443,24 @@ class _CliProgress:
         self.interactive = bool(isatty()) if callable(isatty) else False
         self._last_bucket = -1
         self._line_open = False
+        # Private CLI hook: preserve the public Repository callback protocol.
+        self._storage_progress = self._write_progress if self.interactive else None
+
+    def _write_progress(self, event: str, *, done: int = 0, total: int = 0) -> None:
+        messages = {
+            "delete_start": "removing old index entries...",
+            "write_start": "writing index...",
+            "finalize": "committing index...",
+        }
+        message = messages.get(event)
+        if message is None:
+            return
+        stream = self.stream if self.stream is not None else sys.stderr
+        if self._line_open:
+            stream.write("\n")
+            self._line_open = False
+        stream.write(message + "\n")
+        stream.flush()
 
     def __call__(
         self,

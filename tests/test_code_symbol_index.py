@@ -1759,6 +1759,30 @@ def test_cli_progress_separates_partial_stages() -> None:
     )
 
 
+def test_repository_cli_progress_reports_writing_before_final_commit(tmp_path) -> None:
+    (tmp_path / "app.py").write_text("def target(): pass\n")
+    repo = Repository(tmp_path, create_index=True)
+    for operation in (repo.refresh, repo.build, lambda **kw: repo.update(['app.py'], **kw)):
+        stream = _FakeStream(interactive=True)
+        commits = []
+        repo.storage.connection.set_trace_callback(
+            lambda sql: commits.append(''.join(stream.writes)) if sql == 'COMMIT' else None
+        )
+        try:
+            operation(progress=code_symbol_index._CliProgress(stream))
+        finally:
+            repo.storage.connection.set_trace_callback(None)
+        output = ''.join(stream.writes)
+        assert output.index('(100%)') < output.index('writing index...')
+        assert output.index('writing index...') < output.index('committing index...')
+        assert commits[-1].endswith('committing index...\n')
+
+
+def test_cli_captured_progress_does_not_enable_storage_callbacks() -> None:
+    progress = code_symbol_index._CliProgress(_FakeStream(interactive=False))
+    assert progress._storage_progress is None
+
+
 def _write_call_chain_fixture(tmp_path: Path) -> None:
     (tmp_path / "app" / "api").mkdir(parents=True)
     (tmp_path / "app" / "workers").mkdir(parents=True)

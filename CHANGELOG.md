@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Show terminal-only index-writing and transaction-commit stages after file
+  parsing reaches 100%, without changing public progress callback events.
+
 ## 0.5.3 - 2026-09-10
 
 ### Fixed

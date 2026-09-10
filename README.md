@@ -52,6 +52,8 @@ Captured/non-TTY index and update calls emit no progress, keeping agent output
 small. Interactive terminals refresh file counts and percentages on the same line
 at 10% milestones, retaining the final line without erasing it. Results remain on
 stdout; actionable hints remain on stderr.
+The file percentage measures parsing. Terminal-only messages then identify
+index writing and transaction commit; public progress callback events are unchanged.
 
 Negative matches are trusted only while device, inode, size, mtime and ctime
 match. Checks are shared only within one request, not across calls on a reused
