@@ -11,7 +11,8 @@ import shutil
 import sqlite3
 import sys
 import threading
-from collections.abc import Iterable
+from bisect import bisect_right
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2983,8 +2984,8 @@ def _extract_symbols_and_references(
 ) -> tuple[list[Symbol], list[Reference]]:
     symbols: list[Symbol] = []
     references: list[Reference] = []
-    text = source.decode("utf-8", errors="replace")
-    lines = text.splitlines()
+    line_starts = _line_starts(source)
+    lines = source.decode("utf-8", errors="replace").splitlines() if include_references else []
 
     def walk(
         node: Node,
@@ -2994,7 +2995,7 @@ def _extract_symbols_and_references(
         ctx: frozenset[str],
         in_function: bool = False,
     ) -> None:
-        symbol = _symbol_from_node(source, path, language, node, container)
+        symbol = _symbol_from_node(source, path, language, node, container, line_starts)
         next_container = container
         next_in_function = in_function or (symbol is not None and symbol.kind in FUNCTION_KINDS)
         if symbol is not None and in_function and symbol.kind in language.non_local_kinds:
@@ -3011,13 +3012,13 @@ def _extract_symbols_and_references(
                     name=_node_text(source, node),
                     language=language.name,
                     path=path,
-                    range=_node_range(source, node),
-                    context=_line_context(source, lines, node),
+                    range=_node_range(source, node, line_starts),
+                    context=_line_context(source, lines, node, line_starts),
                     reference_kind=_classify_reference(node, parent, grandparent, ctx, language),
                 )
             )
 
-        child_ctx = _child_reference_context(node, parent, ctx, language)
+        child_ctx = _child_reference_context(node, parent, ctx, language) if include_references else ctx
         if _node_kind(node) in language.transparent_node_types:
             child_parent, child_grandparent = parent, grandparent
         else:
@@ -3027,11 +3028,14 @@ def _extract_symbols_and_references(
 
     walk(root_node, None, None, None, frozenset())
     if language.name == "python":
-        symbols.extend(_python_top_level_symbols(source, path, language, root_node))
+        symbols.extend(_python_top_level_symbols(source, path, language, root_node, line_starts))
     return symbols, references
 
 
-def _python_top_level_symbols(source: bytes, path: Path, language: LanguageSpec, root_node: Node) -> list[Symbol]:
+def _python_top_level_symbols(
+    source: bytes, path: Path, language: LanguageSpec, root_node: Node,
+    line_starts: Sequence[int] | None = None,
+) -> list[Symbol]:
     symbols: list[Symbol] = []
     for node in _node_children(root_node):
         if _node_kind(node) != "assignment":
@@ -3046,7 +3050,7 @@ def _python_top_level_symbols(source: bytes, path: Path, language: LanguageSpec,
         if not name or not _looks_like_symbol_name(name):
             continue
         kind = "constant" if name.isupper() else "variable"
-        range_ = _node_range(source, name_node)
+        range_ = _node_range(source, name_node, line_starts)
         symbols.append(
             Symbol(
                 id=_symbol_id(language.name, path, kind, name, range_.start_byte),
@@ -3059,7 +3063,7 @@ def _python_top_level_symbols(source: bytes, path: Path, language: LanguageSpec,
                 container=None,
             )
         )
-        symbols.extend(_python_dict_key_symbols(source, path, language, node, container=name))
+        symbols.extend(_python_dict_key_symbols(source, path, language, node, container=name, line_starts=line_starts))
     return symbols
 
 
@@ -3070,6 +3074,7 @@ def _python_dict_key_symbols(
     assignment: Node,
     *,
     container: str,
+    line_starts: Sequence[int] | None = None,
 ) -> list[Symbol]:
     value = assignment.child_by_field_name("right")
     if value is None or _node_kind(value) != "dictionary":
@@ -3085,7 +3090,7 @@ def _python_dict_key_symbols(
         key_name, key_node = _python_dict_key_name(source, language, key)
         if not key_name or not _looks_like_symbol_name(key_name):
             continue
-        range_ = _node_range(source, key_node)
+        range_ = _node_range(source, key_node, line_starts)
         symbols.append(
             Symbol(
                 id=_symbol_id(language.name, path, "dict_key", key_name, range_.start_byte),
@@ -3118,6 +3123,7 @@ def _symbol_from_node(
     language: LanguageSpec,
     node: Node,
     container: str | None,
+    line_starts: Sequence[int] | None = None,
 ) -> Symbol | None:
     kind = _definition_kind(source, language, node)
     if kind is None:
@@ -3128,7 +3134,7 @@ def _symbol_from_node(
     name = _node_text(source, name_node)
     if not name or not _looks_like_symbol_name(name):
         return None
-    range_ = _node_range(source, name_node)
+    range_ = _node_range(source, name_node, line_starts)
     signature = (
         _signature_at_name(source, node, name_node)
         if language.signature_starts_at_name
@@ -3256,11 +3262,11 @@ def _signature_at_name(source: bytes, node: Node, name_node: Node) -> str:
     return source[line_start:line_end].decode("utf-8", errors="replace").strip()[:240]
 
 
-def _node_range(source: bytes, node: Node) -> Range:
+def _node_range(source: bytes, node: Node, line_starts: Sequence[int] | None = None) -> Range:
     start_byte = _node_start_byte(node)
     end_byte = _node_end_byte(node)
-    start_line, start_column = _byte_position(source, start_byte)
-    end_line, end_column = _byte_position(source, end_byte)
+    start_line, start_column = _byte_position(source, start_byte, line_starts)
+    end_line, end_column = _byte_position(source, end_byte, line_starts)
     return Range(
         start=Position(line=start_line, column=start_column),
         end=Position(line=end_line, column=end_column),
@@ -3269,15 +3275,22 @@ def _node_range(source: bytes, node: Node) -> Range:
     )
 
 
-def _byte_position(source: bytes, offset: int) -> tuple[int, int]:
+def _line_starts(source: bytes) -> list[int]:
+    return [0, *(match.end() for match in re.finditer(b"\n", source))]
+
+
+def _byte_position(source: bytes, offset: int, line_starts: Sequence[int] | None = None) -> tuple[int, int]:
+    if line_starts is not None:
+        line = bisect_right(line_starts, offset) - 1
+        return line, offset - line_starts[line]
     prefix = source[:offset]
     line = prefix.count(b"\n")
     line_start = prefix.rfind(b"\n") + 1
     return line, len(prefix) - line_start
 
 
-def _line_context(source: bytes, lines: list[str], node: Node) -> str:
-    line, _ = _byte_position(source, _node_start_byte(node))
+def _line_context(source: bytes, lines: list[str], node: Node, line_starts: Sequence[int] | None = None) -> str:
+    line, _ = _byte_position(source, _node_start_byte(node), line_starts)
     if 0 <= line < len(lines):
         return lines[line].strip()
     return ""
@@ -4038,6 +4051,7 @@ def _definition_ranges_for_symbols(
         for symbol in symbols
     }
     ranges: dict[str, Range] = {}
+    line_starts = _line_starts(source_bytes)
     tree = _parse_source(_parser_for_language(spec.name), source)
     root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
 
@@ -4050,7 +4064,7 @@ def _definition_ranges_for_symbols(
             if name_node is not None:
                 symbol = wanted.get((kind, _node_start_byte(name_node)))
                 if symbol is not None:
-                    ranges[symbol.id] = _node_range(source_bytes, node)
+                    ranges[symbol.id] = _node_range(source_bytes, node, line_starts)
         for child in _node_children(node):
             walk(child)
 
