@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Query commands warn on stderr after Git branch/HEAD changes. Default status
+  exposes bounded Git freshness separately from full file checks. Schema 5 is
+  unchanged: baseline metadata is recorded by the next full incremental refresh;
+  partial updates do not clear Git suspicion. Unsupported Git layouts are unknown.
+
 - Locate small result sets through native AST byte lookup during formatting;
   large outlines retain a single traversal. No schema or index/update changes.
 

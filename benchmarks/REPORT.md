@@ -173,3 +173,40 @@ search 85.93 -> 73.13 ms and 20-result search 84.58 -> 70.95 ms. New index there
 was 231.61 -> 234.94 ms; update one 118.21 -> 118.56 ms. Small write differences
 are reported as measurement variation, not speedups or an absolute guarantee.
 `bench_restart.py` now includes `search_late` to cover late-file lookup.
+
+
+## Step 7: bounded Git checkout hints
+
+One Git-files check per query, one at the start of a full refresh; baseline is
+written with existing final metadata transaction. Explicit-path update adds no
+Git read. The mounted checkout Git check took p50 0.487 ms / p95 0.575 ms across
+300 calls. This is a heuristic, not a scan for uncommitted edits.
+
+Write guard: 11 alternating samples, disposable 16-file Git repository with
+ignore rules, code/source/databases all on the shared mount, against step 6.
+
+| Command | Before ms | After ms |
+| --- | ---: | ---: |
+| small.index_new | 120.66 | 121.59 |
+| small.index_no_change | 70.03 | 67.69 |
+| small.update_one | 80.50 | 78.59 |
+| small.update_two | 92.25 | 90.56 |
+
+First index +0.8%; other medians were lower in this run. No material write
+regression observed; this is a small-fixture measurement, not a universal
+guarantee. Files/symbols/refs rows match; only the existing meta table gains a
+Git baseline. Reproduce with `bench_restart.py --baseline 17c9221 --samples 11
+--fixture small --with-git --with-gitignore --temp-parent <mounted-directory>
+--write-only --output /tmp/git-write.json`.
+
+Benchmark correction: both compared modules are now copied beside each other.
+Earlier runs loaded baseline from a temporary directory and current code from
+the checkout, confounding storage and worker-import cost. In this step that
+first suggested +7.9%, then +3.1% after equalizing locations. Removing the
+redundant second Git read produced the final numbers above. Earlier measurements
+retain this location-bias limitation.
+
+216 tests cover query stderr/stdout/JSON compatibility, old schema-5 reads,
+same-commit branch switches, detached HEAD, reset, worktrees, packed refs, unborn
+HEAD, bounded unknown states, full-check versus partial-update behavior, and
+failed parse handling. No remote Git/network operation is used by these tests.

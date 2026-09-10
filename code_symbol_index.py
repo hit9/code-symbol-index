@@ -232,6 +232,7 @@ DEFAULT_CALL_FANOUT = 20
 MAX_CALL_GRAPH_NODES = 200
 CALLER_SCAN_BATCH_SIZE = 32
 NATIVE_DEFINITION_MAX_SYMBOLS = 64
+GIT_PACKED_REFS_MAX_BYTES = 256 * 1024
 # Symbol kinds a call edge can resolve to. Restricting callee resolution to
 # these drops false matches against variables/constants/dict keys.
 CALLEE_KINDS = ("class", "function", "method", "constructor", "struct")
@@ -422,6 +423,7 @@ class IndexStatus:
     pending_files: tuple[str, ...] = ()
     reason: str | None = None
     message: str | None = None
+    git_freshness: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1273,6 +1275,8 @@ class Repository(CodeIndex):
         self.progress = progress
 
     def refresh(self, *, progress: Any = _DEFAULT_PROGRESS) -> Repository:
+        git_before = _git_state(self.root)
+        self._gitignore_specs.clear()
         progress_callback = self.progress if progress is _DEFAULT_PROGRESS else progress
         if self.storage.schema_version() != SCHEMA_VERSION:
             self.storage.reset_schema()
@@ -1304,11 +1308,14 @@ class Repository(CodeIndex):
             deleted_paths=deleted,
             indexed_files=indexed_results,
             schema_version=SCHEMA_VERSION,
+            git_baseline=_git_baseline(self.root, git_before if len(indexed_results) == len(to_index) else None),
         )
         _emit_progress(progress_callback, "finish", done=total, total=total)
         return self
 
     def build(self, *, progress: Any = _DEFAULT_PROGRESS) -> Repository:
+        git_before = _git_state(self.root)
+        self._gitignore_specs.clear()
         progress_callback = self.progress if progress is _DEFAULT_PROGRESS else progress
         self.storage.clear()
         paths = list(self._iter_indexable_files())
@@ -1319,6 +1326,7 @@ class Repository(CodeIndex):
             deleted_paths=(),
             indexed_files=indexed_results,
             schema_version=SCHEMA_VERSION,
+            git_baseline=_git_baseline(self.root, git_before if len(indexed_results) == len(paths) else None),
         )
         _emit_progress(progress_callback, "finish", done=total, total=total)
         return self
@@ -1335,6 +1343,7 @@ class Repository(CodeIndex):
         if self.storage.schema_version() != SCHEMA_VERSION:
             return self.refresh(progress=progress_callback)
 
+        self._gitignore_specs.clear()
         relative_paths = list(dict.fromkeys(self._relative_path(path) for path in _coerce_paths(paths)))
         to_index = [
             path
@@ -2099,6 +2108,7 @@ class _Storage:
         indexed_files: Iterable[_IndexedFile],
         schema_version: int,
         progress: Any | None = None,
+        git_baseline: str | None = None,
     ) -> None:
         indexed_files = list(indexed_files)
         deleted_paths = list(deleted_paths)
@@ -2186,6 +2196,11 @@ class _Storage:
                 progress("commit_batch", done=write_done, total=write_total)
 
         with self.connection:
+            if git_baseline is not None:
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES ('git_baseline', ?)",
+                    (git_baseline,),
+                )
             updated_at = _utc_now()
             self.connection.execute(
                 """
@@ -4473,6 +4488,111 @@ def _outline_signature(symbol: Symbol, definition_range: Range | None) -> str:
     return f"{' ' * definition_range.start.column}{signature}"[:240].rstrip()
 
 
+def _read_git_text(path: Path, limit: int = 4096) -> str:
+    with path.open("rb") as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("Git metadata exceeds bounded check")
+    return data.decode("utf-8").strip()
+
+
+def _git_state(root: Path) -> str | None:
+    """Bounded Git-files check, no subprocess or worktree traversal.
+
+    None means unknown, never a clean bill of health. Include the symbolic HEAD
+    to detect branch switches even when two branches point at the same commit.
+    Remote-tracking refs and FETCH_HEAD are deliberately not part of the state.
+    """
+    try:
+        for directory in (root, *root.parents):
+            marker = directory / ".git"
+            if marker.is_dir():
+                git_dir = marker
+                break
+            try:
+                text = _read_git_text(marker)
+            except FileNotFoundError:
+                continue
+            if not text.startswith("gitdir: "):
+                return None
+            git_dir = (directory / text[8:]).resolve()
+            break
+        else:
+            return "no-git"
+        try:
+            common_dir = (git_dir / _read_git_text(git_dir / "commondir")).resolve()
+        except FileNotFoundError:
+            common_dir = git_dir
+        head = _read_git_text(git_dir / "HEAD")
+        value = head
+        for _ in range(5):
+            if not value.startswith("ref: "):
+                if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value):
+                    return json.dumps([str(git_dir), head, value.lower()])
+                return None
+            ref = value[5:]
+            if (not ref.startswith("refs/") or "\\" in ref
+                    or any(part in {"", ".", ".."} for part in ref.split("/"))):
+                return None
+            ref_dir = git_dir if ref.startswith(("refs/bisect/", "refs/worktree/", "refs/rewritten/")) else common_dir
+            try:
+                value = _read_git_text(ref_dir / ref)
+                continue
+            except FileNotFoundError:
+                pass
+            # A missing loose ref is not evidence of an unborn reftable HEAD.
+            if (common_dir / "reftable").exists():
+                return None
+            try:
+                packed = _read_git_text(common_dir / "packed-refs", GIT_PACKED_REFS_MAX_BYTES)
+            except FileNotFoundError:
+                packed = ""
+            for line in packed.splitlines():
+                fields = line.split(" ", 1)
+                if len(fields) == 2 and fields[1] == ref:
+                    value = fields[0]
+                    break
+            else:
+                return json.dumps([str(git_dir), head, "unborn"])
+        return None
+    except (OSError, ValueError):
+        return None
+
+
+def _git_baseline(root: Path, before: str | None) -> str:
+    # Record the checkout at scan start, never acknowledge a newer HEAD that
+    # appeared while parsing/writing. The next query compares it with live Git.
+    return json.dumps([str(root), before])
+
+
+def _git_freshness(root: Path, baseline: str | None) -> str:
+    current = _git_state(root)
+    if baseline is not None:
+        try:
+            saved = json.loads(baseline)
+            if isinstance(saved, list) and len(saved) == 2 and isinstance(saved[1], str):
+                if saved[0] != str(root):
+                    return "changed"
+                if current is not None:
+                    if saved[1] != current:
+                        return "changed"
+                    return "not-applicable" if current == "no-git" else "unchanged"
+        except (ValueError, TypeError):
+            pass
+    return "not-applicable" if current == "no-git" else "unknown"
+
+
+def _warn_git_freshness(repo: Repository) -> None:
+    row = repo.storage.connection.execute("SELECT value FROM meta WHERE key = 'git_baseline'").fetchone()
+    freshness = _git_freshness(repo.root, row[0] if row else None)
+    if freshness == "changed":
+        sys.stderr.write("warning: index may be stale: Git checkout changed; "
+                         "run `code-symbol-index index` or repeat with --sync (incremental).\n")
+    elif freshness == "unknown":
+        sys.stderr.write("warning: Git freshness unknown: baseline missing or Git metadata unavailable; "
+                         "use `status --check` to check files, or `index` to record a baseline (incremental).\n")
+
+
 def _index_status(
     *,
     root: Path,
@@ -4514,11 +4634,15 @@ def _index_status(
 
     schema_version = data["schema_version"]
     is_schema_stale = schema_version != SCHEMA_VERSION
-    is_stale = is_schema_stale or isinstance(pending_changes, int) and pending_changes > 0
+    git_freshness = _git_freshness(root, data["git_baseline"])
+    is_stale = (is_schema_stale or isinstance(pending_changes, int) and pending_changes > 0
+                or not check and git_freshness == "changed")
     if is_schema_stale:
         reason = "index schema is out of date"
     elif isinstance(pending_changes, int) and pending_changes > 0:
         reason = "files changed after last index update"
+    elif not check and git_freshness == "changed":
+        reason = "Git checkout changed; index may be stale"
     else:
         reason = None
     return IndexStatus(
@@ -4532,6 +4656,7 @@ def _index_status(
         pending_changes=pending_changes,
         pending_files=pending_files,
         reason=reason,
+        git_freshness=git_freshness,
     )
 
 
@@ -4545,6 +4670,7 @@ def _read_index_metadata(db_path: Path, *, include_files: bool = True) -> dict[s
         updated_at_row = connection.execute(
             "SELECT value FROM meta WHERE key = 'updated_at'",
         ).fetchone()
+        git_row = connection.execute("SELECT value FROM meta WHERE key = 'git_baseline'").fetchone()
         files = connection.execute("SELECT count(*) FROM files").fetchone()[0]
         symbols = connection.execute("SELECT count(*) FROM symbols").fetchone()[0]
         languages = tuple(
@@ -4570,6 +4696,7 @@ def _read_index_metadata(db_path: Path, *, include_files: bool = True) -> dict[s
     return {
         "schema_version": int(schema_row["value"]) if schema_row is not None else None,
         "updated_at": updated_at_row["value"] if updated_at_row is not None else None,
+        "git_baseline": git_row["value"] if git_row is not None else None,
         "files": files,
         "symbols": symbols,
         "languages": languages,
@@ -4652,6 +4779,8 @@ def _format_status_text(index_status: IndexStatus) -> str:
         lines.append(f"  updated_at: {index_status.updated_at}")
     if index_status.pending_changes is not None:
         lines.append(f"  pending_changes: {index_status.pending_changes}")
+    if index_status.git_freshness is not None:
+        lines.append(f"  git_freshness: {index_status.git_freshness}")
     if index_status.pending_files:
         lines.append("  pending_files:")
         for path in index_status.pending_files:
@@ -5428,6 +5557,9 @@ def main(argv: list[str] | None = None) -> int:
         language = args.languages[0] if args.languages and len(args.languages) == 1 else None
         if getattr(args, "sync", False):
             repo.refresh()
+
+        if args.command not in {"index", "update"}:
+            _warn_git_freshness(repo)
 
         if args.command == "index":
             repo.refresh()

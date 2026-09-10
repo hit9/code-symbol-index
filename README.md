@@ -304,6 +304,27 @@ index:
   pending_changes: unknown
 ```
 
+Query commands (`search`, `inspect`, `refs`, `callers`, `callees`, `impls`,
+`outline`) now warn on stderr when Git HEAD or the checked-out branch differs
+from the last full refresh. This bounded check reads Git metadata, without a Git
+subprocess or a worktree scan. It does not change JSON/stdout or refresh the index.
+A fetch that changes only remote-tracking refs does not trigger a warning.
+
+`status` includes `git_freshness`: `unchanged`, `changed`, `unknown`, or
+`not-applicable`. **Unchanged Git state does not mean unchanged source files.**
+Uncommitted edits, changed ignore rules, nested repositories/submodules and
+same-size/same-mtime replacements are not covered by the Git hint. Missing or
+unreadable metadata, reftable HEADs without loose refs, and packed refs over
+256 KiB degrade to `unknown` rather than claiming freshness.
+
+Schema 5 remains usable without migration. An older index has no Git baseline:
+queries say freshness is unknown until the next successful `index` or `--sync`
+records it. This is a normal incremental refresh; unchanged files are not
+reparsed. Explicit-path `update` retains the prior baseline because other files
+may still need updating. `status --check` never writes a baseline; it can report
+ready when files match even if Git has changed. Its file check uses size/mtime,
+not content hashes.
+
 Use `--check` to scan the directory and compute staleness:
 
 ```text

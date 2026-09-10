@@ -44,6 +44,7 @@ def main() -> None:
     parser.add_argument("--write-only", action="store_true", help="repeat only index/update guards")
     parser.add_argument("--fixture", choices=("all", "small", "large"), default="all")
     parser.add_argument("--with-gitignore", action="store_true")
+    parser.add_argument("--with-git", action="store_true", help="use a disposable local Git repository")
     parser.add_argument("--temp-parent", type=Path, help="existing directory for disposable fixtures/databases")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -56,8 +57,12 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="symbol-restart-bench-", dir=args.temp_parent) as directory:
         temp = Path(directory).resolve()
         (temp / "baseline").mkdir()
-        scripts = {"before": temp / "baseline" / "code_symbol_index.py", "after": project / "code_symbol_index.py"}
+        (temp / "current").mkdir()
+        # Match module storage as well as source/database storage: a local
+        # baseline versus a mounted checkout biases startup and worker imports.
+        scripts = {"before": temp / "baseline" / "code_symbol_index.py", "after": temp / "current" / "code_symbol_index.py"}
         scripts["before"].write_bytes(baseline)
+        scripts["after"].write_bytes((project / "code_symbol_index.py").read_bytes())
         for script in scripts.values():
             run(script, ["version"])
         for size, count, functions in (("small", 16, 8), ("large", 4, 1000)):
@@ -65,6 +70,8 @@ def main() -> None:
                 continue
             root = temp / size
             root.mkdir()
+            if args.with_git:
+                subprocess.run(["git", "init", "-q", str(root)], check=True)
             if args.with_gitignore:
                 (root / ".gitignore").write_text("ignored/\n")
             for file_index in range(count):
@@ -121,7 +128,7 @@ def main() -> None:
                 if name in ("index_new", "index_no_change", "update_one", "update_two"):
                     assert snapshot(databases["before"]) == snapshot(databases["after"]), (size, name)
                 elif name in ("status", "status_check"):
-                    stable = {key: [line for line in value.splitlines() if not line.startswith("updated_at:")]
+                    stable = {key: [line for line in value.splitlines() if not line.strip().startswith(("updated_at:", "git_freshness:"))]
                               for key, value in outputs.items()}
                     assert stable["before"] == stable["after"], (size, name)
                 else:

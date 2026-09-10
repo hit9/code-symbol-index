@@ -294,6 +294,23 @@ index:
   pending_changes: unknown
 ```
 
+查询子命令（`search`、`inspect`、`refs`、`callers`、`callees`、`impls`、
+`outline`）会比较上次完整刷新记录的 Git HEAD 和分支。发生变化就在 stderr
+提示索引可能过期，不改变 stdout/JSON，也不自动刷新。检查只读取有界的 Git
+元数据，不启动 Git 子进程，不扫描工作区。仅更新远程跟踪引用的 fetch 不报警。
+
+`status` 新增 `git_freshness`：`unchanged`、`changed`、`unknown` 或
+`not-applicable`。**Git 未变化不代表源码未变化。** 未提交的编辑、忽略规则变化、
+嵌套仓库/子模块以及同大小同 mtime 替换不在 Git 提示的检测范围。元数据缺失或
+不可读、无 loose ref 的 reftable 布局、超过 256 KiB 的 packed refs 都降级为
+`unknown`，不误报最新。
+
+schema 仍是 5，旧库无需迁移。旧库没有 Git 基线时，查询会提示尚无法判断；
+下次成功运行 `index` 或 `--sync` 时记录基线，这是正常增量刷新，不重解析未变化
+文件。指定路径的 `update` 保留旧基线，因为其他文件可能仍需更新。
+`status --check` 不写基线；文件一致时即使 Git 变化也可报告 ready。它按文件
+大小和 mtime 检查，不校验内容哈希。
+
 使用 `--check` 扫描目录并计算过期状态：
 
 ```text
