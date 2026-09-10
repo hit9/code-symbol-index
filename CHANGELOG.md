@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Add compact per-file name summaries for live reference/caller prefiltering.
+  Old schema-5 reads remain usable; writes add one nullable column, and normal
+  index fills missing summaries without reparsing unchanged files. Missing or
+  invalid summaries fall back to scanning. Query checks expire per request.
+
 - Query commands warn on stderr after Git branch/HEAD changes. Default status
   exposes bounded Git freshness separately from full file checks. Schema 5 is
   unchanged: baseline metadata is recorded by the next full incremental refresh;

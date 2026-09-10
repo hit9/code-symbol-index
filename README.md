@@ -31,6 +31,29 @@ unrelated AST subtrees. They do not persist references or require an index
 rebuild. Filesystem scanning and candidate parsing still have a cost on large
 repositories. See [measured query and indexing results](benchmarks/REPORT.md).
 
+### File name summaries
+
+Reference and caller queries can skip unchanged files using compact name
+membership summaries. Possible matches still scan and parse live source. The
+first 32 file checks use the original scanner so early results do not load a
+summary manifest. Per-request summary data is bounded; missing summaries,
+unusual names and files over 1 MiB keep the original path.
+
+The next write adds a nullable `files.name_summary` column to schema 5. Reads
+of old databases do not migrate them. A normal `index` fills missing summaries
+for unchanged files **without rebuilding their ASTs**, with a progress message;
+subsequent refreshes do not repeat the backfill. Explicit-path `update` only
+maintains the selected files. Existing symbols/references keep their formats.
+This trades a small amount of storage and indexing time for fewer query reads.
+Files changed within the last second defer summary generation until a later
+refresh, preventing timestamp-granularity collisions from hiding live edits.
+
+Negative matches are trusted only while device, inode, size, mtime and ctime
+match. Checks are shared only within one request, not across calls on a reused
+Repository. This is not an atomic snapshot against concurrent source edits.
+On Windows this shortcut is disabled because [ctime still means creation time](https://docs.python.org/3/library/os.html#os.stat_result.st_ctime);
+queries use the original scanner there. No full reference/context database is stored.
+
 ## Install
 
 Install the CLI as a uv tool:

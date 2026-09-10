@@ -32,7 +32,10 @@ def run(script: Path, args: list[str]) -> tuple[float, str]:
 def snapshot(db: Path) -> dict:
     with sqlite3.connect(str(db)) as connection:
         return {
-            table: sorted(connection.execute(f"SELECT * FROM {table}").fetchall())
+            table: sorted(connection.execute(
+                "SELECT path, language, mtime_ns, size FROM files" if table == "files"
+                else f"SELECT * FROM {table}"
+            ).fetchall())
             for table in ("files", "symbols", "refs")
         }
 

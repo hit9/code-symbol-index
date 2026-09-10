@@ -210,3 +210,37 @@ retain this location-bias limitation.
 same-commit branch switches, detached HEAD, reset, worktrees, packed refs, unborn
 HEAD, bounded unknown states, full-check versus partial-update behavior, and
 failed parse handling. No remote Git/network operation is used by these tests.
+
+## Step 8: compact name summaries
+
+Optional file metadata contains name-membership bits, not references or source
+contexts. Old reads do not migrate; writes add one nullable schema-5 column.
+A normal refresh fills missing summaries without rebuilding unchanged ASTs.
+Freshly modified files defer summaries to avoid coarse timestamp collisions.
+232 tests pass, including live edits, same-size/restored-mtime writes, replacement,
+deletion, old databases, bounded fallback, early results and request cleanup.
+
+Synthetic 802-file mounted fixture, five alternating independent CLI samples:
+
+| Command | Before ms | After ms |
+| --- | ---: | ---: |
+| index new | 486.68 | 523.31 |
+| index unchanged | 64.63 | 68.41 |
+| update one large file | 240.63 | 212.83 |
+| refs | 211.40 | 101.80 |
+| refs, early limit 1 | 57.80 | 56.93 |
+| callers | 601.13 | 149.30 |
+| inspect | 228.36 | 108.96 |
+
+Reproduce with `bench_name_summaries.py --baseline fd7a2b1 --samples 5
+--temp-parent <mounted-directory> --output /tmp/summaries.json`.
+All read stdout and common files/symbols/refs columns matched. These timing
+samples precede the recent-file timestamp guard; stable-file query behavior is
+unchanged, but freshly modified files deliberately use the original scanner.
+
+Write cost is not zero: this mounted first-build median rose 7.5%. The separate
+seven-sample all-command run on the existing local large fixture measured new
+index +5.5% and one-file update +7.4%; other commands were broadly unchanged.
+These costs are reported explicitly, rather than claiming all writes fit 3–5%.
+The many-file query improvement motivates further write-path optimization.
+No private repository cases or measurements are included here.

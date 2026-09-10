@@ -15,7 +15,9 @@ from bisect import bisect_right
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
+from time import time_ns
 from typing import TYPE_CHECKING, Any
 
 from tree_sitter import Node
@@ -233,6 +235,11 @@ MAX_CALL_GRAPH_NODES = 200
 CALLER_SCAN_BATCH_SIZE = 32
 NATIVE_DEFINITION_MAX_SYMBOLS = 64
 GIT_PACKED_REFS_MAX_BYTES = 256 * 1024
+NAME_SUMMARY_MAX_SOURCE_BYTES = 1024 * 1024
+NAME_SUMMARY_MAX_QUERY_BYTES = 16 * 1024 * 1024
+NAME_SUMMARY_SCAN_PREFIX = 32
+NAME_SUMMARY_MIN_AGE_NS = 1_000_000_000
+NAME_SUMMARY_SIZES = (64, 128, 256, 512, 1024, 2048, 4096)
 # Symbol kinds a call edge can resolve to. Restricting callee resolution to
 # these drops false matches against variables/constants/dict keys.
 CALLEE_KINDS = ("class", "function", "method", "constructor", "struct")
@@ -434,6 +441,7 @@ class _IndexedFile:
     size: int
     symbols: tuple[Symbol, ...]
     references: tuple[Reference, ...]
+    name_summary: bytes | None = None
 
 
 class CodeSymbolIndexError(Exception):
@@ -783,6 +791,20 @@ LANGUAGE_BY_EXTENSION = {
 }
 
 
+def _name_query(method: Any) -> Any:
+    """Share checks inside one request, never across calls on a reused index."""
+    @wraps(method)
+    def query(self: CodeIndex, *args: Any, **kwargs: Any) -> Any:
+        if getattr(self, "_name_filter", None) is not None:
+            return method(self, *args, **kwargs)
+        self._name_filter = _NameFilter(self)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._name_filter = None
+    return query
+
+
 class CodeIndex:
     def __init__(
         self,
@@ -873,6 +895,7 @@ class CodeIndex:
     ) -> Symbol:
         return self._resolve_symbol(query, kind=kind, language=language, path=path, exact_only=exact_only)
 
+    @_name_query
     def inspect(
         self,
         query: str,
@@ -923,6 +946,7 @@ class CodeIndex:
     ) -> Page:
         return self.find_implementations(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit, offset=offset)
 
+    @_name_query
     def callers(
         self,
         query: str,
@@ -952,6 +976,7 @@ class CodeIndex:
         symbol = _resolve_inspect_symbol(self, query, kind=kind, language=language, path=path, exact_only=exact_only)
         return _build_call_graph(self, symbol, direction="callees", depth=_clamp_depth(depth), limit=limit, loose=loose)
 
+    @_name_query
     def inspect_symbol(
         self,
         query: str,
@@ -971,6 +996,7 @@ class CodeIndex:
             max_source_chars=max_source_chars,
         )
 
+    @_name_query
     def inspect_text(
         self,
         query: str,
@@ -1282,30 +1308,52 @@ class Repository(CodeIndex):
             self.storage.reset_schema()
 
         _emit_progress(progress_callback, "scan", done=0, total=0)
-        current_files: dict[str, tuple[Path, int, int]] = {}
+        current_files: dict[str, tuple[Path, os.stat_result]] = {}
         paths = list(self._iter_indexable_files())
         for path in paths:
             try:
                 stat = (self.root / path).stat()
             except OSError:
                 continue
-            current_files[path.as_posix()] = (path, stat.st_mtime_ns, stat.st_size)
+            current_files[path.as_posix()] = (path, stat)
 
         indexed_files = self.storage.files()
         deleted = [Path(path) for path in indexed_files if path not in current_files]
 
         to_index: list[Path] = []
-        for path_text, (path, mtime_ns, size) in current_files.items():
+        to_summarize: list[tuple[Path, os.stat_result]] = []
+        for path_text, (path, stat) in current_files.items():
             old = indexed_files.get(path_text)
-            if old is not None and old["mtime_ns"] == mtime_ns and old["size"] == size:
+            if old is not None and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size:
+                if not old["has_summary"]:
+                    to_summarize.append((path, stat))
                 continue
             to_index.append(path)
+
+        summary_updates: list[tuple[bytes, str]] = []
+        if to_summarize:
+            _emit_progress(progress_callback, "summary", done=0, total=len(to_summarize))
+        for done, (path, stat) in enumerate(to_summarize, 1):
+            try:
+                if stat.st_size > NAME_SUMMARY_MAX_SOURCE_BYTES:
+                    summary = b"\x00"
+                else:
+                    with (self.root / path).open("rb") as stream:
+                        source = stream.read(NAME_SUMMARY_MAX_SOURCE_BYTES + 1)
+                    summary = _file_name_summary(source, stat)
+                if summary is not None:
+                    summary_updates.append((summary, path.as_posix()))
+            except OSError:
+                pass  # A disappearing file is handled by the next scan.
+            if done % 100 == 0 or done == len(to_summarize):
+                _emit_progress(progress_callback, "summary", done=done, total=len(to_summarize))
 
         total = len(to_index)
         _emit_progress(progress_callback, "start", done=0, total=total)
         indexed_results = self._parse_files(to_index, include_references=False, progress=progress_callback)
         self.storage.replace_files(
             deleted_paths=deleted,
+            summary_updates=summary_updates,
             indexed_files=indexed_results,
             schema_version=SCHEMA_VERSION,
             git_baseline=_git_baseline(self.root, git_before if len(indexed_results) == len(to_index) else None),
@@ -1460,6 +1508,7 @@ class Repository(CodeIndex):
             implementations_next_offset=implementations.next_offset,
         )
 
+    @_name_query
     def _references_for_symbol(
         self,
         symbol: Symbol,
@@ -1474,7 +1523,7 @@ class Repository(CodeIndex):
         references: list[Reference] = []
         skipped = 0
         for path in paths:
-            if not _file_contains_bytes(self.root / path, needle):
+            if not self._name_filter.may_contain(path, (needle,)) or not _file_contains_bytes(self.root / path, needle):
                 continue
             indexed_file = _parse_file(self.root, path, self.languages, reference_name=symbol.name)
             if indexed_file is None:
@@ -2005,9 +2054,14 @@ class _Storage:
             self.connection.execute("DELETE FROM files")
 
     def files(self) -> dict[str, sqlite3.Row]:
-        rows = self.connection.execute(
-            "SELECT path, language, mtime_ns, size FROM files",
-        ).fetchall()
+        try:
+            rows = self.connection.execute(
+                "SELECT path, language, mtime_ns, size, name_summary IS NOT NULL AS has_summary FROM files",
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = self.connection.execute(
+                "SELECT path, language, mtime_ns, size, 0 AS has_summary FROM files",
+            ).fetchall()
         return {row["path"]: row for row in rows}
 
     def schema_version(self) -> int | None:
@@ -2109,7 +2163,12 @@ class _Storage:
         schema_version: int,
         progress: Any | None = None,
         git_baseline: str | None = None,
+        summary_updates: Iterable[tuple[bytes, str]] = (),
     ) -> None:
+        # Nullable, additive schema-5 capability: no row rewrite or backfill.
+        # Older writers use explicit columns and replace summaries with NULL.
+        if not any(row[1] == "name_summary" for row in self.connection.execute("PRAGMA table_info(files)")):
+            self.connection.execute("ALTER TABLE files ADD COLUMN name_summary BLOB")
         indexed_files = list(indexed_files)
         deleted_paths = list(deleted_paths)
         symbol_count = sum(len(indexed_file.symbols) for indexed_file in indexed_files)
@@ -2134,6 +2193,7 @@ class _Storage:
                     indexed_file.language,
                     indexed_file.mtime_ns,
                     indexed_file.size,
+                    indexed_file.name_summary,
                 )
                 for indexed_file in file_chunk
             ]
@@ -2155,8 +2215,8 @@ class _Storage:
                 )
                 self.connection.executemany(
                     """
-                    INSERT OR REPLACE INTO files(path, language, mtime_ns, size)
-                    VALUES (?, ?, ?, ?)
+                    INSERT OR REPLACE INTO files(path, language, mtime_ns, size, name_summary)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
                     file_rows,
                 )
@@ -2196,6 +2256,9 @@ class _Storage:
                 progress("commit_batch", done=write_done, total=write_total)
 
         with self.connection:
+            self.connection.executemany(
+                "UPDATE files SET name_summary = ? WHERE path = ?", summary_updates,
+            )
             if git_baseline is not None:
                 self.connection.execute(
                     "INSERT OR REPLACE INTO meta(key, value) VALUES ('git_baseline', ?)",
@@ -2721,6 +2784,105 @@ def _spec_for_extension(extension: str, languages: set[str] | None = None) -> La
     return spec
 
 
+def _file_name_summary(source: bytes, stat: os.stat_result) -> bytes | None:
+    """Lossy ASCII-name membership only; exact matches still parse live source."""
+    if sys.platform == "win32" or len(source) > NAME_SUMMARY_MAX_SOURCE_BYTES:
+        return b"\x00"
+    # Coarse timestamp clocks can assign the same ctime to successive writes.
+    # Only build summaries after the indexed timestamp's tick has passed.
+    if time_ns() - stat.st_ctime_ns < NAME_SUMMARY_MIN_AGE_NS:
+        return None
+    import struct
+    import zlib
+
+    names = set(re.findall(rb"[A-Za-z_][A-Za-z_0-9]*", source))
+    size = max(64, min(4096, 1 << max(0, (len(names) * 2 - 1).bit_length())))
+    bits = bytearray(size)
+    mask = size * 8 - 1
+    for name in names:
+        value = zlib.crc32(name)
+        for position in (value & mask, (value >> 16) & mask):
+            bits[position >> 3] |= 1 << (position & 7)
+    # Capture the pre-read identity: edits/replacements during parsing cannot
+    # make a summary of old bytes look valid for the resulting file.
+    try:
+        stamp = struct.pack("<QQQqq", stat.st_dev, stat.st_ino, stat.st_size,
+                            stat.st_mtime_ns, stat.st_ctime_ns)
+    except (struct.error, OverflowError):
+        return b"\x00"  # Filesystems with wider identities keep normal scanning.
+    return b"\x01" + stamp + bits
+
+
+class _NameFilter:
+    """Bounded per-request metadata, with stat checks only for negative hits."""
+    def __init__(self, repo: CodeIndex) -> None:
+        self.repo = repo
+        self.rows: dict[str, bytes] | None = None
+        self.remaining_prefix = NAME_SUMMARY_SCAN_PREFIX
+        self.checked: dict[Path, bool] = {}
+        self.positions: dict[tuple[bytes, ...], Any] = {}
+
+    def may_contain(self, path: Path, needles: tuple[bytes, ...]) -> bool:
+        # Windows ctime is birth time, not a reliable edit invalidator.
+        if sys.platform == "win32":
+            return True
+        if self.rows is None and self.remaining_prefix > 0:
+            self.remaining_prefix -= 1
+            return True  # Early hits avoid loading the repository's summaries.
+        import struct
+        import zlib
+
+        if self.rows is None:
+            self.rows = {}
+            budget = NAME_SUMMARY_MAX_QUERY_BYTES
+            try:
+                cursor = self.repo.storage.connection.execute(
+                    "SELECT path, name_summary FROM files WHERE name_summary IS NOT NULL",
+                )
+            except sqlite3.OperationalError:
+                pass  # Old schema-5 database: read normally, no migration.
+            else:
+                try:
+                    for row in cursor:
+                        data = row["name_summary"]
+                        if not isinstance(data, bytes) or len(data) - 41 not in NAME_SUMMARY_SIZES or data[0] != 1:
+                            continue
+                        budget -= len(data) + len(row["path"]) + 128
+                        if budget < 0:
+                            break
+                        self.rows[row["path"]] = data
+                finally:
+                    cursor.close()
+        data = self.rows.get(path.as_posix())
+        if data is None:
+            return True
+        if needles not in self.positions:
+            if any(re.fullmatch(rb"[A-Za-z_][A-Za-z_0-9]*", needle) is None for needle in needles):
+                self.positions[needles] = None
+            else:
+                hashes = [zlib.crc32(needle) for needle in needles]
+                self.positions[needles] = {
+                    size: [((h & (size * 8 - 1)) >> 3, 1 << (h & 7),
+                            ((h >> 16) & (size * 8 - 1)) >> 3, 1 << ((h >> 16) & 7))
+                           for h in hashes]
+                    for size in NAME_SUMMARY_SIZES
+                }
+        positions = self.positions[needles]
+        if positions is None:
+            return True  # Unicode/punctuation names retain the exact scanner.
+        for byte1, bit1, byte2, bit2 in positions[len(data) - 41]:
+            if data[41 + byte1] & bit1 and data[41 + byte2] & bit2:
+                return True
+        if path not in self.checked:
+            try:
+                stat = (self.repo.root / path).stat()
+                current = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                self.checked[path] = current == struct.unpack("<QQQqq", data[1:41])
+            except OSError:
+                self.checked[path] = False
+        return not self.checked[path]
+
+
 def _parse_file(
     root: Path,
     relative_path: Path,
@@ -2761,6 +2923,7 @@ def _parse_file(
         size=stat.st_size,
         symbols=tuple(symbols),
         references=tuple(references),
+        name_summary=_file_name_summary(source_bytes, stat) if not include_references else None,
     )
 
 
@@ -3837,6 +4000,7 @@ def _direct_callers_batch(repo: Repository, symbols: list[Symbol], *, limit: int
     """Share a source prefilter/parse pass among a bounded set of graph nodes."""
     if len(symbols) <= 1 or limit <= 0:
         return {symbol.id: _direct_callers(repo, symbol, limit=limit) for symbol in symbols}
+    name_filter = getattr(repo, "_name_filter", None) or _NameFilter(repo)
     by_language: dict[str, list[Symbol]] = {}
     for symbol in symbols:
         by_language.setdefault(symbol.language, []).append(symbol)
@@ -3847,11 +4011,11 @@ def _direct_callers_batch(repo: Repository, symbols: list[Symbol], *, limit: int
         for symbol in targets:
             by_name.setdefault(symbol.name, []).append(symbol)
         names = frozenset(by_name)
-        needles = [name.encode("utf-8") for name in sorted(names)]
+        needles = tuple(name.encode("utf-8") for name in sorted(names))
         pattern = re.compile(b"|".join(re.escape(needle) for needle in needles))
         overlap = max(map(len, needles)) - 1
         for path in repo.storage.file_paths(language=language):
-            if not _file_contains_pattern(repo.root / path, pattern, overlap):
+            if not name_filter.may_contain(path, needles) or not _file_contains_pattern(repo.root / path, pattern, overlap):
                 continue
             indexed = _parse_file(repo.root, path, repo.languages, reference_name=names)
             if indexed is None:
@@ -5249,9 +5413,18 @@ class _CliProgress:
         total: int = 0,
         path: str | None = None,
     ) -> None:
-        if total:
+        if event == "start" or event == "file":
             self.last_total = total
         stream = self.stream if self.stream is not None else sys.stderr
+
+        if event == "summary":
+            if self.interactive:
+                stream.write("\r" + _progress_line(done, total, label="preparing query summaries", unit="files"))
+                self.visible = True
+            elif done == 0:
+                stream.write(f"preparing query summaries for {total} files (no AST rebuild)\n")
+            stream.flush()
+            return
 
         # When stderr is captured (non-TTY), the live `\r` bar does not collapse
         # and floods the output, so suppress per-file updates and emit a single
