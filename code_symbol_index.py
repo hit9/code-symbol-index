@@ -16,11 +16,12 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pathspec
 from tree_sitter import Node
-from tree_sitter_language_pack import get_parser
+
+if TYPE_CHECKING:
+    import pathspec
 
 
 __version__ = "0.5.1"
@@ -1233,6 +1234,8 @@ class CodeIndex:
             except OSError:
                 lines = None
             if lines is not None:
+                import pathspec
+
                 base_text = prefix[:-1] if prefix else ""
                 specs = inherited + (
                     (base_text, prefix, pathspec.PathSpec.from_lines("gitignore", lines)),
@@ -2810,6 +2813,8 @@ def _parser_for_language(language: str):
     parser = cache.get(language)
     if parser is None:
         try:
+            from tree_sitter_language_pack import get_parser
+
             parser = get_parser(language)
         except Exception as exc:
             raise UnsupportedLanguageError(f"No parser available for language: {language}") from exc

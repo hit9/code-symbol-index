@@ -99,3 +99,48 @@ has no implementors here; it measures the empty-result path only. `clean` and
 
 Reference/query-heavy cases improve; startup-dominated commands mostly remain
 unchanged at this step. No automatic stale warnings have been added.
+
+## Step 4: load parser/ignore dependencies only when used
+
+186 tests passed. Seven runs per variant through the import/main entry point,
+with `.gitignore` enabled. Fixtures now also include 20 Protocol implementations
+to exercise nonempty impls output; compare within this table, not across fixture
+revisions. All query stdout matched (status timestamps excluded).
+
+| Command | small master ms | small new ms | large master ms | large new ms |
+| --- | ---: | ---: | ---: | ---: |
+| index_new | 89.45 | 86.71 | 247.75 | 152.69 |
+| index_no_change | 67.72 | 66.53 | 64.31 | 64.57 |
+| update_one | 67.82 | 66.58 | 194.81 | 103.32 |
+| update_two | 77.13 | 77.81 | 229.28 | 138.40 |
+| search | 67.25 | 52.30 | 233.51 | 66.07 |
+| inspect | 79.55 | 57.63 | 2463.27 | 181.96 |
+| refs | 67.82 | 52.76 | 998.65 | 75.72 |
+| callers | 68.97 | 54.13 | 1124.62 | 111.79 |
+| callees | 67.84 | 53.55 | 1021.25 | 131.01 |
+| impls | 64.57 | 41.42 | 68.69 | 42.89 |
+| outline | 65.61 | 52.14 | 102.29 | 80.41 |
+| impls_hits | 70.71 | 52.60 | 403.77 | 74.69 |
+| status | 63.92 | 40.72 | 64.76 | 41.67 |
+| status_check | 65.75 | 67.26 | 67.27 | 67.15 |
+| missing | 64.97 | 42.32 | 65.88 | 42.98 |
+| version | 63.19 | 40.47 | 79.63 | 49.26 |
+| languages | 65.31 | 51.04 | 68.95 | 55.44 |
+| clean | 63.14 | 40.72 | 67.43 | 43.00 |
+| install_skill | 62.97 | 41.05 | 67.43 | 42.65 |
+
+Shared-mount guard: 11 runs, small fixture and `.gitignore`, disposable directory
+under the checkout, using `--write-only --fixture small --with-gitignore
+--temp-parent .`. No real repository index was touched.
+
+| Command | master ms | new ms |
+| --- | ---: | ---: |
+| small.index_new | 122.68 | 124.76 |
+| small.index_no_change | 71.17 | 68.17 |
+| small.update_one | 81.43 | 81.42 |
+| small.update_two | 97.65 | 96.52 |
+
+The mounted first-build median was 1.7% higher in this sample; other mounted
+write medians were equal or lower. This small difference is reported rather
+than represented as a speedup. No database work or schema change was introduced.
+

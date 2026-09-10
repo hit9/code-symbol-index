@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Load ignore-rule and parser dependencies when actually needed, reducing
+  startup cost for status, version, empty results and other lightweight commands.
 - Reuse a per-source line-offset table instead of repeatedly scanning source
   prefixes for positions. Symbol-only index/update skip reference context work.
 - Repository reference queries extract only the requested name and prune

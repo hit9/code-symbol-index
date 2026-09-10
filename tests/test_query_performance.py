@@ -1,4 +1,6 @@
 from pathlib import Path
+import subprocess
+import sys
 from unittest import mock
 
 import pytest
@@ -137,3 +139,24 @@ def test_status_loads_manifest_only_for_explicit_check(tmp_path):
         assert "SELECT path, language, mtime_ns, size FROM files" not in statements
         c.status(root=tmp_path, check=True)
         assert "SELECT path, language, mtime_ns, size FROM files" in statements
+
+
+@pytest.mark.parametrize("command", ["version", "status", "search", "refs"])
+def test_light_queries_do_not_load_unused_dependencies(tmp_path, command):
+    (tmp_path / "app.py").write_text("def target():\n    pass\n")
+    c.Repository(tmp_path, create_index=True).refresh()
+    args = [command]
+    if command in ("search", "refs"):
+        args += ["target", "--json"]
+    if command != "version":
+        args += ["--root", str(tmp_path)]
+    # An isolated process prevents imports from fixture construction hiding an
+    # accidental eager import. refs needs its parser, but never ignore rules.
+    source = (
+        "import sys; import code_symbol_index as c; "
+        f"assert c.main({args!r}) == 0; "
+        "assert 'pathspec' not in sys.modules; "
+        + ("assert 'tree_sitter_language_pack' not in sys.modules" if command != "refs" else "")
+    )
+    result = subprocess.run([sys.executable, "-c", source], capture_output=True, text=True, cwd=Path(c.__file__).parent)
+    assert result.returncode == 0, result.stderr

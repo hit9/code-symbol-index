@@ -42,6 +42,9 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--baseline", default="55e843a")
     parser.add_argument("--write-only", action="store_true", help="repeat only index/update guards")
+    parser.add_argument("--fixture", choices=("all", "small", "large"), default="all")
+    parser.add_argument("--with-gitignore", action="store_true")
+    parser.add_argument("--temp-parent", type=Path, help="existing directory for disposable fixtures/databases")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.samples < 2:
@@ -50,16 +53,20 @@ def main() -> None:
     baseline = subprocess.check_output(["git", "show", f"{args.baseline}:code_symbol_index.py"], cwd=project)
     report = {"python": sys.version, "platform": platform.platform(), "baseline": args.baseline,
               "samples": args.samples, "cache": "warm filesystem and bytecode; independent import/main processes", "cases": {}}
-    with tempfile.TemporaryDirectory(prefix="symbol-restart-bench-") as directory:
-        temp = Path(directory)
+    with tempfile.TemporaryDirectory(prefix="symbol-restart-bench-", dir=args.temp_parent) as directory:
+        temp = Path(directory).resolve()
         (temp / "baseline").mkdir()
         scripts = {"before": temp / "baseline" / "code_symbol_index.py", "after": project / "code_symbol_index.py"}
         scripts["before"].write_bytes(baseline)
         for script in scripts.values():
             run(script, ["version"])
         for size, count, functions in (("small", 16, 8), ("large", 4, 1000)):
+            if args.fixture != "all" and size != args.fixture:
+                continue
             root = temp / size
             root.mkdir()
+            if args.with_gitignore:
+                (root / ".gitignore").write_text("ignored/\n")
             for file_index in range(count):
                 text = "def target():\n    return 1\n\n" if file_index == 0 else ""
                 text += "".join(
@@ -67,6 +74,10 @@ def main() -> None:
                     f"    result = value + {i}\n    return target() + result\n\n"
                     for i in range(functions)
                 )
+                if file_index == 0:
+                    text += "class Protocol:\n    pass\n" + "".join(
+                        f"class Implementation_{i}(Protocol):\n    pass\n" for i in range(20)
+                    )
                 (root / f"file_{file_index:02}.py").write_text(text)
             databases = {key: temp / f"{size}-{key}.sqlite" for key in scripts}
             paths = ["file_00.py", "file_01.py"]
@@ -78,6 +89,7 @@ def main() -> None:
                 "callers": ["callers", "target", "--depth", "1"],
                 "callees": ["callees", "worker_0_0", "--depth", "1"],
                 "impls": ["impls", "target"], "outline": ["outline", paths[0]],
+                "impls_hits": ["impls", "Protocol"],
                 "status": ["status"], "status_check": ["status", "--check"],
                 "missing": ["search", "no_such_symbol"], "version": ["version"],
                 "languages": ["languages"],
