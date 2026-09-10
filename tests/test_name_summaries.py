@@ -179,3 +179,36 @@ def test_recent_file_summary_deferred_then_filled_without_ast_rebuild(tmp_path, 
     with mock.patch.object(c, '_parse_file', side_effect=AssertionError('AST rebuilt')):
         repo.refresh()
     assert repo.storage.connection.execute('SELECT count(*) FROM files WHERE name_summary IS NULL').fetchone()[0] == 0
+
+
+def test_old_cli_explains_how_to_enable_query_speedup(tmp_path, capsys):
+    repo = fixture_repo(tmp_path)
+    legacy_files_table(repo)
+    assert c.main(['refs', 'target', '--root', str(tmp_path), '--json']) == 0
+    result = capsys.readouterr()
+    assert 'query summaries are not ready' in result.err
+    assert 'query summaries' not in result.out
+    assert len(repo.storage.connection.execute('PRAGMA table_info(files)').fetchall()) == 4
+
+
+def test_progress_clears_long_summary_line():
+    import io
+    stream = io.StringIO()
+    progress = c._CliProgress(stream)
+    progress.interactive = True
+    progress('summary', done=3975, total=3975)
+    progress('start', done=0, total=0)
+    progress('finish')
+    # Simulate carriage-return overwrite in a terminal.
+    line = []
+    column = 0
+    for char in stream.getvalue().rstrip('\n'):
+        if char == '\r':
+            column = 0
+        else:
+            if column == len(line):
+                line.append(char)
+            else:
+                line[column] = char
+            column += 1
+    assert ''.join(line).rstrip() == 'index up to date'

@@ -799,6 +799,7 @@ def _name_query(method: Any) -> Any:
     def query(self: CodeIndex, *args: Any, **kwargs: Any) -> Any:
         if getattr(self, "_name_filter", None) is not None:
             return method(self, *args, **kwargs)
+        self._name_summary_unavailable = False
         self._name_filter = _NameFilter(self)
         try:
             return method(self, *args, **kwargs)
@@ -2854,10 +2855,12 @@ class _NameFilter:
                     "SELECT path, name_summary FROM files WHERE name_summary IS NOT NULL",
                 )
             except sqlite3.OperationalError:
-                pass  # Old schema-5 database: read normally, no migration.
+                self.repo._name_summary_unavailable = True
             else:
+                seen_summary = False
                 try:
                     for row in cursor:
+                        seen_summary = True
                         data = row["name_summary"]
                         if not isinstance(data, bytes) or len(data) - 41 not in NAME_SUMMARY_SIZES or data[0] != 1:
                             continue
@@ -2867,6 +2870,8 @@ class _NameFilter:
                         self.rows[row["path"]] = data
                 finally:
                     cursor.close()
+                if not seen_summary:
+                    self.repo._name_summary_unavailable = True
         data = self.rows.get(path.as_posix())
         if data is None:
             return True
@@ -5415,9 +5420,17 @@ class _CliProgress:
         self.stream = stream
         self.visible = False
         self.last_total = 0
+        self.width = 0
         target = stream if stream is not None else sys.stderr
         isatty = getattr(target, "isatty", None)
         self.interactive = bool(isatty()) if callable(isatty) else False
+
+    def _render(self, line: str) -> None:
+        stream = self.stream if self.stream is not None else sys.stderr
+        stream.write("\r" + line + " " * max(0, self.width - len(line)))
+        stream.flush()
+        self.width = len(line)
+        self.visible = True
 
     def __call__(
         self,
@@ -5433,8 +5446,7 @@ class _CliProgress:
 
         if event == "summary":
             if self.interactive:
-                stream.write("\r" + _progress_line(done, total, label="preparing query summaries", unit="files"))
-                self.visible = True
+                self._render(_progress_line(done, total, label="preparing query summaries", unit="files"))
             elif done == 0:
                 stream.write(f"preparing query summaries for {total} files (no AST rebuild)\n")
             stream.flush()
@@ -5450,25 +5462,20 @@ class _CliProgress:
             return
 
         if event == "scan":
-            stream.write("\rscanning files...")
-            stream.flush()
-            self.visible = True
+            self._render("scanning files...")
             return
         if event == "start":
-            stream.write("\r" + _progress_line(done, total, label="indexing", unit="files"))
-            stream.flush()
-            self.visible = True
+            self._render(_progress_line(done, total, label="indexing", unit="files"))
             return
         if event == "finish":
             if self.visible:
                 stream.write("\n")
                 stream.flush()
             self.visible = False
+            self.width = 0
             return
         if event == "file":
-            self.visible = True
-            stream.write("\r" + _progress_line(done, total, label="indexing", unit="files"))
-            stream.flush()
+            self._render(_progress_line(done, total, label="indexing", unit="files"))
 
 
 def _progress_line(done: int, total: int, *, label: str, unit: str) -> str:
@@ -5855,6 +5862,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(_format_outline_text(repo, repo._relative_path(Path(args.path)), page, symbol=args.symbol), end="")
         else:
             parser.error(f"unknown command: {args.command}")
+        if getattr(repo, "_name_summary_unavailable", False):
+            sys.stderr.write("hint: query summaries are not ready; run `code-symbol-index index` "
+                             "to prepare them without rebuilding unchanged ASTs.\n")
         return 0
     except KeyboardInterrupt:
         sys.stderr.write("\ninterrupted\n")

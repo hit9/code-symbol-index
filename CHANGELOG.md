@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Explain missing query summaries on stderr without migrating during reads;
+  clear long terminal progress lines before displaying shorter status text.
 - Parse small batches directly (up to 16 files / 64 KiB); keep process workers
   for larger work. Avoid copying AST child lists that are already lists.
 - Add compact per-file name summaries for live reference/caller prefiltering.
