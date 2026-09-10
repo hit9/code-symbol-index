@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Locate small result sets through native AST byte lookup during formatting;
+  large outlines retain a single traversal. No schema or index/update changes.
+
 - Load ignore-rule and parser dependencies when actually needed, reducing
   startup cost for status, version, empty results and other lightweight commands.
 - Reuse a per-source line-offset table instead of repeatedly scanning source

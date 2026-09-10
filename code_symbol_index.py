@@ -231,6 +231,7 @@ MAX_CALL_DEPTH = 6
 DEFAULT_CALL_FANOUT = 20
 MAX_CALL_GRAPH_NODES = 200
 CALLER_SCAN_BATCH_SIZE = 32
+NATIVE_DEFINITION_MAX_SYMBOLS = 64
 # Symbol kinds a call edge can resolve to. Restricting callee resolution to
 # these drops false matches against variables/constants/dict keys.
 CALLEE_KINDS = ("class", "function", "method", "constructor", "struct")
@@ -4176,6 +4177,35 @@ def _definition_ranges_for_symbols(
     line_starts = _line_starts(source_bytes)
     tree = _parse_source(_parser_for_language(spec.name), source)
     root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
+
+    # Locate a few names in native code instead of walking every AST node in
+    # Python. Large outlines still benefit from one sequential traversal.
+    if isinstance(root_node, Node) and len(wanted) <= NATIVE_DEFINITION_MAX_SYMBOLS:
+        for symbol in wanted.values():
+            start = symbol.range.start_byte
+            if not 0 <= start < len(source_bytes):
+                break  # Malformed/stale positions use the original traversal.
+            # Only the start is part of the existing match contract: a live
+            # edit can shorten the name while the indexed end is still old.
+            node = root_node.descendant_for_byte_range(start, start + 1)
+            match = None
+            ambiguous = False
+            while node is not None:
+                if _definition_kind(source_bytes, spec, node) == symbol.kind:
+                    name = _name_node(node, spec)
+                    if name is not None and _node_start_byte(name) == start:
+                        if match is not None:
+                            ambiguous = True
+                            break
+                        match = node
+                node = node.parent
+            if ambiguous:
+                break  # Preserve traversal order for nested grammar wrappers.
+            if match is not None:
+                ranges[symbol.id] = _node_range(source_bytes, match, line_starts)
+        else:
+            return ranges
+        ranges.clear()
 
     def walk(node: Node) -> None:
         if len(ranges) >= len(wanted):

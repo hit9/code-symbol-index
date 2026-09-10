@@ -50,6 +50,16 @@ def test_named_extraction_matches_full_extraction(language, source):
         node = tree.root_node() if callable(tree.root_node) else tree.root_node
         _, references = c._extract_symbols_and_references(source=data, root_node=node, path=Path("sample"), language=spec)
         assert references
+        symbols, _ = c._extract_symbols_and_references(
+            source=data, root_node=node, path=Path("sample" + spec.extensions[0]), language=spec,
+        )
+        from types import SimpleNamespace
+        repo = SimpleNamespace(languages=(language,))
+        for subset in ([symbol] for symbol in symbols):
+            actual = c._definition_ranges_for_symbols(repo, subset[0].path, subset, source=text)
+            with mock.patch.object(c, "NATIVE_DEFINITION_MAX_SYMBOLS", 0):
+                expected = c._definition_ranges_for_symbols(repo, subset[0].path, subset, source=text)
+            assert actual == expected
         names = frozenset(ref.name for ref in references if ref.name.startswith(("T", "c", "x")))
         assert c._extract_named_references(data, node, Path("sample"), spec, names) == [
             ref for ref in references if ref.name in names
@@ -208,3 +218,25 @@ def test_batch_prefilter_preserves_chunk_boundary_matches(tmp_path, monkeypatch)
             assert c._file_contains_pattern(path, pattern, max(map(len, needles)) - 1)
     path.write_bytes(b"aXb completely unrelated")
     assert not c._file_contains_pattern(path, pattern, max(map(len, needles)) - 1)
+
+
+def test_native_ranges_handle_live_shortened_name_and_wide_results(tmp_path):
+    from dataclasses import replace
+    source = "def lengthy_name():\n    return 1\n" + "".join(
+        f"def worker_{i}():\n    return {i}\n" for i in range(100)
+    )
+    path = Path("app.py")
+    (tmp_path / path).write_text(source)
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    symbols = repo.search_symbols("worker", limit=100)
+    for subset in (symbols[:1], symbols[:20], symbols):
+        actual = c._definition_ranges_for_symbols(repo, path, subset, source=source)
+        with mock.patch.object(c, "NATIVE_DEFINITION_MAX_SYMBOLS", 0):
+            assert actual == c._definition_ranges_for_symbols(repo, path, subset, source=source)
+    target = repo.search_symbols("lengthy_name")[0]
+    for text in ("def x():\n pass\n", "", "def x(", "# gone\n"):
+        actual = c._definition_ranges_for_symbols(repo, path, [target], source=text)
+        with mock.patch.object(c, "NATIVE_DEFINITION_MAX_SYMBOLS", 0):
+            assert actual == c._definition_ranges_for_symbols(repo, path, [target], source=text)
+    invalid = replace(target, range=replace(target.range, start_byte=len(source) + 1))
+    assert c._definition_ranges_for_symbols(repo, path, [invalid], source=source) == {}

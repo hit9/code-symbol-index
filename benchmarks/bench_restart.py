@@ -85,6 +85,7 @@ def main() -> None:
                 "index_new": ["index"], "index_no_change": ["index"],
                 "update_one": ["update", paths[0]], "update_two": ["update", *paths],
                 "search": ["search", "worker_0", "--limit", "20"],
+                "search_late": ["search", f"worker_0_{functions - 1}", "--limit", "1"],
                 "inspect": ["inspect", "target"], "refs": ["refs", "target"],
                 "callers": ["callers", "target", "--depth", "1"],
                 "callees": ["callees", "worker_0_0", "--depth", "1"],

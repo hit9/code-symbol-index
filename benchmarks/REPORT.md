@@ -155,3 +155,21 @@ cycles/cross-links, node limits, overlapping names and read-chunk boundaries.
 
 Further read-side latency work remains. No private repository identifiers, paths,
 source snippets or private benchmark output belong in this report.
+
+
+## Step 6: native lookup for small definition result sets
+
+Locate up to 64 requested definitions through Tree-sitter byte lookup; preserve
+the original traversal for large result sets or ambiguous grammar wrappers.
+Indexed name ends are not trusted after live edits. Schema and write code are
+unchanged. 193 tests passed, including 13-language range comparisons and live
+shortened names.
+
+Five independent CLI samples on the existing large fixture against step 5:
+index new +1.4%, unchanged index +1.0%, update one -5.5%, update two -2.2%;
+impls with hits -13.2%. Early-file search was unchanged. A separate synthetic
+802-file fixture with a 2,000-function file (7 samples) measured late-definition
+search 85.93 -> 73.13 ms and 20-result search 84.58 -> 70.95 ms. New index there
+was 231.61 -> 234.94 ms; update one 118.21 -> 118.56 ms. Small write differences
+are reported as measurement variation, not speedups or an absolute guarantee.
+`bench_restart.py` now includes `search_late` to cover late-file lookup.
