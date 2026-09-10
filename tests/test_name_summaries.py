@@ -200,7 +200,7 @@ def test_summary_progress_has_no_cursor_control_and_is_silent_when_captured():
     progress('summary', done=3975, total=3975)
     progress('start', done=0, total=0)
     progress('finish')
-    assert stream.getvalue() == 'preparing query summaries for 3975 files (no AST rebuild)\n'
+    assert stream.getvalue() == 'query summaries 0/3975 files (0%)\nquery summaries 3975/3975 files (100%)\n'
     stream.seek(0)
     stream.truncate()
     progress.interactive = False

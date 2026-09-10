@@ -5425,6 +5425,7 @@ class _CliProgress:
         target = stream if stream is not None else sys.stderr
         isatty = getattr(target, "isatty", None)
         self.interactive = bool(isatty()) if callable(isatty) else False
+        self._last_bucket = -1
 
     def __call__(
         self,
@@ -5435,15 +5436,20 @@ class _CliProgress:
         path: str | None = None,
     ) -> None:
         # Agent/tool captures need results, not progress logs. In a terminal,
-        # emit one plain line per actual work stage, without cursor control.
-        if not self.interactive:
+        # emit bounded percentage milestones without cursor control.
+        if not self.interactive or total <= 0:
             return
-        if event == "start" and total > 0:
-            message = f"indexing {total} files\n"
-        elif event == "summary" and done == 0 and total > 0:
-            message = f"preparing query summaries for {total} files (no AST rebuild)\n"
-        else:
+        if event not in {"start", "file", "summary"}:
             return
+        if event == "start" or (event == "summary" and done == 0):
+            self._last_bucket = -1
+        percent = min(100, max(0, done * 100 // total))
+        bucket = percent // 10
+        if bucket <= self._last_bucket:
+            return
+        self._last_bucket = bucket
+        stage = "query summaries" if event == "summary" else "indexing"
+        message = f"{stage} {done}/{total} files ({percent}%)\n"
         stream = self.stream if self.stream is not None else sys.stderr
         stream.write(message)
         stream.flush()

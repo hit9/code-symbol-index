@@ -6,7 +6,7 @@
 
 - Defer process-pool, Tree-sitter, hashing and argument-parser imports until
   needed; plain `version` bypasses parser construction. Captured index/update
-  calls emit no progress. Terminals get plain stage lines without cursor control.
+  calls emit no progress. Terminals show file counts and percentages at 10% milestones without cursor control.
 - Explain missing query summaries on stderr without migrating during reads;
   keep actionable freshness and upgrade hints separate from stdout results.
 - Parse small batches directly (up to 16 files / 64 KiB); keep process workers

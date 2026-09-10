@@ -48,7 +48,7 @@ This trades a small amount of storage and indexing time for fewer query reads.
 Files changed within the last second defer summary generation until a later
 refresh, preventing timestamp-granularity collisions from hiding live edits.
 Captured/non-TTY index and update calls emit no progress, keeping agent output
-small. Interactive terminals show plain stage lines without animated bars or
+small. Interactive terminals show file counts and percentages at 10% milestones without animated bars or
 cursor erasure. Results remain on stdout; actionable hints remain on stderr.
 
 Negative matches are trusted only while device, inode, size, mtime and ctime
@@ -544,9 +544,8 @@ repo.update(["src/app.py"], progress=on_progress)
 
 Stable progress events are `scan`, `start`, `file`, and `finish`.
 
-The CLI shows a live progress bar only when stderr is an interactive terminal.
-When stderr is captured (piped, or read by an agent), per-file updates are
-suppressed and a single `indexed N files` summary line is printed on completion,
+The CLI shows file counts and percentages at 10% milestones only when stderr is an interactive terminal.
+When stderr is captured (piped, or read by an agent), progress is suppressed,
 so a `--sync` query keeps its result output clean.
 
 To refresh the index during application startup without blocking startup:

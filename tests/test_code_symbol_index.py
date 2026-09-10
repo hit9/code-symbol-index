@@ -1710,16 +1710,29 @@ def test_cli_progress_silent_for_noop_sync_when_non_tty() -> None:
     assert stream.writes == []
 
 
-def test_cli_progress_uses_one_plain_stage_line_when_interactive() -> None:
+def test_cli_progress_uses_plain_percentages_when_interactive() -> None:
     stream = _FakeStream(interactive=True)
     progress = code_symbol_index._CliProgress(stream)
 
     progress("start", done=0, total=2)
     progress("file", done=1, total=2)
+    progress("file", done=2, total=2)
     progress("finish")
 
     output = "".join(stream.writes)
-    assert output == "indexing 2 files\n"
+    assert output == "indexing 0/2 files (0%)\nindexing 1/2 files (50%)\nindexing 2/2 files (100%)\n"
+
+
+def test_cli_progress_bounds_output_and_resets_for_next_stage() -> None:
+    stream = _FakeStream(interactive=True)
+    progress = code_symbol_index._CliProgress(stream)
+    for event in ("file", "summary"):
+        progress("start" if event == "file" else "summary", total=1000)
+        for done in range(1, 1001):
+            progress(event, done=done, total=1000)
+    assert len(stream.writes) == 22
+    assert stream.writes[-1] == "query summaries 1000/1000 files (100%)\n"
+    assert all("\r" not in line and "\x1b" not in line for line in stream.writes)
 
 
 def _write_call_chain_fixture(tmp_path: Path) -> None:
