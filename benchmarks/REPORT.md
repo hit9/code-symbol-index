@@ -144,3 +144,14 @@ The mounted first-build median was 1.7% higher in this sample; other mounted
 write medians were equal or lower. This small difference is reported rather
 than represented as a speedup. No database work or schema change was introduced.
 
+
+## Step 5: batch caller expansion within a graph layer
+
+Caller expansion batches at most 32 targets, grouped by language, and shares
+one prefilter/parse pass. Consumption order, per-target limits, node truncation,
+reference classification and graph structure are unchanged. No write path or
+schema changes. 192 tests passed, including batched-vs-individual graph equality,
+cycles/cross-links, node limits, overlapping names and read-chunk boundaries.
+
+Further read-side latency work remains. No private repository identifiers, paths,
+source snippets or private benchmark output belong in this report.

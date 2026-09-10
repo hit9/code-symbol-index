@@ -50,6 +50,10 @@ def test_named_extraction_matches_full_extraction(language, source):
         node = tree.root_node() if callable(tree.root_node) else tree.root_node
         _, references = c._extract_symbols_and_references(source=data, root_node=node, path=Path("sample"), language=spec)
         assert references
+        names = frozenset(ref.name for ref in references if ref.name.startswith(("T", "c", "x")))
+        assert c._extract_named_references(data, node, Path("sample"), spec, names) == [
+            ref for ref in references if ref.name in names
+        ]
         for name in {ref.name for ref in references} | {"missing", "TargetExtra", "Target"}:
             assert c._extract_named_references(data, node, Path("sample"), spec, name) == [
                 ref for ref in references if ref.name == name
@@ -160,3 +164,47 @@ def test_light_queries_do_not_load_unused_dependencies(tmp_path, command):
     )
     result = subprocess.run([sys.executable, "-c", source], capture_output=True, text=True, cwd=Path(c.__file__).parent)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("depth,limit,max_nodes", [(1, 3, 200), (3, 3, 200), (4, 50, 200), (3, 50, 2), (3, 50, 45)])
+def test_batched_call_graph_matches_individual_queries(tmp_path, depth, limit, max_nodes):
+    (tmp_path / "target.py").write_text("def target():\n    branch_0()\n")
+    (tmp_path / "branches.py").write_text("".join(
+        f"def branch_{i}():\n    target()\n    target()\n" for i in range(40)
+    ))
+    (tmp_path / "entries.py").write_text("".join(
+        f"def entry_{i}():\n    branch_{i}()\n    branch_{(i + 1) % 40}()\n" for i in range(40)
+    ))
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    target = repo.search_symbols("target", exact_only=True)[0]
+    def graph():
+        return c._build_call_graph(repo, target, direction="callers", depth=depth, limit=limit, max_nodes=max_nodes)
+
+    def individual(repo, symbols, *, limit):
+        return {symbol.id: c._direct_callers(repo, symbol, limit=limit) for symbol in symbols}
+
+    with mock.patch.object(c, "_direct_callers_batch", side_effect=individual):
+        expected = graph()
+    with mock.patch.object(c, "_file_contains_pattern", wraps=c._file_contains_pattern) as scans:
+        actual = graph()
+    assert actual == expected
+    assert scans.call_count <= 3 * 2 * max(depth - 1, 0)
+    (tmp_path / "entries.py").write_text("def changed_entry():\n    branch_0()\n")
+    repo.update([Path("entries.py")])
+    with mock.patch.object(c, "_direct_callers_batch", side_effect=individual):
+        expected_after_edit = graph()
+    assert graph() == expected_after_edit
+
+
+def test_batch_prefilter_preserves_chunk_boundary_matches(tmp_path, monkeypatch):
+    import re
+    monkeypatch.setattr(c, "FILE_SCAN_CHUNK_SIZE", 7)
+    path = tmp_path / "bytes"
+    needles = [b"long_target_name", "名字".encode(), b"a.b"]
+    pattern = re.compile(b"|".join(re.escape(value) for value in needles))
+    for needle in needles:
+        for padding in range(15):
+            path.write_bytes(b" " * padding + needle + b" tail")
+            assert c._file_contains_pattern(path, pattern, max(map(len, needles)) - 1)
+    path.write_bytes(b"aXb completely unrelated")
+    assert not c._file_contains_pattern(path, pattern, max(map(len, needles)) - 1)

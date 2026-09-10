@@ -230,6 +230,7 @@ DEFAULT_CALL_DEPTH = 3
 MAX_CALL_DEPTH = 6
 DEFAULT_CALL_FANOUT = 20
 MAX_CALL_GRAPH_NODES = 200
+CALLER_SCAN_BATCH_SIZE = 32
 # Symbol kinds a call edge can resolve to. Restricting callee resolution to
 # these drops false matches against variables/constants/dict keys.
 CALLEE_KINDS = ("class", "function", "method", "constructor", "struct")
@@ -2710,7 +2711,7 @@ def _parse_file(
     languages: set[str] | None = None,
     include_references: bool = True,
     *,
-    reference_name: str | None = None,
+    reference_name: str | frozenset[str] | None = None,
 ) -> _IndexedFile | None:
     full_path = root / relative_path
     spec = _spec_for_path(relative_path, languages)
@@ -2780,6 +2781,20 @@ def _file_contains_bytes(path: Path, needle: bytes) -> bool:
             while chunk := file.read(FILE_SCAN_CHUNK_SIZE):
                 window = previous + chunk
                 if needle in window:
+                    return True
+                previous = window[-overlap:] if overlap else b""
+    except OSError:
+        return False
+    return False
+
+
+def _file_contains_pattern(path: Path, pattern: re.Pattern[bytes], overlap: int) -> bool:
+    previous = b""
+    try:
+        with path.open("rb") as file:
+            while chunk := file.read(FILE_SCAN_CHUNK_SIZE):
+                window = previous + chunk
+                if pattern.search(window) is not None:
                     return True
                 previous = window[-overlap:] if overlap else b""
     except OSError:
@@ -2986,27 +3001,32 @@ def _classify_reference(
 
 
 def _extract_named_references(
-    source: bytes, root_node: Node, path: Path, language: LanguageSpec, name: str,
+    source: bytes, root_node: Node, path: Path, language: LanguageSpec, name: str | frozenset[str],
 ) -> list[Reference]:
-    """Extract one name without building unrelated symbols or references.
+    """Extract requested names without building unrelated symbols or references.
 
     Prune only subtrees whose byte span cannot contain the name. Visit the
     remaining ancestors normally to preserve import/type/inheritance context
     and transparent-node handling from the full extractor.
     """
-    needle = name.encode("utf-8")
+    names = frozenset({name}) if isinstance(name, str) else name
+    if not names:
+        return []
+    needle = next(iter(names)).encode("utf-8") if len(names) == 1 else None
+    pattern = re.compile(b"|".join(re.escape(value.encode("utf-8")) for value in sorted(names))) if needle is None else None
     line_starts = _line_starts(source)
     lines = source.decode("utf-8", errors="replace").splitlines()
     references: list[Reference] = []
 
     def walk(node: Node, parent: Node | None, grandparent: Node | None, ctx: frozenset[str]) -> None:
         start, end = _node_start_byte(node), _node_end_byte(node)
-        if source.find(needle, start, end) < 0:
+        if (source.find(needle, start, end) < 0 if needle is not None else pattern.search(source, start, end) is None):
             return
         kind = _node_kind(node)
-        if kind in language.identifier_node_types and source[start:end] == needle:
+        reference_name = _node_text(source, node) if kind in language.identifier_node_types else None
+        if reference_name in names:
             references.append(Reference(
-                symbol_id="", name=name, language=language.name, path=path,
+                symbol_id="", name=reference_name, language=language.name, path=path,
                 range=_node_range(source, node, line_starts),
                 context=_line_context(source, lines, node, line_starts),
                 reference_kind=_classify_reference(node, parent, grandparent, ctx, language),
@@ -3797,6 +3817,48 @@ def _direct_callers(repo: CodeIndex, symbol: Symbol, *, limit: int) -> tuple[Sym
     return _callers_for_symbol(repo, symbol, references, limit=limit)
 
 
+def _direct_callers_batch(repo: Repository, symbols: list[Symbol], *, limit: int) -> dict[str, tuple[Symbol, ...]]:
+    """Share a source prefilter/parse pass among a bounded set of graph nodes."""
+    if len(symbols) <= 1 or limit <= 0:
+        return {symbol.id: _direct_callers(repo, symbol, limit=limit) for symbol in symbols}
+    by_language: dict[str, list[Symbol]] = {}
+    for symbol in symbols:
+        by_language.setdefault(symbol.language, []).append(symbol)
+    callers: dict[str, tuple[Symbol, ...]] = {}
+    for language, targets in by_language.items():
+        by_name: dict[str, list[Symbol]] = {}
+        found: dict[str, list[Reference]] = {symbol.id: [] for symbol in targets}
+        for symbol in targets:
+            by_name.setdefault(symbol.name, []).append(symbol)
+        names = frozenset(by_name)
+        needles = [name.encode("utf-8") for name in sorted(names)]
+        pattern = re.compile(b"|".join(re.escape(needle) for needle in needles))
+        overlap = max(map(len, needles)) - 1
+        for path in repo.storage.file_paths(language=language):
+            if not _file_contains_pattern(repo.root / path, pattern, overlap):
+                continue
+            indexed = _parse_file(repo.root, path, repo.languages, reference_name=names)
+            if indexed is None:
+                continue
+            for reference in indexed.references:
+                if reference.reference_kind != "call":
+                    continue
+                for target in by_name[reference.name]:
+                    references = found[target.id]
+                    if len(references) >= limit:
+                        continue
+                    if (reference.path == target.path
+                            and reference.range.start_byte == target.range.start_byte
+                            and reference.range.end_byte == target.range.end_byte):
+                        continue
+                    references.append(reference)
+            if all(len(references) >= limit for references in found.values()):
+                break
+        for target in targets:
+            callers[target.id] = _callers_for_symbol(repo, target, tuple(found[target.id]), limit=limit)
+    return callers
+
+
 def _direct_callees(repo: CodeIndex, symbol: Symbol, *, limit: int, loose: bool = False) -> tuple[Symbol, ...]:
     source_range = _definition_range(repo, symbol) or symbol.range
     return _callees_for_symbol(repo, symbol, source_range, limit=limit, ref_kinds=frozenset({"call"}), loose=loose)
@@ -3834,8 +3896,18 @@ def _build_call_graph(
     frontier = [symbol]
     for level in range(1, depth + 1):
         next_frontier: list[Symbol] = []
-        for current in frontier:
-            for neighbour in step(current):
+        batch: dict[str, tuple[Symbol, ...]] = {}
+        for index, current in enumerate(frontier):
+            if direction == "callers" and isinstance(repo, Repository) and len(frontier) > 1:
+                if current.id not in batch:
+                    # Avoid prefetching a wide batch when the graph is about to
+                    # hit its node limit. Results are still consumed in BFS order.
+                    width = min(CALLER_SCAN_BATCH_SIZE, max(1, max_nodes - len(visited) + 1))
+                    batch = _direct_callers_batch(repo, frontier[index:index + width], limit=limit)
+                neighbours = batch[current.id]
+            else:
+                neighbours = step(current)
+            for neighbour in neighbours:
                 if neighbour.id == symbol.id:
                     continue
                 if neighbour.id not in visited:
