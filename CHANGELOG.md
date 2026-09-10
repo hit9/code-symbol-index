@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.5.3 - 2026-09-10
+
+### Fixed
+
+- Refresh terminal index/update percentages on the same line and retain the
+  final counts. Captured calls remain silent; warnings start on a separate line.
+
 ## 0.5.2 - 2026-09-10
 
 ### Changed
