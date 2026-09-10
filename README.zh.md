@@ -43,7 +43,7 @@ code-symbol-index
 符号、引用的存储格式不变，以少量空间和索引时间换取更少的查询文件读取。
 最近一秒内变化的文件暂不生成摘要，后续刷新再补齐，避免时间戳精度导致漏掉编辑。
 非 TTY／被 Codex、Claude 等工具捕获时，index/update 不输出进度，减少 token。
-交互终端每跨过 10% 显示一行文件计数和百分比，不使用动态进度条或光标擦除。stdout 结果格式保持兼容，必要提示在 stderr。
+交互终端每跨过 10% 在同一行刷新文件计数和百分比，完成后保留最终一行，不擦除。stdout 结果格式保持兼容，必要提示在 stderr。
 
 只有设备、inode、大小、mtime、ctime 均一致时，才信任摘要的否定结果。
 检查只在单次请求内复用，多次调用同一 Repository 也会重新检查；不承诺对并发
@@ -504,7 +504,7 @@ repo.update(["src/app.py"], progress=on_progress)
 稳定的进度事件为 `scan`、`start`、`file` 和 `finish`。
 `finish` 的 `done` 是成功解析文件数，`total` 是尝试解析文件数。
 
-仅当 stderr 为交互式终端时，CLI 才每跨过 10% 显示文件计数和百分比。当 stderr 被捕获（管道，或被
+仅当 stderr 为交互式终端时，CLI 才每跨过 10% 在同一行刷新文件计数和百分比，完成后保留最终一行。当 stderr 被捕获（管道，或被
 agent 读取）时，不输出进度，
 因此 `--sync` 查询的结果输出保持干净。
 

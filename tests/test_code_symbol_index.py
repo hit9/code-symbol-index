@@ -1720,7 +1720,7 @@ def test_cli_progress_uses_plain_percentages_when_interactive() -> None:
     progress("finish")
 
     output = "".join(stream.writes)
-    assert output == "indexing 0/2 files (0%)\nindexing 1/2 files (50%)\nindexing 2/2 files (100%)\n"
+    assert output == "indexing 0/2 files (0%)\rindexing 1/2 files (50%)\rindexing 2/2 files (100%)\n"
 
 
 def test_cli_progress_bounds_output_and_resets_for_next_stage() -> None:
@@ -1731,8 +1731,32 @@ def test_cli_progress_bounds_output_and_resets_for_next_stage() -> None:
         for done in range(1, 1001):
             progress(event, done=done, total=1000)
     assert len(stream.writes) == 22
-    assert stream.writes[-1] == "query summaries 1000/1000 files (100%)\n"
-    assert all("\r" not in line and "\x1b" not in line for line in stream.writes)
+    assert stream.writes[-1] == "\rquery summaries 1000/1000 files (100%)\n"
+    assert "".join(stream.writes).count("\n") == 2
+    assert all("\x1b" not in line for line in stream.writes)
+
+
+def test_cli_progress_closes_partial_line_before_warning() -> None:
+    stream = _FakeStream(interactive=True)
+    progress = code_symbol_index._CliProgress(stream)
+    progress("start", total=2)
+    progress("file", done=1, total=2)
+    progress("finish", done=1, total=2)
+    output = "".join(stream.writes)
+    assert "(50%)\nwarning: 1/2 files could not be indexed" in output
+    assert output.endswith("\n")
+
+
+def test_cli_progress_separates_partial_stages() -> None:
+    stream = _FakeStream(interactive=True)
+    progress = code_symbol_index._CliProgress(stream)
+    progress("summary", total=100)
+    progress("start", total=1)
+    progress("file", done=1, total=1)
+    assert "".join(stream.writes) == (
+        "query summaries 0/100 files (0%)\n"
+        "indexing 0/1 files (0%)\rindexing 1/1 files (100%)\n"
+    )
 
 
 def _write_call_chain_fixture(tmp_path: Path) -> None:

@@ -216,7 +216,7 @@ def test_old_cli_explains_how_to_enable_query_speedup(tmp_path, capsys):
     assert len(repo.storage.connection.execute('PRAGMA table_info(files)').fetchall()) == 4
 
 
-def test_summary_progress_has_no_cursor_control_and_is_silent_when_captured():
+def test_summary_progress_overwrites_line_and_is_silent_when_captured():
     import io
     stream = io.StringIO()
     progress = c._CliProgress(stream)
@@ -225,7 +225,7 @@ def test_summary_progress_has_no_cursor_control_and_is_silent_when_captured():
     progress('summary', done=3975, total=3975)
     progress('start', done=0, total=0)
     progress('finish')
-    assert stream.getvalue() == 'query summaries 0/3975 files (0%)\nquery summaries 3975/3975 files (100%)\n'
+    assert stream.getvalue() == 'query summaries 0/3975 files (0%)\rquery summaries 3975/3975 files (100%)\n'
     stream.seek(0)
     stream.truncate()
     progress.interactive = False

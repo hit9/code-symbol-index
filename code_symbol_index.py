@@ -5439,6 +5439,7 @@ class _CliProgress:
         isatty = getattr(target, "isatty", None)
         self.interactive = bool(isatty()) if callable(isatty) else False
         self._last_bucket = -1
+        self._line_open = False
 
     def __call__(
         self,
@@ -5449,9 +5450,14 @@ class _CliProgress:
         path: str | None = None,
     ) -> None:
         # Agent/tool captures need results, not progress logs. In a terminal,
-        # emit bounded percentage milestones without cursor control.
+        # overwrite bounded percentage milestones, retaining the final line.
+        stream = self.stream if self.stream is not None else sys.stderr
+        new_stage = event == "start" or (event == "summary" and done == 0)
+        if self.interactive and self._line_open and (new_stage or event == "finish"):
+            stream.write("\n")
+            stream.flush()
+            self._line_open = False
         if event == "finish" and done < total:
-            stream = self.stream if self.stream is not None else sys.stderr
             stream.write(f"warning: {total - done}/{total} files could not be indexed; "
                          "check file readability/encoding or exclude unsupported files. "
                          "Git freshness only tracks the checkout.\n")
@@ -5461,7 +5467,7 @@ class _CliProgress:
             return
         if event not in {"start", "file", "summary"}:
             return
-        if event == "start" or (event == "summary" and done == 0):
+        if new_stage:
             self._last_bucket = -1
         percent = min(100, max(0, done * 100 // total))
         bucket = percent // 10
@@ -5469,8 +5475,10 @@ class _CliProgress:
             return
         self._last_bucket = bucket
         stage = "query summaries" if event == "summary" else "indexing"
-        message = f"{stage} {done}/{total} files ({percent}%)\n"
-        stream = self.stream if self.stream is not None else sys.stderr
+        prefix = "\r" if self._line_open else ""
+        suffix = "\n" if done >= total else ""
+        message = f"{prefix}{stage} {done}/{total} files ({percent}%){suffix}"
+        self._line_open = not suffix
         stream.write(message)
         stream.flush()
 
