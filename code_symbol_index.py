@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import argparse
-import concurrent.futures
 import fnmatch
-import hashlib
 import json
 import os
 import re
@@ -20,10 +17,11 @@ from pathlib import Path
 from time import time_ns
 from typing import TYPE_CHECKING, Any
 
-from tree_sitter import Node
-
 if TYPE_CHECKING:
+    import argparse
+    import concurrent.futures
     import pathspec
+    from tree_sitter import Node
 
 
 __version__ = "0.5.1"
@@ -1441,6 +1439,8 @@ class Repository(CodeIndex):
                     results.append(result)
                 _emit_progress(progress, "file", done=done, total=len(paths), path=path.as_posix())
             return results
+
+        import concurrent.futures
 
         results: list[_IndexedFile] = []
         workers = min(MAX_WORKERS, len(paths))
@@ -4358,6 +4358,8 @@ def _definition_ranges_for_symbols(
     symbols = tuple(symbols)
     if not symbols:
         return {}
+    from tree_sitter import Node
+
     if source is None:
         source = repo.storage.file_source(repo.root, path)
     if source is None:
@@ -5067,6 +5069,8 @@ def _source_excerpt(source: str, range_: Range, max_source_chars: int) -> tuple[
 
 
 def _hash_line(line: str) -> str:
+    import hashlib
+
     return hashlib.sha256(line.encode("utf-8")).hexdigest()[:HASHLINE_HASH_CHARS]
 
 
@@ -5418,19 +5422,9 @@ def _readable_call_graph(graph: CallGraph) -> dict[str, Any]:
 class _CliProgress:
     def __init__(self, stream: Any | None = None) -> None:
         self.stream = stream
-        self.visible = False
-        self.last_total = 0
-        self.width = 0
         target = stream if stream is not None else sys.stderr
         isatty = getattr(target, "isatty", None)
         self.interactive = bool(isatty()) if callable(isatty) else False
-
-    def _render(self, line: str) -> None:
-        stream = self.stream if self.stream is not None else sys.stderr
-        stream.write("\r" + line + " " * max(0, self.width - len(line)))
-        stream.flush()
-        self.width = len(line)
-        self.visible = True
 
     def __call__(
         self,
@@ -5440,52 +5434,19 @@ class _CliProgress:
         total: int = 0,
         path: str | None = None,
     ) -> None:
-        if event == "start" or event == "file":
-            self.last_total = total
-        stream = self.stream if self.stream is not None else sys.stderr
-
-        if event == "summary":
-            if self.interactive:
-                self._render(_progress_line(done, total, label="preparing query summaries", unit="files"))
-            elif done == 0:
-                stream.write(f"preparing query summaries for {total} files (no AST rebuild)\n")
-            stream.flush()
-            return
-
-        # When stderr is captured (non-TTY), the live `\r` bar does not collapse
-        # and floods the output, so suppress per-file updates and emit a single
-        # summary line on finish instead.
+        # Agent/tool captures need results, not progress logs. In a terminal,
+        # emit one plain line per actual work stage, without cursor control.
         if not self.interactive:
-            if event == "finish" and self.last_total > 0:
-                stream.write(f"indexed {self.last_total} files\n")
-                stream.flush()
             return
-
-        if event == "scan":
-            self._render("scanning files...")
+        if event == "start" and total > 0:
+            message = f"indexing {total} files\n"
+        elif event == "summary" and done == 0 and total > 0:
+            message = f"preparing query summaries for {total} files (no AST rebuild)\n"
+        else:
             return
-        if event == "start":
-            self._render(_progress_line(done, total, label="indexing", unit="files"))
-            return
-        if event == "finish":
-            if self.visible:
-                stream.write("\n")
-                stream.flush()
-            self.visible = False
-            self.width = 0
-            return
-        if event == "file":
-            self._render(_progress_line(done, total, label="indexing", unit="files"))
-
-
-def _progress_line(done: int, total: int, *, label: str, unit: str) -> str:
-    width = 24
-    if total <= 0:
-        return "index up to date"
-    filled = round(width * done / total)
-    bar = "#" * filled + "-" * (width - filled)
-    percent = round(100 * done / total)
-    return f"{label} [{bar}] {done}/{total} {unit} {percent}%"
+        stream = self.stream if self.stream is not None else sys.stderr
+        stream.write(message)
+        stream.flush()
 
 
 def _add_index_options(parser: argparse.ArgumentParser) -> None:
@@ -5511,6 +5472,8 @@ def _add_page_options(parser: argparse.ArgumentParser) -> None:
 def _ref_kind_value(value: str) -> str:
     unknown = sorted(set(_coerce_filter_values(value)) - REFERENCE_KINDS)
     if unknown:
+        import argparse
+
         valid = ", ".join(sorted(REFERENCE_KINDS))
         raise argparse.ArgumentTypeError(f"unknown reference kind(s): {', '.join(unknown)}; valid kinds: {valid}")
     return value
@@ -5546,6 +5509,8 @@ def _ref_kinds_arg(args: argparse.Namespace) -> str | tuple[str, ...] | None:
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
+        import argparse
+
         raise argparse.ArgumentTypeError("must be >= 1")
     return parsed
 
@@ -5553,6 +5518,8 @@ def _positive_int(value: str) -> int:
 def _search_limit(value: str) -> int:
     parsed = _positive_int(value)
     if parsed > MAX_SEARCH_LIMIT:
+        import argparse
+
         raise argparse.ArgumentTypeError(f"must be <= {MAX_SEARCH_LIMIT}")
     return parsed
 
@@ -5560,6 +5527,8 @@ def _search_limit(value: str) -> int:
 def _non_negative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
+        import argparse
+
         raise argparse.ArgumentTypeError("must be >= 0")
     return parsed
 
@@ -5567,11 +5536,15 @@ def _non_negative_int(value: str) -> int:
 def _depth(value: str) -> int:
     parsed = int(value)
     if parsed < 1 or parsed > MAX_CALL_DEPTH:
+        import argparse
+
         raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_CALL_DEPTH}")
     return parsed
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    import argparse
+
     parser = argparse.ArgumentParser(prog="code-symbol-index")
     parser.add_argument("--version", action="version", version=f"code-symbol-index {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -5689,6 +5662,9 @@ def _inspect_options_from_args(args: argparse.Namespace) -> InspectOptions:
 def main(argv: list[str] | None = None) -> int:
     try:
         raw_args = list(sys.argv[1:] if argv is None else argv)
+        if raw_args == ["version"]:
+            print(f"code-symbol-index {__version__}")
+            return 0
         commands = {
             "search",
             "inspect",

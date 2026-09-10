@@ -191,24 +191,19 @@ def test_old_cli_explains_how_to_enable_query_speedup(tmp_path, capsys):
     assert len(repo.storage.connection.execute('PRAGMA table_info(files)').fetchall()) == 4
 
 
-def test_progress_clears_long_summary_line():
+def test_summary_progress_has_no_cursor_control_and_is_silent_when_captured():
     import io
     stream = io.StringIO()
     progress = c._CliProgress(stream)
     progress.interactive = True
+    progress('summary', done=0, total=3975)
     progress('summary', done=3975, total=3975)
     progress('start', done=0, total=0)
     progress('finish')
-    # Simulate carriage-return overwrite in a terminal.
-    line = []
-    column = 0
-    for char in stream.getvalue().rstrip('\n'):
-        if char == '\r':
-            column = 0
-        else:
-            if column == len(line):
-                line.append(char)
-            else:
-                line[column] = char
-            column += 1
-    assert ''.join(line).rstrip() == 'index up to date'
+    assert stream.getvalue() == 'preparing query summaries for 3975 files (no AST rebuild)\n'
+    stream.seek(0)
+    stream.truncate()
+    progress.interactive = False
+    progress('summary', done=0, total=3975)
+    progress('summary', done=3975, total=3975)
+    assert stream.getvalue() == ''

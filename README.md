@@ -41,12 +41,15 @@ unusual names and files over 1 MiB keep the original path.
 
 The next write adds a nullable `files.name_summary` column to schema 5. Reads
 of old databases do not migrate them. A normal `index` fills missing summaries
-for unchanged files **without rebuilding their ASTs**, with a progress message;
+for unchanged files **without rebuilding their ASTs**, with a brief terminal stage message;
 subsequent refreshes do not repeat the backfill. Explicit-path `update` only
 maintains the selected files. Existing symbols/references keep their formats.
 This trades a small amount of storage and indexing time for fewer query reads.
 Files changed within the last second defer summary generation until a later
 refresh, preventing timestamp-granularity collisions from hiding live edits.
+Captured/non-TTY index and update calls emit no progress, keeping agent output
+small. Interactive terminals show plain stage lines without animated bars or
+cursor erasure. Results remain on stdout; actionable hints remain on stderr.
 
 Negative matches are trusted only while device, inode, size, mtime and ctime
 match. Checks are shared only within one request, not across calls on a reused

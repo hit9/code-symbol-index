@@ -263,3 +263,37 @@ Reproduce with `bench_restart.py --baseline d5cf6c8 --samples 7 --write-only
 --output /tmp/batching.json`, optionally with `--with-git --temp-parent
 <mounted-directory>`. Tests cover both size and count boundaries for retaining
 the pool, in addition to the existing symbol/output checks.
+
+## Step 10: CLI startup and agent output
+
+Defer process-pool imports until parallel parsing, Tree-sitter until parsing or
+range lookup, hashing until anchors, and argparse until CLI parsing. Exact
+`version` avoids building every command parser. Captured index/update emits no
+progress; interactive output uses plain stage lines, without cursor erasure.
+
+Eleven alternating fresh processes per case, synthetic small Git repository,
+warm bytecode/filesystem, against 7552ee4. Times include Python startup:
+
+| Command | Before ms | After ms |
+| --- | ---: | ---: |
+| version | 38.45 | 30.34 |
+| status | 39.73 | 36.16 |
+| search | 50.01 | 46.65 |
+| refs | 50.67 | 48.03 |
+| inspect | 54.36 | 51.29 |
+| callers | 51.77 | 48.53 |
+| clean | 39.35 | 33.83 |
+| index new | 57.03 | 54.16 |
+| index unchanged | 51.41 | 46.75 |
+| update one | 52.52 | 49.08 |
+| update two | 50.98 | 48.21 |
+
+Reproduce with `bench_restart.py --baseline 7552ee4 --samples 11 --fixture small
+--with-git --output /tmp/startup.json`. All stdout and common indexed columns
+matched. These are process-start measurements with warm storage, not OS cold
+cache claims. Large queries still spend most of their time doing query work.
+
+Final compatibility check on Linux/aarch64: Python 3.11.15, 3.12.3, 3.13.13,
+3.14.4 and 3.15.0a8 each passed all 239 tests in separate environments. No
+Windows/macOS runtime matrix was run; the Windows summary shortcut remains
+disabled as described above.

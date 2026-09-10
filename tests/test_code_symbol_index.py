@@ -1078,7 +1078,7 @@ def test_cli_query_does_not_sync_by_default(tmp_path: Path, capsys) -> None:
     assert "count: 0" in stale_output.out
     assert synced_exit == 0
     assert "name: second_cli_name" in synced_output.out
-    assert "indexed" in synced_output.err
+    assert synced_output.err == ""
 
 
 def test_cli_bare_keyword_search_and_inspect_best_match(tmp_path: Path, capsys) -> None:
@@ -1252,7 +1252,7 @@ impl Greeter for Person {
     assert json_output["items"][0]["kind"] == "impl"
 
 
-def test_cli_progress_goes_to_stderr(tmp_path: Path, capsys) -> None:
+def test_cli_index_capture_contains_only_result(tmp_path: Path, capsys) -> None:
     (tmp_path / "app.py").write_text("def progress_target():\n    pass\n", encoding="utf-8")
 
     exit_code = main(["index", "--root", str(tmp_path), "--language", "python"])
@@ -1260,8 +1260,7 @@ def test_cli_progress_goes_to_stderr(tmp_path: Path, capsys) -> None:
     captured = capsys.readouterr()
     assert exit_code == 0
     assert json.loads(captured.out)["root"] == str(tmp_path.resolve())
-    assert "indexed" in captured.err
-    assert "writing index" not in captured.err
+    assert captured.err == ""
 
 
 def test_cli_index_command_refreshes_disk_index(tmp_path: Path, capsys) -> None:
@@ -1274,7 +1273,7 @@ def test_cli_index_command_refreshes_disk_index(tmp_path: Path, capsys) -> None:
     assert exit_code == 0
     assert payload["root"] == str(tmp_path.resolve())
     assert (tmp_path / ".code-symbol-index" / "index.sqlite").exists()
-    assert "indexed" in captured.err
+    assert captured.err == ""
     assert "writing index" not in captured.err
 
 
@@ -1686,7 +1685,7 @@ class _FakeStream:
         pass
 
 
-def test_cli_progress_compresses_when_non_tty() -> None:
+def test_cli_progress_silent_when_non_tty() -> None:
     stream = _FakeStream(interactive=False)
     progress = code_symbol_index._CliProgress(stream)
 
@@ -1697,7 +1696,7 @@ def test_cli_progress_compresses_when_non_tty() -> None:
     progress("finish")
 
     output = "".join(stream.writes)
-    assert output == "indexed 3 files\n"
+    assert output == ""
     assert "\r" not in output
 
 
@@ -1711,7 +1710,7 @@ def test_cli_progress_silent_for_noop_sync_when_non_tty() -> None:
     assert stream.writes == []
 
 
-def test_cli_progress_keeps_live_bar_when_interactive() -> None:
+def test_cli_progress_uses_one_plain_stage_line_when_interactive() -> None:
     stream = _FakeStream(interactive=True)
     progress = code_symbol_index._CliProgress(stream)
 
@@ -1720,9 +1719,7 @@ def test_cli_progress_keeps_live_bar_when_interactive() -> None:
     progress("finish")
 
     output = "".join(stream.writes)
-    assert "\r" in output          # live, self-rewriting bar
-    assert "indexing" in output
-    assert "indexed 2 files" not in output
+    assert output == "indexing 2 files\n"
 
 
 def _write_call_chain_fixture(tmp_path: Path) -> None:

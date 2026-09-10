@@ -244,6 +244,7 @@ def test_native_ranges_handle_live_shortened_name_and_wide_results(tmp_path):
 
 @pytest.mark.parametrize("count,size,parallel", [(2, 128, False), (2, 65536, True), (17, 128, True)])
 def test_parse_pool_reserved_for_large_batches(tmp_path, monkeypatch, count, size, parallel):
+    import concurrent.futures
     monkeypatch.setattr(c, "MAX_WORKERS", 2)
     paths = []
     for i in range(count):
@@ -251,8 +252,27 @@ def test_parse_pool_reserved_for_large_batches(tmp_path, monkeypatch, count, siz
         (tmp_path / path).write_text(f"def worker_{i}():\n    return 1\n#" + "x" * size)
         paths.append(path)
     repo = c.Repository(tmp_path, create_index=True)
-    with mock.patch.object(c.concurrent.futures, "ProcessPoolExecutor", wraps=c.concurrent.futures.ProcessPoolExecutor) as pool:
+    with mock.patch.object(concurrent.futures, "ProcessPoolExecutor", wraps=concurrent.futures.ProcessPoolExecutor) as pool:
         results = repo._parse_files(paths, include_references=False)
     assert pool.called is parallel
     assert {result.path for result in results} == set(paths)
     assert all(len(result.symbols) == 1 and not result.references for result in results)
+
+
+def test_version_avoids_query_and_writer_imports():
+    source = """
+import sys
+import code_symbol_index as c
+assert c.main(['version']) == 0
+for name in ('concurrent.futures', 'tree_sitter', 'tree_sitter_language_pack', 'pathspec', 'argparse', 'hashlib'):
+    assert name not in sys.modules, name
+"""
+    result = subprocess.run([sys.executable, '-c', source], capture_output=True, text=True, cwd=Path(c.__file__).parent)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f'code-symbol-index {c.__version__}\n'
+
+
+def test_version_still_rejects_unrecognized_options():
+    with pytest.raises(SystemExit) as error:
+        c.main(['version', '--invalid-option'])
+    assert error.value.code == 2
