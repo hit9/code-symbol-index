@@ -3521,8 +3521,9 @@ def _inspect_text(
         return _bounded_text(f"not_found:\n  query: {query}\n", options.max_total_chars)
     if len(candidates) > 1:
         lines = ["ambiguous:", "  candidates:"]
+        ranges = _result_definition_ranges(repo, candidates[:MAX_INSPECT_CANDIDATES])
         for candidate in candidates[:MAX_INSPECT_CANDIDATES]:
-            lines.extend(_format_relation_item(repo, candidate, indent=4))
+            lines.extend(_format_relation_item(repo, candidate, indent=4, range_=ranges.get(candidate.id, candidate.range)))
         return _bounded_text("\n".join(lines) + "\n", options.max_total_chars)
 
     symbol = candidates[0]
@@ -4129,8 +4130,19 @@ def _format_symbol_fields(symbol: Symbol, *, indent: int, range_: Range | None =
     ]
 
 
-def _format_relation_item(repo: CodeIndex, symbol: Symbol, *, indent: int) -> list[str]:
-    range_ = _definition_range(repo, symbol) or symbol.range
+def _result_definition_ranges(repo: CodeIndex, symbols: Iterable[Symbol]) -> dict[str, Range]:
+    by_path: dict[Path, list[Symbol]] = {}
+    for symbol in symbols:
+        by_path.setdefault(symbol.path, []).append(symbol)
+    return {
+        symbol_id: range_
+        for path, file_symbols in by_path.items()
+        for symbol_id, range_ in _definition_ranges_for_symbols(repo, path, file_symbols).items()
+    }
+
+
+def _format_relation_item(repo: CodeIndex, symbol: Symbol, *, indent: int, range_: Range | None = None) -> list[str]:
+    range_ = range_ or _definition_range(repo, symbol) or symbol.range
     prefix = " " * indent
     lines = [f"{prefix}- id: {_text_symbol_id(symbol, range_)}"]
     lines.extend(_format_symbol_fields(symbol, indent=indent + 2, range_=range_)[1:])
@@ -4167,11 +4179,12 @@ def _format_relation_section(repo: CodeIndex, name: str, items: tuple[Any, ...],
     if not items:
         lines.append("  []")
         return lines
+    ranges = _result_definition_ranges(repo, (item for item in items[:limit] if isinstance(item, Symbol)))
     for item in items[:limit]:
         if isinstance(item, Reference):
             lines.extend(_format_reference_item(item, indent=2))
         else:
-            lines.extend(_format_relation_item(repo, item, indent=2))
+            lines.extend(_format_relation_item(repo, item, indent=2, range_=ranges.get(item.id, item.range)))
     return lines
 
 
@@ -4214,11 +4227,12 @@ def _format_page_text(repo: CodeIndex, name: str, page: Page) -> str:
     if not page.items:
         lines.append("    []")
     else:
+        ranges = _result_definition_ranges(repo, (item for item in page.items if isinstance(item, Symbol)))
         for item in page.items:
             if isinstance(item, Reference):
                 lines.extend(_format_reference_item(item, indent=4))
             else:
-                lines.extend(_format_relation_item(repo, item, indent=4))
+                lines.extend(_format_relation_item(repo, item, indent=4, range_=ranges.get(item.id, item.range)))
     return "\n".join(lines) + "\n"
 
 
@@ -4294,8 +4308,9 @@ def _format_search_text(repo: CodeIndex, query: str | Iterable[str], page: Page)
     if not symbols:
         lines.append("  []")
         return "\n".join(lines) + "\n"
+    ranges = _result_definition_ranges(repo, symbols)
     for symbol in symbols:
-        range_ = _definition_range(repo, symbol) or symbol.range
+        range_ = ranges.get(symbol.id, symbol.range)
         lines.append(f"  - id: {_text_symbol_id(symbol, range_)}")
         lines.append(f"    name: {symbol.name}")
         lines.append(f"    kind: {symbol.kind}")
@@ -4370,7 +4385,7 @@ def _index_status(
         )
 
     try:
-        data = _read_index_metadata(index_path)
+        data = _read_index_metadata(index_path, include_files=check)
         pending_files: tuple[str, ...] = ()
         if check:
             pending_changes, pending_files = _pending_index_changes(
@@ -4413,7 +4428,7 @@ def _index_status(
     )
 
 
-def _read_index_metadata(db_path: Path) -> dict[str, Any]:
+def _read_index_metadata(db_path: Path, *, include_files: bool = True) -> dict[str, Any]:
     connection = sqlite3.connect(str(db_path))
     connection.row_factory = sqlite3.Row
     try:
@@ -4441,7 +4456,7 @@ def _read_index_metadata(db_path: Path) -> dict[str, Any]:
         ).fetchall()
         indexed_rows = connection.execute(
             "SELECT path, language, mtime_ns, size FROM files",
-        ).fetchall()
+        ).fetchall() if include_files else []
     finally:
         connection.close()
 
@@ -5411,7 +5426,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.json:
                 _print_cli_json(page)
             else:
-                print(repo.outline_text(args.path, symbol=args.symbol, max_symbols=args.max_symbols), end="")
+                print(_format_outline_text(repo, repo._relative_path(Path(args.path)), page, symbol=args.symbol), end="")
         else:
             parser.error(f"unknown command: {args.command}")
         return 0

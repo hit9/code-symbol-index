@@ -25,6 +25,12 @@ machine-readable response is better.
 This is syntactic code navigation, not a language server. It does not provide
 type-aware rename safety or full semantic call graph accuracy.
 
+Query optimizations keep the schema-5 symbol index unchanged. Reference queries
+still read current source files, but extract only the requested name and skip
+unrelated AST subtrees. They do not persist references or require an index
+rebuild. Filesystem scanning and candidate parsing still have a cost on large
+repositories. See [measured query and indexing results](benchmarks/REPORT.md).
+
 ## Install
 
 Install the CLI as a uv tool:

@@ -89,3 +89,51 @@ def test_named_query_keeps_pagination_and_live_source(tmp_path, limit, offset, k
     assert disk.refs("target", limit=limit, offset=offset, ref_kinds=kinds) == memory.refs(
         "target", limit=limit, offset=offset, ref_kinds=kinds
     )
+
+
+def test_text_results_parse_each_file_once(tmp_path):
+    (tmp_path / "app.py").write_text("".join(f"def target_{i}():\n    return {i}\n" for i in range(20)))
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    page = repo.search_page("target", limit=20)
+    for render in (
+        lambda: c._format_search_text(repo, "target", page),
+        lambda: c._format_page_text(repo, "implementations", page),
+        lambda: "\n".join(c._format_relation_section(repo, "members", page.items, 20)),
+    ):
+        with mock.patch.object(c, "_parse_source", wraps=c._parse_source) as parse:
+            output = render()
+        assert parse.call_count == 1
+        assert "target_19" in output
+    (tmp_path / "app.py").write_text("def target_0():\n    return 'changed'\n")
+    # There is no cache across renders/requests, even on the same Repository.
+    with mock.patch.object(c, "_parse_source", wraps=c._parse_source) as parse:
+        c._format_search_text(repo, "target", page)
+    assert parse.call_count == 1
+
+
+def test_cli_outline_queries_only_once(tmp_path, capsys):
+    (tmp_path / "app.py").write_text("class Target:\n    def method(self):\n        pass\n")
+    c.Repository(tmp_path, create_index=True).refresh()
+    original = c.Repository.outline
+    with mock.patch.object(c.Repository, "outline", autospec=True, side_effect=original) as outline:
+        assert c.main(["outline", "app.py", "--root", str(tmp_path), "--symbol", "Target"]) == 0
+    assert outline.call_count == 1
+    assert "method" in capsys.readouterr().out
+
+
+def test_status_loads_manifest_only_for_explicit_check(tmp_path):
+    (tmp_path / "app.py").write_text("def target():\n    pass\n")
+    c.Repository(tmp_path, create_index=True).refresh()
+    statements = []
+    connect = c.sqlite3.connect
+
+    def traced(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    with mock.patch.object(c.sqlite3, "connect", side_effect=traced):
+        assert c.status(root=tmp_path).status == "ready"
+        assert "SELECT path, language, mtime_ns, size FROM files" not in statements
+        c.status(root=tmp_path, check=True)
+        assert "SELECT path, language, mtime_ns, size FROM files" in statements

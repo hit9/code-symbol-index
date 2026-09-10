@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Reuse a per-source line-offset table instead of repeatedly scanning source
+  prefixes for positions. Symbol-only index/update skip reference context work.
+- Repository reference queries extract only the requested name and prune
+  unrelated AST subtrees. Results retain live-source and classification semantics;
+  the schema-5 symbol database and stored rows are unchanged, with no migration.
+- Batch same-file result ranges in search, inspect relation sections and impls
+  formatting. Text outline reuses its query result; ordinary status avoids loading
+  the complete file manifest. Explicit `status --check` still scans for changes.
+- Reproducible before/after CLI and write-cost measurements are documented in
+  `benchmarks/REPORT.md`. Small commands remain dominated by startup, and reference
+  queries still scan files; these changes do not make every command equally fast.
+
 ## 0.5.1 - 2026-08-17
 
 ### Changed

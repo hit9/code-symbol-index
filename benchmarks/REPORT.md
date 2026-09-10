@@ -62,3 +62,40 @@ a repeatable regression or an absolute no-regression guarantee on every machine.
 The query change adds no work to the write path. Large-file writes are faster
 and files/symbols/refs rows remain identical to master.
 
+
+## Step 3: batching, outline reuse and status summary
+
+182 tests passed. No index/update implementation changed in this step.
+The benchmark now imports the module and invokes main, matching the installed
+entry point and allowing warm bytecode caches. Earlier step-1/2 measurements
+executed the source script directly; do not compare their startup times as if
+the harness were identical. Both sides of every comparison use the same harness.
+
+Seven independent processes per command/variant; median milliseconds below.
+The fixture is the large four-file case unless labelled small. `impls target`
+has no implementors here; it measures the empty-result path only. `clean` and
+`install-skill` operate exclusively in the disposable benchmark directory.
+
+| Command | master ms | step 3 ms |
+| --- | ---: | ---: |
+| index_new | 249.40 | 158.16 |
+| index_no_change | 68.63 | 67.54 |
+| update_one | 197.99 | 105.61 |
+| update_two | 230.80 | 140.10 |
+| search | 235.61 | 80.76 |
+| inspect | 2461.96 | 195.10 |
+| refs | 1005.24 | 88.14 |
+| callers | 1118.52 | 126.79 |
+| callees | 1010.96 | 144.11 |
+| impls | 65.36 | 66.82 |
+| outline | 90.61 | 81.98 |
+| status | 65.42 | 64.59 |
+| status_check | 69.62 | 69.47 |
+| missing | 65.87 | 65.52 |
+| version | 65.15 | 65.18 |
+| languages | 64.22 | 64.60 |
+| clean | 63.97 | 65.07 |
+| install_skill | 63.77 | 65.64 |
+
+Reference/query-heavy cases improve; startup-dominated commands mostly remain
+unchanged at this step. No automatic stale warnings have been added.

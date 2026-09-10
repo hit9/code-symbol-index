@@ -20,7 +20,9 @@ from pathlib import Path
 
 def run(script: Path, args: list[str]) -> tuple[float, str]:
     started = time.perf_counter()
-    result = subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True, timeout=120)
+    # Match the installed entry point: import the module (warm .pyc), then main.
+    entry = "import sys; sys.path.insert(0, sys.argv[1]); import code_symbol_index as c; raise SystemExit(c.main(sys.argv[2:]))"
+    result = subprocess.run([sys.executable, "-c", entry, str(script.parent), *args], capture_output=True, text=True, timeout=120)
     elapsed = time.perf_counter() - started
     if result.returncode:
         raise RuntimeError(f"{args}: {result.stderr}")
@@ -47,11 +49,14 @@ def main() -> None:
     project = Path(__file__).resolve().parents[1]
     baseline = subprocess.check_output(["git", "show", f"{args.baseline}:code_symbol_index.py"], cwd=project)
     report = {"python": sys.version, "platform": platform.platform(), "baseline": args.baseline,
-              "samples": args.samples, "cache": "warm filesystem; independent CLI processes", "cases": {}}
+              "samples": args.samples, "cache": "warm filesystem and bytecode; independent import/main processes", "cases": {}}
     with tempfile.TemporaryDirectory(prefix="symbol-restart-bench-") as directory:
         temp = Path(directory)
-        scripts = {"before": temp / "before.py", "after": project / "code_symbol_index.py"}
+        (temp / "baseline").mkdir()
+        scripts = {"before": temp / "baseline" / "code_symbol_index.py", "after": project / "code_symbol_index.py"}
         scripts["before"].write_bytes(baseline)
+        for script in scripts.values():
+            run(script, ["version"])
         for size, count, functions in (("small", 16, 8), ("large", 4, 1000)):
             root = temp / size
             root.mkdir()
@@ -75,6 +80,9 @@ def main() -> None:
                 "impls": ["impls", "target"], "outline": ["outline", paths[0]],
                 "status": ["status"], "status_check": ["status", "--check"],
                 "missing": ["search", "no_such_symbol"], "version": ["version"],
+                "languages": ["languages"],
+                "clean": ["clean", "--root", str(root)],
+                "install_skill": ["install-skill", "--codex-home", str(temp / "skill-home")],
             }
             for name, command in cases.items():
                 if args.write_only and name not in ("index_new", "index_no_change", "update_one", "update_two"):
@@ -89,13 +97,21 @@ def main() -> None:
                         if name == "index_new":
                             for suffix in ("", "-wal", "-shm"):
                                 Path(str(db) + suffix).unlink(missing_ok=True)
-                        flags = [] if name == "version" else ["--root", str(root), "--db", str(db)]
+                        if name == "clean":
+                            cleanup = root / ".code-symbol-index"
+                            cleanup.mkdir(exist_ok=True)
+                            (cleanup / "disposable").write_text("temporary benchmark data")
+                        flags = [] if name in ("version", "languages", "clean", "install_skill") else ["--root", str(root), "--db", str(db)]
                         elapsed, output = run(scripts[key], command + flags)
                         times[key].append(elapsed)
                         outputs[key] = output
                 if name in ("index_new", "index_no_change", "update_one", "update_two"):
                     assert snapshot(databases["before"]) == snapshot(databases["after"]), (size, name)
-                elif name not in ("status", "status_check"):
+                elif name in ("status", "status_check"):
+                    stable = {key: [line for line in value.splitlines() if not line.startswith("updated_at:")]
+                              for key, value in outputs.items()}
+                    assert stable["before"] == stable["after"], (size, name)
+                else:
                     assert outputs["before"] == outputs["after"], (size, name, "output changed")
                 measurements = {key: {"p50_ms": statistics.median(values) * 1000,
                                       "max_ms": max(values) * 1000, "samples_ms": [v * 1000 for v in values]}
