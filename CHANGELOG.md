@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- CLI update checks: contact PyPI at most once every 7 days in a background thread
+  and hint at most once per interval on stderr when a newer stable release exists.
+  stdout stays clean; pre-release versions are ignored; failures are silent. Set
+  `CODE_SYMBOL_INDEX_NO_UPDATE_CHECK=1` to disable, or
+  `CODE_SYMBOL_INDEX_UPDATE_CACHE` to relocate the cache file.
+
 ## 0.5.4 - 2026-09-10
 
 ### Fixed

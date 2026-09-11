@@ -593,6 +593,16 @@ make smoke
 make clean
 ```
 
+## Update Checks
+
+The CLI contacts `pypi.org/pypi/code-symbol-index/json` at most once every 7 days to
+report a newer release on stderr; stdout stays clean. The check sends only a version
+query, runs in a background thread, and is silent when offline. To disable it:
+
+```bash
+export CODE_SYMBOL_INDEX_NO_UPDATE_CHECK=1
+```
+
 ## Python API List
 
 Index lifecycle:

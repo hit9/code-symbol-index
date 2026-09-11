@@ -532,6 +532,16 @@ uv pip install --python .venv/bin/python -e '.[dev]'
 uv run pytest
 ```
 
+## 更新检查
+
+CLI 每 7 天最多访问一次 `pypi.org/pypi/code-symbol-index/json`，发现新版本时在 stderr
+提示一行，stdout 保持纯净。检查只发送版本查询，在后台线程中执行，离线时静默。
+如需禁用：
+
+```bash
+export CODE_SYMBOL_INDEX_NO_UPDATE_CHECK=1
+```
+
 ## Python API 列表
 
 | 函数 | 返回 | 作用 |

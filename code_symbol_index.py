@@ -43,6 +43,12 @@ DEFAULT_MAX_MEMBERS = 80
 DEFAULT_MAX_CALLERS = 50
 DEFAULT_MAX_CALLEES = 50
 DEFAULT_MAX_REFERENCES = 50
+UPDATE_CHECK_INTERVAL_NS = 7 * 24 * 60 * 60 * 1_000_000_000
+UPDATE_CHECK_TIMEOUT_S = 2.0
+UPDATE_CHECK_JOIN_TIMEOUT_S = 1.0
+PYPI_JSON_URL = "https://pypi.org/pypi/code-symbol-index/json"
+UPDATE_CHECK_ENV_DISABLE = "CODE_SYMBOL_INDEX_NO_UPDATE_CHECK"
+UPDATE_CHECK_CACHE_ENV = "CODE_SYMBOL_INDEX_UPDATE_CACHE"
 DEFAULT_MAX_IMPLEMENTORS = 50
 DEFAULT_MAX_IMPORTS = 40
 DEFAULT_MAX_OUTLINE_SYMBOLS = 200
@@ -5711,7 +5717,117 @@ def _inspect_options_from_args(args: argparse.Namespace) -> InspectOptions:
     )
 
 
+def _update_check_cache_path() -> Path:
+    """Cache file for the update check, in the user's platform cache directory."""
+    override = os.environ.get(UPDATE_CHECK_CACHE_ENV)
+    if override:
+        return Path(override)
+    if sys.platform == "darwin":
+        base = Path("~/Library/Caches").expanduser()
+    elif os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", "~/.cache")).expanduser()
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
+    return base / "code-symbol-index" / "update-check.json"
+
+
+def _read_update_check_cache(path: Path) -> dict:
+    """Read the cached update-check state; missing or corrupt files count as empty."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_update_check_cache(path: Path, data: dict) -> None:
+    """Best-effort atomic write of the update-check state; failures are ignored."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        temp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(temp, path)
+    except OSError:
+        pass
+
+
+def _fetch_latest_version() -> str | None:
+    """Fetch the latest stable version from PyPI, or None on any failure."""
+    import urllib.request
+
+    request = urllib.request.Request(PYPI_JSON_URL, headers={"User-Agent": f"code-symbol-index/{__version__}"})
+    try:
+        with urllib.request.urlopen(request, timeout=UPDATE_CHECK_TIMEOUT_S) as response:
+            payload = json.loads(response.read())
+        version = payload["info"]["version"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return version if isinstance(version, str) and version else None
+
+
+def _is_newer_release(latest: str, current: str) -> bool:
+    """True when `latest` is a newer stable release than `current` (pre-releases ignored)."""
+    def parse(version: str) -> tuple[int, ...] | None:
+        parts = version.split(".")
+        if len(parts) > 4 or not all(part.isdigit() for part in parts):
+            return None  # pre-release or malformed; never suggest an upgrade to it
+        return tuple(int(part) for part in parts)
+
+    latest_parts = parse(latest)
+    current_parts = parse(current)
+    if latest_parts is None or current_parts is None:
+        return False
+    return latest_parts > current_parts
+
+
+class _UpdateCheck:
+    """Background PyPI check that hints once per interval on stderr."""
+
+    def __init__(self, state: dict, thread: threading.Thread | None = None) -> None:
+        self._state = state
+        self._thread = thread
+
+    @classmethod
+    def start(cls) -> _UpdateCheck | None:
+        """Start a check unless disabled or already done for this interval."""
+        if os.environ.get(UPDATE_CHECK_ENV_DISABLE):
+            return None
+        state = _read_update_check_cache(_update_check_cache_path())
+        if time_ns() - state.get("last_check_ns", 0) < UPDATE_CHECK_INTERVAL_NS:
+            if state.get("hint_emitted"):
+                return None
+            return cls(state)  # hint is due but was never shown; no network needed
+        check = cls(state)
+        check._thread = threading.Thread(target=check._run, daemon=True, name="code-symbol-index-update")
+        check._thread.start()
+        return check
+
+    def _run(self) -> None:
+        self._state = {
+            "last_check_ns": time_ns(),
+            "latest_version": _fetch_latest_version(),
+        }
+        _write_update_check_cache(_update_check_cache_path(), self._state)
+
+    def emit(self) -> None:
+        """Wait briefly for the check and print the hint on stderr if due."""
+        if self._thread is not None:
+            self._thread.join(timeout=UPDATE_CHECK_JOIN_TIMEOUT_S)
+        if self._thread is not None and self._thread.is_alive():
+            return  # check unfinished; the next run retries within this interval
+        version = self._state.get("latest_version")
+        if not isinstance(version, str) or not _is_newer_release(version, __version__):
+            return
+        self._state["hint_emitted"] = True
+        _write_update_check_cache(_update_check_cache_path(), self._state)
+        sys.stderr.write(
+            f"note: code-symbol-index {version} is available (installed {__version__}); "
+            "upgrade: uv tool upgrade code-symbol-index\n"
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
+    update_check = _UpdateCheck.start()
     try:
         raw_args = list(sys.argv[1:] if argv is None else argv)
         if raw_args == ["version"]:
@@ -5906,6 +6022,9 @@ def main(argv: list[str] | None = None) -> int:
     except SymbolNotFoundError as exc:
         sys.stderr.write(f"{exc}; narrow with --path/--kind/--exact-only\n")
         return 2
+    finally:
+        if update_check is not None:
+            update_check.emit()
 
 
 __all__ = [
