@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from code_symbol_index import CodeIndex
+from code_symbol_index import CodeIndex, SymbolNotFoundError
 
 
 def _symbols(index: CodeIndex, language: str):
@@ -389,3 +389,111 @@ def test_kotlin_destructuring_skips_placeholder_and_locals(tmp_path: Path) -> No
     symbols = _symbols(index, "kotlin")
     assert symbols["destructured_one"].signature == "val (destructured_one, destructured_two) = pair"
     assert symbols["destructured_one"].range.start_byte != symbols["destructured_two"].range.start_byte
+
+
+RUST_DECLARATIONS = (
+    "trait Greeter {\n"
+    "    fn greet(&self) -> u32;\n"
+    "    fn provided(&self) -> u32 { 1 }\n"
+    "    type Item;\n"
+    "}\n"
+    "\n"
+    "extern \"C\" {\n"
+    "    fn ffi_helper(value: u32) -> u32;\n"
+    "}\n"
+    "\n"
+    "struct Person;\n"
+    "\n"
+    "impl Greeter for Person {\n"
+    "    fn greet(&self) -> u32 { 2 }\n"
+    "}\n"
+    "\n"
+    "fn user() -> u32 {\n"
+    "    ffi_helper(1)\n"
+    "}\n"
+)
+
+
+def test_rust_bodyless_function_declarations_are_indexed(tmp_path: Path) -> None:
+    (tmp_path / "lib.rs").write_text(RUST_DECLARATIONS, encoding="utf-8")
+    index = CodeIndex(tmp_path).build()
+
+    greets = index.search_symbols("greet", language="rust", exact_only=True)
+    assert sorted((symbol.kind, symbol.container) for symbol in greets) == [
+        ("function", "Greeter"),
+        ("function", "Person"),
+    ]
+    # The declaration keeps its own position and preview inside the trait.
+    declaration = next(symbol for symbol in greets if symbol.container == "Greeter")
+    assert declaration.signature == "fn greet(&self) -> u32;"
+    symbols = _symbols(index, "rust")
+    assert (symbols["provided"].kind, symbols["provided"].container) == ("function", "Greeter")
+    assert (symbols["ffi_helper"].kind, symbols["ffi_helper"].container) == ("function", None)
+    # Associated types are part of the untested acceptance matrix, not indexed.
+    assert index.search_symbols("Item", language="rust", exact_only=True) == []
+
+
+def test_rust_declaration_does_not_hide_the_definition(tmp_path: Path) -> None:
+    (tmp_path / "lib.rs").write_text(RUST_DECLARATIONS, encoding="utf-8")
+    index = CodeIndex(tmp_path).build()
+
+    # Navigation prefers the implementation that has a body.
+    assert index.inspect("greet", language="rust", exact_only=True).definition.container == "Person"
+    # A declaration without any definition stays the only target and is used by
+    # the call graph.
+    assert [node.symbol.name for node in index.callees("user", language="rust").roots] == ["ffi_helper"]
+
+
+RUST_SHARED_NAME = (
+    "trait Mixed {\n"
+    "    fn mixed(value: u32) -> u32;\n"
+    "}\n"
+    "\n"
+    "fn mixed(value: u32) -> u32 { value }\n"
+    "\n"
+    "fn user() -> u32 {\n"
+    "    mixed(1)\n"
+    "}\n"
+)
+
+
+def test_rust_declaration_does_not_steal_an_existing_call_target(tmp_path: Path) -> None:
+    (tmp_path / "lib.rs").write_text(RUST_SHARED_NAME, encoding="utf-8")
+    index = CodeIndex(tmp_path).build()
+
+    # Case-insensitive search finds the trait as well as both declarations.
+    assert {(symbol.name, symbol.container) for symbol in index.search_symbols(
+        "mixed", language="rust", exact_only=True
+    )} == {("Mixed", None), ("mixed", "Mixed"), ("mixed", None)}
+    # The call still resolves to the definition, not to the new declaration.
+    assert [(node.symbol.container, node.depth) for node in index.callees("user", language="rust").roots] == [
+        (None, 1)
+    ]
+    assert [node.symbol.name for node in index.callers("mixed", language="rust", exact_only=True).roots] == ["user"]
+    assert index.inspect("mixed", language="rust", exact_only=True).definition.container is None
+
+
+def test_rust_two_definitions_stay_ambiguous(tmp_path: Path) -> None:
+    (tmp_path / "lib.rs").write_text(
+        "trait Dup {\n"
+        "    fn dup() -> u32;\n"
+        "}\n"
+        "\n"
+        "struct A;\n"
+        "struct B;\n"
+        "\n"
+        "impl A {\n"
+        "    fn dup() -> u32 { 1 }\n"
+        "}\n"
+        "\n"
+        "impl B {\n"
+        "    fn dup() -> u32 { 2 }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(tmp_path).build()
+
+    with pytest.raises(SymbolNotFoundError):
+        index.inspect("dup", language="rust", exact_only=True)
+    with pytest.raises(SymbolNotFoundError):
+        index.callers("dup", language="rust", exact_only=True)

@@ -39,6 +39,7 @@ EXTRACTOR_REVISIONS: dict[str, str] = {
     "javascript": "javascript:1",
     "kotlin": "kotlin:2",
     "python": "python:1",
+    "rust": "rust:1",
     "swift": "swift:1",
     "tsx": "tsx:1",
     "typescript": "typescript:1",
@@ -763,6 +764,10 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "const_item": "constant",
             "enum_item": "enum",
             "function_item": "function",
+            # A trait or extern block declares a function without a body; the
+            # declaration stays a symbol so the name is findable where it is
+            # declared, and definition preference keeps the body the call target.
+            "function_signature_item": "function",
             "impl_item": "impl",
             "mod_item": "module",
             "static_item": "variable",
@@ -5149,14 +5154,17 @@ def _resolve_inspect_symbol(
     if not candidates:
         raise SymbolNotFoundError(f"No symbol matched: {query}")
     if len(candidates) > 1:
-        # Same name and scope, but one of them has a body: the definition is the
-        # navigation target. Anything else stays ambiguous rather than guessing.
-        scopes = {(candidate.name, candidate.container) for candidate in candidates}
-        if len(scopes) == 1:
-            defined = _defined_symbol_ids(repo, candidates)
-            preferred = [candidate for candidate in candidates if candidate.id in defined]
-            if len(preferred) == 1:
-                return preferred[0]
+        # One candidate has a body and the others are declarations: the definition
+        # is the navigation target. Scopes are deliberately not compared here,
+        # because a declaration and its definition legitimately live in different
+        # scopes (a Rust trait method versus its impl, a Swift protocol member
+        # versus its conformance), and indexing the declaration must not hide a
+        # target that used to resolve. Anything less clear-cut stays ambiguous
+        # rather than guessing between two definitions.
+        defined = _defined_symbol_ids(repo, candidates)
+        preferred = [candidate for candidate in candidates if candidate.id in defined]
+        if len(preferred) == 1:
+            return preferred[0]
         raise SymbolNotFoundError(f"Ambiguous symbol: {query}")
     return candidates[0]
 
