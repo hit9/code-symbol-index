@@ -1396,7 +1396,7 @@ def test_cli_status_defaults_to_text_and_supports_json(tmp_path: Path, capsys) -
 
 
 def test_cli_keyboard_interrupt_returns_130(monkeypatch, capsys) -> None:
-    def interrupt(self: Repository) -> Repository:
+    def interrupt(self: Repository, **kwargs: object) -> Repository:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(Repository, "refresh", interrupt)

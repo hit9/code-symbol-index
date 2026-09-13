@@ -27,6 +27,24 @@ if TYPE_CHECKING:
 
 __version__ = "0.5.5"
 SCHEMA_VERSION = 5
+
+# Extraction-rule revisions: one entry per language whose *persisted* symbols or
+# references changed in this release. Values are code constants, not program
+# versions, and languages that did not change stay absent so they are never
+# re-parsed for rules. A nullable ``files.extractor_revision`` column records the
+# value each indexed file was written with.
+EXTRACTOR_REVISIONS: dict[str, str] = {
+    "c": "c:1",
+    "cpp": "cpp:1",
+}
+# C/C++ header files are the one extension whose language is ambiguous. The
+# default stays C (unchanged behaviour); ``c_header_language`` in the meta table
+# records the language future writes use, and every read uses the language the
+# file's own row was written with.
+HEADER_LANGUAGE_META = "c_header_language"
+HEADER_LANGUAGES: tuple[str, ...] = ("c", "cpp")
+DEFAULT_HEADER_LANGUAGE = "c"
+HEADER_EXTENSION = ".h"
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
 TEXT_SAMPLE_BYTES = 8192
@@ -525,6 +543,9 @@ class _IndexedFile:
     # extracted (``reference_name`` path) or when the grammar has no known
     # function body nodes.
     bodies: tuple[_CallableBody, ...] = ()
+    # Extraction-rule revision this file was parsed with; ``None`` for languages
+    # without registered rules and for rows written before the column existed.
+    revision: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -564,6 +585,10 @@ class IndexNotFoundError(CodeSymbolIndexError):
 
 class BinaryFileError(CodeSymbolIndexError):
     """Raised when a file does not look like text."""
+
+
+class HeaderLanguageError(CodeSymbolIndexError):
+    """Raised when a header-language change cannot be applied consistently."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -933,11 +958,19 @@ class CodeIndex:
         exclude: Iterable[str] | None = None,
         db_path: str | Path | None = None,
         create_storage: bool = True,
+        header_language: str | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         self.languages = _normalize_languages(languages)
+        # Language used for ``.h`` files on the next write pass. ``None`` means the
+        # default (C); a persisted ``Repository`` overrides it from meta.
+        self.header_language = _validate_header_language(header_language)
+        self._language_cache: dict[str, str | None] | None = None
         self.include = tuple(include or ())
         self.exclude = tuple(DEFAULT_EXCLUDES) + tuple(exclude or ())
+        # A narrowed scan cannot speak for files it never walked, so a filter and a
+        # header-language change are refused together instead of half-converted.
+        self.filtered_scan = bool(languages) or bool(include) or bool(exclude)
         self._exclude_matcher = _compile_path_patterns(self.exclude)
         self.storage = _Storage(db_path, create=create_storage)
         # Gitignore specs in force for a directory, keyed by its posix prefix
@@ -946,7 +979,9 @@ class CodeIndex:
         # hit and a match tests only the path's own ancestors.
         self._gitignore_specs: dict[str, tuple[tuple[str, str, pathspec.PathSpec], ...]] = {}
 
-    def build(self) -> CodeIndex:
+    def build(self, *, header_language: str | None = None) -> CodeIndex:
+        if header_language is not None:
+            self.header_language = _validate_header_language(header_language)
         self.storage.clear()
         self._index_files(self._iter_indexable_files())
         return self
@@ -1257,10 +1292,53 @@ class CodeIndex:
             self._index_file(relative_path)
 
     def _index_file(self, relative_path: Path) -> None:
-        indexed = _parse_file(self.root, relative_path, self.languages)
+        indexed = _parse_file(
+            self.root,
+            relative_path,
+            self.languages,
+            header_language=self.write_header_language(),
+        )
         if indexed is None:
             return
         self.storage.insert_file_result(indexed)
+
+    def write_header_language(self) -> str | None:
+        """Language future writes use for ``.h`` files (``None`` = default C)."""
+        return self.header_language
+
+    def _write_spec(self, path: Path) -> LanguageSpec | None:
+        """Language to parse ``path`` with on this write pass."""
+        return _spec_for_path(path, self.languages, self.write_header_language())
+
+    def _stored_language(self, relative_path: Path) -> str | None:
+        """Language an already-indexed file was written with.
+
+        Reads must use the file's own language, never the pending write setting,
+        so a half-converted index still parses each file the way it was stored.
+        Look-ups are cached for one request; misses are one indexed row each.
+        """
+        cache = self._language_cache
+        if cache is None:
+            cache = {}
+            self._language_cache = cache
+        key = relative_path.as_posix()
+        if key not in cache:
+            stored = self.storage.file_languages([key])
+            cache[key] = stored.get(key)
+        return cache[key]
+
+    def _stored_spec(self, relative_path: Path) -> LanguageSpec | None:
+        stored = self._stored_language(relative_path)
+        if stored is not None:
+            spec = LANGUAGE_BY_NAME.get(stored)
+            if spec is not None:
+                try:
+                    _parser_for_language(spec.name)
+                except UnsupportedLanguageError:
+                    spec = None
+                if spec is not None:
+                    return spec
+        return self._write_spec(relative_path)
 
 
     def _iter_indexable_files(self) -> Iterable[Path]:
@@ -1298,7 +1376,7 @@ class CodeIndex:
     ) -> bool:
         # Extension first: it is the cheapest and most selective test, so most
         # files never reach the pattern and gitignore matching below.
-        if _spec_for_extension(_extension_of(path_text), self.languages) is None:
+        if _spec_for_extension(_extension_of(path_text), self.languages, self.write_header_language()) is None:
             return False
         if self.include and not any(fnmatch.fnmatch(path_text, pattern) for pattern in self.include):
             return False
@@ -1413,13 +1491,53 @@ class Repository(CodeIndex):
             create_storage=create_index,
         )
         self.progress = progress
+        # Outcome of the last ``update(paths)`` call, for command reporting: paths
+        # whose new symbols were written, and paths whose previous rows were kept
+        # because the file could not be read or parsed.
+        self.last_update_updated: tuple[str, ...] = ()
+        self.last_update_failed: tuple[str, ...] = ()
+        # (header language, converted, pending) of the last refresh.
+        self.last_header_language: tuple[str, int, int] = (DEFAULT_HEADER_LANGUAGE, 0, 0)
 
-    def refresh(self, *, progress: Any = _DEFAULT_PROGRESS) -> Repository:
+    def write_header_language(self) -> str | None:
+        """Header language saved for future writes, defaulting to C."""
+        if self.header_language is None:
+            self.header_language = self.storage.meta_value(HEADER_LANGUAGE_META) or DEFAULT_HEADER_LANGUAGE
+        return self.header_language
+
+    def _write_revision(self, path: Path) -> str | None:
+        """Extraction-rule revision this scan would write for ``path``."""
+        spec = self._write_spec(path)
+        return EXTRACTOR_REVISIONS.get(spec.name) if spec is not None else None
+
+    def _scan_covers_language(self, language: str) -> bool:
+        """Whether this scan's language filter covers existing rows of ``language``.
+
+        A language-filtered refresh knows nothing about files it never walked, so
+        it must not turn its own narrow file set into whole-database deletions.
+        """
+        return self.languages is None or language in self.languages
+
+    def refresh(self, *, progress: Any = _DEFAULT_PROGRESS, header_language: str | None = None) -> Repository:
         git_before = _git_state(self.root)
         self._gitignore_specs.clear()
         progress_callback = self.progress if progress is _DEFAULT_PROGRESS else progress
         if self.storage.schema_version() != SCHEMA_VERSION:
             self.storage.reset_schema()
+
+        target = _validate_header_language(header_language)
+        stored_header = self.storage.meta_value(HEADER_LANGUAGE_META)
+        effective_header = target if target is not None else (stored_header or DEFAULT_HEADER_LANGUAGE)
+        if target is not None and target != (stored_header or DEFAULT_HEADER_LANGUAGE):
+            if self.filtered_scan:
+                raise HeaderLanguageError(
+                    "changing the header language requires an unfiltered refresh: rerun index "
+                    "without --language/--include/--exclude so every header file is converted"
+                )
+            # Saved as the language of future writes, not as a completion marker:
+            # files that fail keep their own language and are retried next time.
+            self.storage.set_meta_value(HEADER_LANGUAGE_META, target)
+        self.header_language = effective_header
 
         _emit_progress(progress_callback, "scan", done=0, total=0)
         current_files: dict[str, tuple[Path, os.stat_result]] = {}
@@ -1432,17 +1550,34 @@ class Repository(CodeIndex):
             current_files[path.as_posix()] = (path, stat)
 
         indexed_files = self.storage.files()
-        deleted = [Path(path) for path in indexed_files if path not in current_files]
+        # Only rows whose language this scan actually covers may be inferred
+        # deleted: a filtered refresh says nothing about other languages.
+        deleted = [
+            Path(path)
+            for path in indexed_files
+            if path not in current_files and self._scan_covers_language(indexed_files[path]["language"])
+        ]
 
         to_index: list[Path] = []
         to_summarize: list[tuple[Path, os.stat_result]] = []
+        rule_upgrades = 0
         for path_text, (path, stat) in current_files.items():
             old = indexed_files.get(path_text)
-            if old is not None and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size:
-                if not _name_summary_current(old["summary_header"], stat):
-                    to_summarize.append((path, stat))
+            revision = self._write_revision(path)
+            needs_rules = revision is not None and (old is None or old["extractor_revision"] != revision)
+            metadata_changed = old is None or old["mtime_ns"] != stat.st_mtime_ns or old["size"] != stat.st_size
+            if old is not None and needs_rules and not metadata_changed:
+                # Unchanged file whose persisted extraction rules moved: one-time
+                # re-parse, counted and reported separately from normal work.
+                rule_upgrades += 1
+            if metadata_changed or needs_rules:
+                to_index.append(path)
                 continue
-            to_index.append(path)
+            if not _name_summary_current(old["summary_header"], stat):
+                to_summarize.append((path, stat))
+
+        if rule_upgrades:
+            _emit_progress(progress_callback, "upgrade", done=0, total=rule_upgrades)
 
         summary_updates: list[tuple[bytes, str]] = []
         if to_summarize:
@@ -1464,7 +1599,9 @@ class Repository(CodeIndex):
 
         total = len(to_index)
         _emit_progress(progress_callback, "start", done=0, total=total)
-        indexed_results = self._parse_files(to_index, include_references=False, progress=progress_callback)
+        indexed_results = self._parse_files(
+            to_index, include_references=False, progress=progress_callback, header_language=effective_header
+        )
         self.storage.replace_files(
             deleted_paths=deleted,
             summary_updates=summary_updates,
@@ -1473,8 +1610,33 @@ class Repository(CodeIndex):
             schema_version=SCHEMA_VERSION,
             git_baseline=_git_baseline(self.root, git_before),
         )
+        self._record_header_language_outcome(indexed_results, current_files, indexed_files, effective_header)
         _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total)
         return self
+
+    def _record_header_language_outcome(
+        self,
+        indexed_results: list[_IndexedFile],
+        current_files: dict[str, tuple[Path, os.stat_result]],
+        indexed_files: dict[str, sqlite3.Row],
+        effective_header: str,
+    ) -> None:
+        """Note how many stored header files actually moved to the new language.
+
+        The meta value already means "future writes", so a partial conversion must
+        be reportable: callers compare converted with pending and say so instead
+        of claiming the whole index was converted.
+        """
+        published = {indexed_file.path for indexed_file in indexed_results}
+        pending = [
+            path
+            for path, (relative_path, _stat) in current_files.items()
+            if relative_path.suffix.lower() == HEADER_EXTENSION
+            and path in indexed_files
+            and indexed_files[path]["language"] != effective_header
+        ]
+        converted = sum(1 for path in pending if Path(path) in published)
+        self.last_header_language = (effective_header, converted, len(pending))
 
     def build(self, *, progress: Any = _DEFAULT_PROGRESS) -> Repository:
         git_before = _git_state(self.root)
@@ -1484,7 +1646,9 @@ class Repository(CodeIndex):
         paths = list(self._iter_indexable_files())
         total = len(paths)
         _emit_progress(progress_callback, "start", done=0, total=total)
-        indexed_results = self._parse_files(paths, include_references=False, progress=progress_callback)
+        indexed_results = self._parse_files(
+            paths, include_references=False, progress=progress_callback, header_language=self.write_header_language()
+        )
         self.storage.replace_files(
             deleted_paths=(),
             indexed_files=indexed_results,
@@ -1516,13 +1680,28 @@ class Repository(CodeIndex):
         ]
         total = len(to_index)
         _emit_progress(progress_callback, "start", done=0, total=total)
-        indexed_results = self._parse_files(to_index, include_references=False, progress=progress_callback)
+        indexed_results = self._parse_files(
+            to_index,
+            include_references=False,
+            progress=progress_callback,
+            header_language=self.write_header_language(),
+        )
+        published = {indexed_file.path for indexed_file in indexed_results}
+        # Deletion candidates are only the requested paths that are gone or no
+        # longer indexable. A file that still exists but failed to read or parse
+        # keeps its previous rows and revision instead of losing them here.
+        requested = set(to_index)
+        removed = [path for path in relative_paths if path not in requested]
         self.storage.replace_files(
-            deleted_paths=relative_paths,
+            deleted_paths=removed,
             indexed_files=indexed_results,
             progress=getattr(progress_callback, "_storage_progress", None),
             schema_version=SCHEMA_VERSION,
         )
+        self.last_update_updated = tuple(
+            path.as_posix() for path in to_index if path in published
+        )
+        self.last_update_failed = tuple(path.as_posix() for path in to_index if path not in published)
         _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total)
         return self
 
@@ -1532,6 +1711,7 @@ class Repository(CodeIndex):
         *,
         include_references: bool = True,
         progress: Any | None = None,
+        header_language: str | None = None,
     ) -> list[_IndexedFile]:
         if not paths:
             return []
@@ -1550,7 +1730,13 @@ class Repository(CodeIndex):
         if serial:
             results = []
             for done, path in enumerate(paths, start=1):
-                result = _parse_file(self.root, path, self.languages, include_references=include_references)
+                result = _parse_file(
+                    self.root,
+                    path,
+                    self.languages,
+                    include_references=include_references,
+                    header_language=header_language,
+                )
                 if result is not None:
                     results.append(result)
                 _emit_progress(progress, "file", done=done, total=len(paths), path=path.as_posix())
@@ -1563,7 +1749,10 @@ class Repository(CodeIndex):
         executor = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
         try:
             future_to_path = {
-                executor.submit(_parse_file, self.root, path, self.languages, include_references): path
+                executor.submit(
+                    _parse_file, self.root, path, self.languages, include_references,
+                    header_language=header_language,
+                ): path
                 for path in paths
             }
             for done, future in enumerate(concurrent.futures.as_completed(future_to_path), start=1):
@@ -1656,7 +1845,13 @@ class Repository(CodeIndex):
         for path in paths:
             if not self._name_filter.may_contain(path, (needle,)) or not _file_contains_bytes(self.root / path, needle):
                 continue
-            indexed_file = _parse_file(self.root, path, self.languages, reference_name=symbol.name)
+            indexed_file = _parse_file(
+                self.root,
+                path,
+                self.languages,
+                reference_name=symbol.name,
+                language=self._stored_language(path),
+            )
             if indexed_file is None:
                 continue
             for reference in indexed_file.references:
@@ -2185,16 +2380,56 @@ class _Storage:
             self.connection.execute("DELETE FROM files")
 
     def files(self) -> dict[str, sqlite3.Row]:
+        """Stored file rows, tolerating any older column layout.
+
+        Readers never migrate: the base four columns always exist, while
+        ``name_summary`` and ``extractor_revision`` are optional additive
+        capabilities. Each is selected independently, so a database missing one of
+        them still reports the other instead of degrading to no capabilities.
+        """
+        columns = self._file_columns()
+        summary_select = (
+            "name_summary IS NOT NULL AS has_summary, substr(name_summary, 1, 41) AS summary_header"
+            if "name_summary" in columns
+            else "0 AS has_summary, NULL AS summary_header"
+        )
+        revision_select = "extractor_revision" if "extractor_revision" in columns else "NULL AS extractor_revision"
         try:
             rows = self.connection.execute(
-                "SELECT path, language, mtime_ns, size, name_summary IS NOT NULL AS has_summary, "
-                "substr(name_summary, 1, 41) AS summary_header FROM files",
+                f"SELECT path, language, mtime_ns, size, {summary_select}, {revision_select} FROM files",
             ).fetchall()
         except sqlite3.OperationalError:
-            rows = self.connection.execute(
-                "SELECT path, language, mtime_ns, size, 0 AS has_summary, NULL AS summary_header FROM files",
-            ).fetchall()
+            return {}
         return {row["path"]: row for row in rows}
+
+    def _file_columns(self) -> set[str]:
+        return {row[1] for row in self.connection.execute("PRAGMA table_info(files)")}
+
+    def file_languages(self, paths: Iterable[str]) -> dict[str, str]:
+        """Stored language per path, for the paths that have a row."""
+        wanted = list(dict.fromkeys(paths))
+        languages: dict[str, str] = {}
+        for chunk in _chunks(wanted, SQLITE_BATCH_SIZE):
+            placeholders = ", ".join("?" * len(chunk))
+            rows = self.connection.execute(
+                f"SELECT path, language FROM files WHERE path IN ({placeholders})", chunk
+            ).fetchall()
+            languages.update({row["path"]: row["language"] for row in rows})
+        return languages
+
+    def meta_value(self, key: str) -> str | None:
+        try:
+            row = self.connection.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return row["value"] if row is not None else None
+
+    def set_meta_value(self, key: str, value: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                (key, value),
+            )
 
     def schema_version(self) -> int | None:
         try:
@@ -2234,15 +2469,17 @@ class _Storage:
         size: int,
         symbols: Iterable[Symbol],
         references: Iterable[Reference],
+        revision: str | None = None,
     ) -> None:
         symbols = list(symbols)
+        self._ensure_file_columns()
         with self.connection:
             self.connection.execute(
                 """
-                INSERT OR REPLACE INTO files(path, language, mtime_ns, size)
-                VALUES (?, ?, ?, ?)
+                INSERT OR REPLACE INTO files(path, language, mtime_ns, size, extractor_revision)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (path.as_posix(), language, mtime_ns, size),
+                (path.as_posix(), language, mtime_ns, size, revision),
             )
             self.connection.executemany(
                 """
@@ -2285,7 +2522,26 @@ class _Storage:
             size=indexed_file.size,
             symbols=indexed_file.symbols,
             references=indexed_file.references,
+            revision=indexed_file.revision,
         )
+
+    def _ensure_file_columns(self) -> None:
+        """Add the optional, nullable ``files`` columns when they are missing.
+
+        Additive and on-demand: an old index is still readable without this, and
+        no read path calls it. Older writers use explicit column lists and turn
+        their values back into NULL, which is exactly what the revision check
+        detects. Downgraded semantics are not guaranteed.
+        """
+        columns = self._file_columns()
+        additions = (
+            ("name_summary", "BLOB"),
+            ("extractor_revision", "TEXT"),
+        )
+        with self.connection:
+            for column, column_type in additions:
+                if column not in columns:
+                    self.connection.execute(f"ALTER TABLE files ADD COLUMN {column} {column_type}")
 
     def replace_files(
         self,
@@ -2297,10 +2553,9 @@ class _Storage:
         git_baseline: str | None = None,
         summary_updates: Iterable[tuple[bytes, str]] = (),
     ) -> None:
-        # Nullable, additive schema-5 capability: no row rewrite or backfill.
+        # Nullable, additive schema-5 capabilities: no row rewrite or backfill.
         # Older writers use explicit columns and replace summaries with NULL.
-        if not any(row[1] == "name_summary" for row in self.connection.execute("PRAGMA table_info(files)")):
-            self.connection.execute("ALTER TABLE files ADD COLUMN name_summary BLOB")
+        self._ensure_file_columns()
         indexed_files = list(indexed_files)
         deleted_paths = list(deleted_paths)
         symbol_count = sum(len(indexed_file.symbols) for indexed_file in indexed_files)
@@ -2326,6 +2581,7 @@ class _Storage:
                     indexed_file.mtime_ns,
                     indexed_file.size,
                     indexed_file.name_summary,
+                    indexed_file.revision,
                 )
                 for indexed_file in file_chunk
             ]
@@ -2347,8 +2603,8 @@ class _Storage:
                 )
                 self.connection.executemany(
                     """
-                    INSERT OR REPLACE INTO files(path, language, mtime_ns, size, name_summary)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO files(path, language, mtime_ns, size, name_summary, extractor_revision)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     file_rows,
                 )
@@ -2899,12 +3155,23 @@ def _path_filter_clause(column: str, path: str | Path | Iterable[str | Path] | N
     return "(" + " OR ".join(clauses) + ")", params
 
 
-def _spec_for_path(path: Path, languages: set[str] | None = None) -> LanguageSpec | None:
-    return _spec_for_extension(path.suffix.lower(), languages)
+def _spec_for_path(
+    path: Path,
+    languages: set[str] | None = None,
+    header_language: str | None = None,
+) -> LanguageSpec | None:
+    return _spec_for_extension(path.suffix.lower(), languages, header_language)
 
 
-def _spec_for_extension(extension: str, languages: set[str] | None = None) -> LanguageSpec | None:
-    spec = LANGUAGE_BY_EXTENSION.get(extension)
+def _spec_for_extension(
+    extension: str,
+    languages: set[str] | None = None,
+    header_language: str | None = None,
+) -> LanguageSpec | None:
+    if header_language is not None and extension == HEADER_EXTENSION:
+        spec = LANGUAGE_BY_NAME.get(header_language)
+    else:
+        spec = LANGUAGE_BY_EXTENSION.get(extension)
     if spec is None:
         return None
     if languages is not None and spec.name not in languages:
@@ -2914,6 +3181,32 @@ def _spec_for_extension(extension: str, languages: set[str] | None = None) -> La
     except UnsupportedLanguageError:
         return None
     return spec
+
+
+def _validate_header_language(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value not in HEADER_LANGUAGES:
+        raise ValueError(f"header language must be one of: {', '.join(HEADER_LANGUAGES)}")
+    return value
+
+
+def _file_spec(repo: CodeIndex, path: Path) -> LanguageSpec | None:
+    """Language to parse an already-indexed file with.
+
+    Reads follow the language the file's own row was written with, so a header
+    conversion that is still in progress parses each file the way it was stored
+    instead of with today's pending setting.
+    """
+    resolver = getattr(repo, "_stored_spec", None)
+    if resolver is not None:
+        return resolver(path)
+    return _spec_for_path(path, getattr(repo, "languages", None))
+
+
+def _file_language(repo: CodeIndex, path: Path) -> str | None:
+    resolver = getattr(repo, "_stored_language", None)
+    return resolver(path) if resolver is not None else None
 
 
 def _name_summary_current(header: bytes | None, stat: os.stat_result) -> bool:
@@ -3038,9 +3331,21 @@ def _parse_file(
     include_references: bool = True,
     *,
     reference_name: str | frozenset[str] | None = None,
+    language: str | None = None,
+    header_language: str | None = None,
 ) -> _IndexedFile | None:
     full_path = root / relative_path
-    spec = _spec_for_path(relative_path, languages)
+    spec = None
+    if language is not None:
+        candidate = LANGUAGE_BY_NAME.get(language)
+        if candidate is not None:
+            try:
+                _parser_for_language(candidate.name)
+            except UnsupportedLanguageError:
+                candidate = None
+            spec = candidate
+    if spec is None:
+        spec = _spec_for_path(relative_path, languages, header_language)
     if spec is None:
         return None
 
@@ -3075,6 +3380,7 @@ def _parse_file(
         references=tuple(references),
         bodies=tuple(bodies),
         name_summary=_file_name_summary(source_bytes, stat) if not include_references else None,
+        revision=EXTRACTOR_REVISIONS.get(spec.name),
     )
 
 
@@ -4714,7 +5020,13 @@ def _direct_callers_batch(repo: Repository, symbols: list[Symbol], *, limit: int
         for path in repo.storage.file_paths(language=language):
             if not name_filter.may_contain(path, needles) or not _file_contains_pattern(repo.root / path, pattern, overlap):
                 continue
-            indexed = _parse_file(repo.root, path, repo.languages, reference_name=names)
+            indexed = _parse_file(
+                repo.root,
+                path,
+                repo.languages,
+                reference_name=names,
+                language=repo._stored_language(path),
+            )
             if indexed is None:
                 continue
             for reference in indexed.references:
@@ -4926,7 +5238,7 @@ def _callees_for_symbol(
 ) -> tuple[Symbol, ...]:
     if limit <= 0:
         return ()
-    indexed = _parse_file(repo.root, symbol.path, repo.languages)
+    indexed = _parse_file(repo.root, symbol.path, repo.languages, language=_file_language(repo, symbol.path))
     if indexed is None:
         return ()
     known = repo.storage.symbol_names_by_language().get(symbol.language, set())
@@ -5175,7 +5487,7 @@ def _definition_ranges_and_tree(
         source = repo.storage.file_source(repo.root, path)
     if source is None:
         return {}, None
-    spec = _spec_for_path(path, repo.languages)
+    spec = _file_spec(repo, path)
     if spec is None:
         return {}, None
     source_bytes = source.encode("utf-8")
@@ -6276,8 +6588,15 @@ class _CliProgress:
             stream.write("\n")
             stream.flush()
             self._line_open = False
+        if event == "upgrade":
+            # One-time cost of a new extraction rule; only a terminal shows it.
+            if self.interactive:
+                stream.write(f"re-extracting {total} files to apply updated extraction rules (one-time)\n")
+                stream.flush()
+            return
         if event == "finish" and done < total:
             stream.write(f"warning: {total - done}/{total} files could not be indexed; "
+                         "existing index entries for them were kept. "
                          "check file readability/encoding or exclude unsupported files. "
                          "Git freshness only tracks the checkout.\n")
             stream.flush()
@@ -6308,6 +6627,13 @@ def _add_index_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--include", action="append", default=(), help="Glob include pattern. Repeatable.")
     parser.add_argument("--exclude", action="append", default=(), help="Glob exclude pattern. Repeatable.")
     parser.add_argument("--db", help="SQLite index path. Defaults to .code-symbol-index/index.sqlite.")
+    parser.add_argument(
+        "--header-language",
+        choices=HEADER_LANGUAGES,
+        default=None,
+        help="Language for .h files (default: c, unchanged). Saved for later writes; "
+             "changing it requires an unfiltered index run.",
+    )
 
 
 def _add_match_options(parser: argparse.ArgumentParser) -> None:
@@ -6695,17 +7021,33 @@ def main(argv: list[str] | None = None) -> int:
             _warn_git_freshness(repo)
 
         if args.command == "index":
-            repo.refresh()
+            repo.refresh(header_language=getattr(args, "header_language", None))
+            header_language, converted, pending = repo.last_header_language
+            if pending and converted < pending:
+                # The saved setting only means "future writes": never claim a
+                # conversion that still has files on their previous language.
+                sys.stderr.write(
+                    f"warning: header language for future writes is {header_language}, but "
+                    f"{pending - converted}/{pending} header files could not be converted and keep "
+                    "their previous language; rerun index to retry them\n"
+                )
+            elif pending and converted == pending:
+                sys.stderr.write(
+                    f"header language for future writes is {header_language}: "
+                    f"converted {converted} header files\n"
+                )
             _print_json({"index": str(Path(repo.storage.db_path)), "root": str(repo.root)})
         elif args.command == "update":
             repo.update(args.paths)
-            _print_json(
-                {
-                    "index": str(Path(repo.storage.db_path)),
-                    "root": str(repo.root),
-                    "updated": [Path(path).as_posix() for path in args.paths],
-                }
-            )
+            payload = {
+                "index": str(Path(repo.storage.db_path)),
+                "root": str(repo.root),
+                "updated": list(repo.last_update_updated),
+            }
+            if repo.last_update_failed:
+                # Never report a failed path as updated: its previous rows stand.
+                payload["failed"] = list(repo.last_update_failed)
+            _print_json(payload)
         elif args.command == "search":
             page = repo.search_page(
                 args.query,
@@ -6814,6 +7156,9 @@ def main(argv: list[str] | None = None) -> int:
     except IndexNotFoundError:
         sys.stderr.write("index not found; run `code-symbol-index index` first\n")
         return 2
+    except HeaderLanguageError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 2
     except SymbolNotFoundError as exc:
         sys.stderr.write(f"{exc}; narrow with --path/--kind/--exact-only\n")
         return 2
@@ -6830,6 +7175,7 @@ __all__ = [
     "CodeSymbolIndexError",
     "EntryPoint",
     "HashLine",
+    "HeaderLanguageError",
     "ImportItem",
     "IndexNotFoundError",
     "IndexStatus",
