@@ -3923,7 +3923,8 @@ def _extract_symbols_and_references(
                 else None
             )
             if declared is None:
-                single = _symbol_from_node(source, path, language, node, container, line_starts)
+                single = (_symbol_from_node(source, path, language, node, container, line_starts)
+                          if node_kind in language.definitions else None)
                 declared = (
                     [(single, "container" if single.kind in CONTAINER_KINDS else None)]
                     if single is not None
@@ -3974,7 +3975,10 @@ def _extract_symbols_and_references(
             child_parent, child_grandparent = parent, grandparent
         else:
             child_parent, child_grandparent = node, parent
-        for child in _node_children(node):
+        # C/C++ declaration nodes are named. A symbol-only write need not visit
+        # punctuation/keyword leaves; declaration handlers still see all children.
+        children = getattr(node, "named_children", None) if c_state is not None and not include_references else None
+        for child in children if children is not None else _node_children(node):
             walk(child, next_container, child_parent, child_grandparent, child_ctx, next_in_function, next_scope_kind)
 
     c_state = _CFileState(source, root_node) if language.name in _C_LANGUAGE_NAMES else None

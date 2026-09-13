@@ -19,6 +19,25 @@ C_DECLARATOR_SOURCE = (
 )
 
 
+@pytest.mark.parametrize('language', ['c', 'cpp'])
+def test_symbol_only_walk_matches_full_walk(tmp_path, language):
+    source = C_DECLARATOR_SOURCE + (
+        '#define VALUE 1\n#define DOUBLE(x) ((x) * 2)\n'
+        'struct Box { int first, second; };\n'
+        'enum Mode { FAST, SLOW };\n'
+        'int call(void) { int local = 1; return local; }\n'
+    )
+    if language == 'cpp':
+        source += CPP_CLASS_SOURCE
+    path = Path('app.' + language)
+    (tmp_path / path).write_text(source)
+    full = code_symbol_index._parse_file(tmp_path, path, None)
+    symbols_only = code_symbol_index._parse_file(
+        tmp_path, path, None, include_references=False, collect_bodies=False,
+    )
+    assert symbols_only.symbols == full.symbols
+
+
 def _symbols(index: CodeIndex, language: str):
     return {symbol.name: symbol for symbol in index.search_symbols("", language=language, limit=200)}
 
