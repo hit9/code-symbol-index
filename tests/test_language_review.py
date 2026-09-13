@@ -253,3 +253,44 @@ def test_worker_batch_keeps_neighbours_when_one_parse_raises(tmp_path, monkeypat
     paths = [Path('first.c'), Path('bad.c'), Path('last.c')]
     assert c._parse_file_batch(tmp_path, paths, None, False, None) == [paths[0], None, paths[2]]
 
+
+def test_query_reuses_one_tree_and_observes_the_next_edit(tmp_path, monkeypatch):
+    path = tmp_path / 'app.c'
+    source = 'int target() { return 1; }\nint other() { return 2; }\nint caller() { return target(); }\n'
+    path.write_text(source)
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    parser = c._parser_for_language('c')
+    parsed = []
+    class CountingParser:
+        def parse(self, source):
+            tree = parser.parse(source)
+            parsed.append(source)
+            return tree
+    counting = CountingParser()
+    monkeypatch.setattr(c, '_parser_for_language', lambda language: counting)
+    assert 'target' in repo.inspect_text('caller')
+    assert len(parsed) == 1
+    assert c._PARSER_TLS.query_trees is None
+    path.write_text(source.replace('return target();', 'return other();'))
+    assert [node.symbol.name for node in repo.callees('caller', depth=1).roots] == ['other']
+    assert len(parsed) == 2
+    assert c._PARSER_TLS.query_trees is None
+
+
+def test_query_tree_cache_is_bounded_and_cleared_after_failure(tmp_path, monkeypatch):
+    repo = c.Repository(tmp_path, create_index=True)
+    parser = c._parser_for_language('c')
+    monkeypatch.setattr(c, 'QUERY_PARSE_MAX_TREES', 2)
+    monkeypatch.setattr(c, 'QUERY_PARSE_MAX_SOURCE_CHARS', 32)
+    @c._name_query
+    def fail(self):
+        for name in ('first', 'second', 'third'):
+            c._parse_source(parser, f'int {name};')
+        assert len(c._PARSER_TLS.query_trees) == 2
+        c._parse_source(parser, '/*' + 'x' * 40 + '*/')
+        assert len(c._PARSER_TLS.query_trees) == 2
+        raise RuntimeError('fixture')
+    with pytest.raises(RuntimeError):
+        fail(repo)
+    assert c._PARSER_TLS.query_trees is None
+    assert repo._name_filter is None

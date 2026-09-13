@@ -56,6 +56,8 @@ DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
 TEXT_SAMPLE_BYTES = 8192
 MAX_WORKERS = max((os.cpu_count() or 2) - 1, 1)
+QUERY_PARSE_MAX_TREES = 4
+QUERY_PARSE_MAX_SOURCE_CHARS = 256 * 1024
 SQLITE_BATCH_SIZE = 1000
 SQLITE_FILE_BATCH_SIZE = 100
 FILE_SCAN_CHUNK_SIZE = 1024 * 1024
@@ -986,11 +988,14 @@ def _name_query(method: Any) -> Any:
         self._name_summary_unavailable = False
         self._name_filter = _NameFilter(self)
         self._language_cache = {}
+        previous_trees = getattr(_PARSER_TLS, 'query_trees', None)
+        _PARSER_TLS.query_trees = {}
         try:
             return method(self, *args, **kwargs)
         finally:
             self._name_filter = None
             self._language_cache = None
+            _PARSER_TLS.query_trees = previous_trees
     return query
 
 
@@ -1160,6 +1165,7 @@ class CodeIndex:
         symbol = _resolve_inspect_symbol(self, query, kind=kind, language=language, path=path, exact_only=exact_only)
         return _build_call_graph(self, symbol, direction="callers", depth=_clamp_depth(depth), limit=limit)
 
+    @_name_query
     def callees(
         self,
         query: str,
@@ -1258,6 +1264,7 @@ class CodeIndex:
         relative_path = self._relative_path(Path(path))
         return _format_outline_text(self, relative_path, self.outline(relative_path, symbol=symbol, max_symbols=max_symbols), symbol=symbol)
 
+    @_name_query
     def find_references(
         self,
         query: str,
@@ -1881,6 +1888,7 @@ class Repository(CodeIndex):
     ) -> list[Symbol]:
         return super().search_symbols(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit)
 
+    @_name_query
     def find_references(
         self,
         query: str,
@@ -3581,13 +3589,24 @@ _PARSER_TLS = threading.local()
 
 
 def _parse_source(parser, source: str):
+    # Share immutable trees only within a query. Content is part of the key, so
+    # a live edit cannot return an old tree, even inside the same request.
+    cache = getattr(_PARSER_TLS, 'query_trees', None)
+    key = (id(parser), source) if cache is not None and len(source) <= QUERY_PARSE_MAX_SOURCE_CHARS else None
+    if key is not None and key in cache:
+        return cache[key]
     # tree-sitter's parse() signature varies across versions/builds: some accept str, others
     # require bytes (raising "source must be a bytestring or a callable, not str"). Try str first,
     # then fall back to encoded bytes so both bindings work. Byte offsets are identical either way.
     try:
-        return parser.parse(source)
+        tree = parser.parse(source)
     except TypeError:
-        return parser.parse(source.encode("utf-8"))
+        tree = parser.parse(source.encode("utf-8"))
+    if key is not None:
+        if len(cache) >= QUERY_PARSE_MAX_TREES:
+            del cache[next(iter(cache))]
+        cache[key] = tree
+    return tree
 
 
 def _parser_for_language(language: str):
