@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `index --header-language c|cpp` chooses how `.h` files are parsed. The value is
+  stored in the index (`c_header_language`), reused by later `index`/`update` calls,
+  and only an unfiltered `index` may change it. Reads keep using the language each
+  file's own row was written with, so an interrupted or partial switch never mixes
+  parsers inside one file, and a run that could not convert every header says so
+  instead of reporting a completed conversion.
+- Per-file extraction-rule revisions (`files.extractor_revision`, schema stays 5). An
+  explicit `index` or `index --sync` re-extracts unchanged files whose rules moved,
+  reports how many files it upgraded, and never rebuilds the whole database. Files
+  already at the current revision are not parsed again; a file that fails keeps its
+  previous rows and is retried by the next run; a filtered refresh only ever deletes
+  rows of the languages it scanned.
+- `update --json` reports gone or no-longer-indexable paths as `updated` and keeps
+  failed paths separate, so a failed file is never reported as updated.
+
+### Changed
+
+- C/C++ extraction now follows declarator structure: pointer, array, function-pointer
+  and multi-declarator forms, class/namespace scope, constructors versus destructors,
+  qualified definitions, base classes as inheritance, unions, aliases, macros, fields
+  and enumerators are all indexed, with the declaration used as the preview range.
+- Depth-1 call edges come from real byte ranges plus function bodies. Two methods on
+  one line no longer share a caller, and a nested function body (Python `def`,
+  lambda, closure, arrow function) no longer contributes calls to the function that
+  declares it. Anonymous bodies still fence off their enclosing function.
+- When a declaration and a definition share a name, `inspect`, `refs`, `callers` and
+  `callees` prefer the one with a body, including across scopes (a Rust trait method
+  and its impl, a Swift protocol member and its conformance). Two definitions stay an
+  ambiguity error.
+- Other languages, per the confirmed gaps in the validation record: Python indexes
+  multi-target, chained and class-body bindings; Rust indexes trait and extern
+  function declarations; TypeScript/TSX index interface members
+  (`method_signature`, `property_signature`), ambient function declarations,
+  abstract classes and destructuring bindings; Swift indexes every name of a
+  multi-property declaration; Kotlin indexes destructuring bindings and no longer
+  treats a plain primary-constructor parameter as a property.
+
+### Notes
+
+- Upgrading an existing index needs an explicit `index` (or `index --sync`): reading
+  never migrates and never re-parses for rules. Symbol IDs, kinds and result contents
+  are expected to differ from 0.5.5, and query results may contain more matches.
+- Measured comparison against `4d942db` plus the remaining untested boundaries are
+  recorded in `LANGUAGE-SUPPORT-VALIDATION.md`; `benchmarks/bench_language_support.py`
+  reproduces the numbers.
+- The one-time rule upgrade re-parses only the affected files: about 0.54 ms per file
+  on a 10001-file corpus (≈5.4 s), after which `index` is back at steady state. Steady
+  state timings stay within a few percent of `4d942db`; the handful of measurements
+  above 5% and their disposition are listed in §5.4 of the validation record.
+
 ## 0.5.5 - 2026-09-10
 
 ### Added

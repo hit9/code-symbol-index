@@ -128,6 +128,7 @@ code-symbol-index languages
 code-symbol-index --version
 code-symbol-index version
 code-symbol-index index --root /path/to/repo
+code-symbol-index index --root /path/to/repo --header-language cpp
 code-symbol-index update src/app.py src/lib.py --root /path/to/repo
 code-symbol-index status --root /path/to/repo
 code-symbol-index status --root /path/to/repo --check
@@ -168,6 +169,26 @@ code-symbol-index status --root /path/to/repo --json
 终端每跨过 10% 在同一行刷新文件计数和百分比，完成后保留最终一行；文件百分比表示
 解析进度，其后终端会提示写入索引与提交事务。公开进度回调事件不变。结果始终在
 stdout，必要提示在 stderr。
+
+### C/C++ 头文件与索引升级
+
+`.h` 默认按 C 解析；`index --header-language cpp` 会把后续写入采用的语言存入索引，
+并重新提取已有的 `.h` 文件，`.hpp/.hh/.hxx` 仍按 C++。设置被持久化，之后的 `index`
+与 `update` 沿用同一设置；查询按每个文件自己行内记录的语言选取 parser。切换设置必须
+使用无筛选的 `index`：带 `--language`/`--include`/`--exclude` 时会拒绝切换，因为那只会
+转换一部分头文件。若部分头文件重新提取失败，设置仍对后续写入生效，命令会明确提示而
+不声称全部转换完成。C 与 C++ 混用 `.h` 的仓库本轮仍无法用单一设置表达。
+
+提取规则变更不会在查询时静默生效：显式 `index`（或 `index --sync`）会在同一数据库中
+就地重新提取受影响的文件，并报告升级的文件数与写入量；已升级的文件不会重复解析，
+失败文件保留旧行以便下次只重试它；规则未变化的语言不重新解析，带语言筛选的刷新也
+不会删除其他语言的行。
+
+本版本符号集合的变化：C/C++ 现在提取每个声明器、类成员、宏、union、别名与枚举项；
+Python 补充多目标/链式绑定与类体字段；TypeScript/TSX 补充接口成员、ambient 声明与
+解构绑定；Swift 提取多属性声明的每个名称；Kotlin 提取解构绑定，同时不再把普通主构造
+参数当作 property。因此查询可能返回更多匹配；当声明与定义同名时，`inspect`/`refs`/
+`callers` 优先选择带函数体的定义。
 
 ## 输出格式
 

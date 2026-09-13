@@ -135,6 +135,7 @@ code-symbol-index languages
 code-symbol-index --version
 code-symbol-index version
 code-symbol-index index --root /path/to/repo
+code-symbol-index index --root /path/to/repo --header-language cpp
 code-symbol-index update src/app.py src/lib.py --root /path/to/repo
 code-symbol-index status --root /path/to/repo
 code-symbol-index status --root /path/to/repo --check
@@ -177,6 +178,35 @@ line at 10% milestones and keep the final line; the file percentage measures par
 and terminal-only messages then report index writing and transaction commit. Public
 progress callback events are unchanged. Results stay on stdout; actionable hints stay
 on stderr.
+
+### C/C++ headers and index upgrades
+
+`.h` files are parsed as C by default. `index --header-language cpp` stores the
+language for future writes and re-extracts existing `.h` files; `.hpp`, `.hh` and
+`.hxx` stay C++. The setting is saved in the index, so later `index` and `update`
+calls reuse it, and reads parse every file with the language its own row was written
+with. Changing the setting requires an unfiltered `index` run: with
+`--language`/`--include`/`--exclude` the command refuses to switch, because only part
+of the headers would be converted. When some headers cannot be re-extracted the
+setting still applies to future writes, and the command says so instead of claiming a
+complete conversion. Repos that mix C and C++ `.h` files cannot be expressed by one
+setting yet.
+
+Extraction-rule changes are not applied by reading. An explicit `index` (or
+`index --sync`) re-extracts the files whose rules changed in the same database, in
+place, and reports how many files were upgraded and how many rows were written.
+Already-upgraded files are not parsed again, and a file that fails keeps its previous
+rows so the next run retries just that file. Languages whose rules did not change are
+not re-parsed, and a language-filtered refresh never deletes rows of other languages.
+
+Symbol sets changed in this release: C and C++ now index every declarator, class
+member, macro, union, alias and enumerator; Python indexes multi-target and chained
+bindings plus class-body fields; TypeScript/TSX index interface members, ambient
+declarations and destructuring bindings; Swift indexes every name in a multi-property
+declaration, and Kotlin indexes destructuring bindings while no longer treating a plain
+constructor parameter as a property. Queries therefore return more matches, and
+`inspect`/`refs`/`callers` prefer the definition that has a body when a declaration
+shares its name.
 
 ## Output Formats
 
