@@ -25,12 +25,39 @@ if TYPE_CHECKING:
     from tree_sitter import Node
 
 
-__version__ = "0.5.5"
+__version__ = "0.6.0"
 SCHEMA_VERSION = 5
+
+# Extraction-rule revisions: one entry per language whose *persisted* symbols or
+# references changed in this release. Values are code constants, not program
+# versions, and languages that did not change stay absent so they are never
+# re-parsed for rules. A nullable ``files.extractor_revision`` column records the
+# value each indexed file was written with.
+EXTRACTOR_REVISIONS: dict[str, str] = {
+    "c": "c:1",
+    "cpp": "cpp:2",
+    "javascript": "javascript:1",
+    "kotlin": "kotlin:2",
+    "python": "python:2",
+    "rust": "rust:1",
+    "swift": "swift:1",
+    "tsx": "tsx:1",
+    "typescript": "typescript:1",
+}
+# C/C++ header files are the one extension whose language is ambiguous. The
+# default stays C (unchanged behaviour); ``c_header_language`` in the meta table
+# records the language future writes use, and every read uses the language the
+# file's own row was written with.
+HEADER_LANGUAGE_META = "c_header_language"
+HEADER_LANGUAGES: tuple[str, ...] = ("c", "cpp")
+DEFAULT_HEADER_LANGUAGE = "c"
+HEADER_EXTENSION = ".h"
 DEFAULT_INDEX_DIR = ".code-symbol-index"
 DEFAULT_INDEX_DB = "index.sqlite"
 TEXT_SAMPLE_BYTES = 8192
 MAX_WORKERS = max((os.cpu_count() or 2) - 1, 1)
+QUERY_PARSE_MAX_TREES = 4
+QUERY_PARSE_MAX_SOURCE_CHARS = 256 * 1024
 SQLITE_BATCH_SIZE = 1000
 SQLITE_FILE_BATCH_SIZE = 100
 FILE_SCAN_CHUNK_SIZE = 1024 * 1024
@@ -279,6 +306,78 @@ IMPLEMENTATION_KINDS = {
     "trait",
 }
 
+# Symbol kinds that can own a call reference. Callables own calls directly;
+# containers own what their member initialisers and class-level statements call.
+# Variables, fields, constants and type aliases are deliberately excluded: an
+# initialiser call is not a call from the field, and letting those win would
+# hide the enclosing class behind a tighter range.
+CALL_OWNER_KINDS = frozenset(FUNCTION_KINDS | CONTAINER_KINDS)
+
+# Node types whose body bounds call ownership, per language. Only languages
+# listed here get body-based depth-1 edges; others keep the older
+# definition-range containment. Anonymous callable nodes are included because
+# their bodies must still fence off the enclosing function.
+_CALLABLE_BODY_NODE_TYPES: dict[str, tuple[str, ...]] = {
+    "c": ("function_definition", "lambda_expression"),
+    "cpp": ("function_definition", "lambda_expression"),
+    "csharp": ("method_declaration", "constructor_declaration", "local_function_statement", "lambda_expression", "anonymous_method_expression"),
+    "go": ("function_declaration", "method_declaration", "func_literal"),
+    "java": ("method_declaration", "constructor_declaration", "lambda_expression"),
+    "javascript": (
+        "function_declaration",
+        "generator_function_declaration",
+        "function_expression",
+        "generator_function",
+        "arrow_function",
+        "method_definition",
+    ),
+    "kotlin": ("function_declaration", "lambda_literal", "anonymous_function"),
+    "php": ("function_definition", "method_declaration", "anonymous_function", "arrow_function"),
+    "python": ("function_definition", "lambda"),
+    "ruby": ("method", "singleton_method", "lambda", "block"),
+    "rust": ("function_item", "closure_expression"),
+    "swift": (
+        "function_declaration",
+        "init_declaration",
+        "deinit_declaration",
+        "subscript_declaration",
+        "lambda_literal",
+        "computed_property",
+    ),
+    "tsx": (
+        "function_declaration",
+        "generator_function_declaration",
+        "function_expression",
+        "generator_function",
+        "arrow_function",
+        "method_definition",
+    ),
+    "typescript": (
+        "function_declaration",
+        "generator_function_declaration",
+        "function_expression",
+        "generator_function",
+        "arrow_function",
+        "method_definition",
+    ),
+}
+
+# Field names that hold a callable's body when the grammar names the field.
+_BODY_FIELD_NAMES = ("body", "computed_value")
+
+# Body node types used when the grammar leaves the body child unnamed
+# (Kotlin/Swift ``function_body``, bare ``statements`` blocks).
+_BODY_NODE_TYPES = frozenset(
+    {
+        "block",
+        "body_statement",
+        "compound_statement",
+        "function_body",
+        "statement_block",
+        "statements",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Position:
@@ -449,6 +548,53 @@ class _IndexedFile:
     symbols: tuple[Symbol, ...]
     references: tuple[Reference, ...]
     name_summary: bytes | None = None
+    # Transient parse metadata; never persisted. Empty when only references were
+    # extracted (``reference_name`` path) or when the grammar has no known
+    # function body nodes.
+    bodies: tuple[_CallableBody, ...] = ()
+    # Extraction-rule revision this file was parsed with; ``None`` for languages
+    # without registered rules and for rows written before the column existed.
+    revision: str | None = None
+
+    def __reduce__(self):
+        # Process-pool results contain thousands of nested frozen dataclasses.
+        # Send plain rows instead, sharing this file's path/language on restore.
+        return _restore_indexed_file, (
+            self.path, self.language, self.mtime_ns, self.size,
+            tuple(_symbol_row(symbol) for symbol in self.symbols),
+            self.references, self.name_summary, self.bodies, self.revision,
+        )
+
+
+def _restore_indexed_file(path, language, mtime_ns, size, rows, references, name_summary, bodies, revision):
+    symbols = tuple(
+        Symbol(
+            id=row[0], name=row[1], kind=row[2], language=row[3], path=path,
+            range=Range(Position(row[5], row[6]), Position(row[7], row[8]), row[9], row[10]),
+            signature=row[11], container=row[12],
+        )
+        for row in rows
+    )
+    return _IndexedFile(path, language, mtime_ns, size, symbols, references, name_summary, bodies, revision)
+
+
+@dataclass(frozen=True, slots=True)
+class _CallableBody:
+    """Body span of one callable in the file that produced it.
+
+    Depth-1 call ownership needs the body, not the whole declaration: a call
+    inside a nested callable belongs to that nested callable. ``name`` is empty
+    for anonymous callables (lambdas, closures), which still act as ownership
+    boundaries even though no symbol is published for them.
+
+    ``name_start_byte`` locates the defining name so a stored symbol can be
+    matched to its own body without re-deriving the name.
+    """
+
+    name: str
+    name_start_byte: int
+    start_byte: int
+    end_byte: int
 
 
 class CodeSymbolIndexError(Exception):
@@ -469,6 +615,10 @@ class IndexNotFoundError(CodeSymbolIndexError):
 
 class BinaryFileError(CodeSymbolIndexError):
     """Raised when a file does not look like text."""
+
+
+class HeaderLanguageError(CodeSymbolIndexError):
+    """Raised when a header-language change cannot be applied consistently."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,13 +711,19 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
         name="typescript",
         extensions=(".ts", ".mts", ".cts"),
         definitions={
+            "abstract_class_declaration": "class",
+            "abstract_method_signature": "method",
             "class_declaration": "class",
             "enum_declaration": "enum",
             "function_declaration": "function",
+            "function_signature": "function",
             "generator_function_declaration": "function",
             "interface_declaration": "interface",
             "internal_module": "module",
             "method_definition": "method",
+            "method_signature": "method",
+            "module": "module",
+            "property_signature": "field",
             "type_alias_declaration": "type",
             "variable_declarator": "variable",
         },
@@ -585,13 +741,19 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
         name="tsx",
         extensions=(".tsx",),
         definitions={
+            "abstract_class_declaration": "class",
+            "abstract_method_signature": "method",
             "class_declaration": "class",
             "enum_declaration": "enum",
             "function_declaration": "function",
+            "function_signature": "function",
             "generator_function_declaration": "function",
             "interface_declaration": "interface",
             "internal_module": "module",
             "method_definition": "method",
+            "method_signature": "method",
+            "module": "module",
+            "property_signature": "field",
             "type_alias_declaration": "type",
             "variable_declarator": "variable",
         },
@@ -625,6 +787,10 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
             "const_item": "constant",
             "enum_item": "enum",
             "function_item": "function",
+            # A trait or extern block declares a function without a body; the
+            # declaration stays a symbol so the name is findable where it is
+            # declared, and definition preference keeps the body the call target.
+            "function_signature_item": "function",
             "impl_item": "impl",
             "mod_item": "module",
             "static_item": "variable",
@@ -652,11 +818,17 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
         name="c",
         extensions=(".c", ".h"),
         definitions={
+            "alias_declaration": "type",
             "declaration": "variable",
             "enum_specifier": "enum",
+            "enumerator": "constant",
+            "field_declaration": "field",
             "function_definition": "function",
+            "preproc_def": "constant",
+            "preproc_function_def": "constant",
             "struct_specifier": "struct",
             "type_definition": "type",
+            "union_specifier": "struct",
         },
         # ``declaration`` also matches locals and for-loop initialisers.
         non_local_kinds=("variable",),
@@ -665,14 +837,23 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
         name="cpp",
         extensions=(".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx"),
         definitions={
+            "alias_declaration": "type",
             "class_specifier": "class",
             "declaration": "variable",
             "enum_specifier": "enum",
+            "enumerator": "constant",
+            "field_declaration": "field",
             "function_definition": "function",
             "namespace_definition": "namespace",
+            "preproc_def": "constant",
+            "preproc_function_def": "constant",
             "struct_specifier": "struct",
             "type_definition": "type",
+            "union_specifier": "struct",
         },
+        # C++ names its base classes in a dedicated clause, which carries the
+        # ``inherit`` context for reference classification and ``impls``.
+        inherit_node_types=("base_class_clause",),
         # ``declaration`` also matches locals and for-loop initialisers.
         non_local_kinds=("variable",),
     ),
@@ -806,10 +987,15 @@ def _name_query(method: Any) -> Any:
             return method(self, *args, **kwargs)
         self._name_summary_unavailable = False
         self._name_filter = _NameFilter(self)
+        self._language_cache = {}
+        previous_trees = getattr(_PARSER_TLS, 'query_trees', None)
+        _PARSER_TLS.query_trees = {}
         try:
             return method(self, *args, **kwargs)
         finally:
             self._name_filter = None
+            self._language_cache = None
+            _PARSER_TLS.query_trees = previous_trees
     return query
 
 
@@ -823,11 +1009,19 @@ class CodeIndex:
         exclude: Iterable[str] | None = None,
         db_path: str | Path | None = None,
         create_storage: bool = True,
+        header_language: str | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         self.languages = _normalize_languages(languages)
+        # Language used for ``.h`` files on the next write pass. ``None`` means the
+        # default (C); a persisted ``Repository`` overrides it from meta.
+        self.header_language = _validate_header_language(header_language)
+        self._language_cache: dict[str, str | None] | None = None
         self.include = tuple(include or ())
         self.exclude = tuple(DEFAULT_EXCLUDES) + tuple(exclude or ())
+        # A narrowed scan cannot speak for files it never walked, so a filter and a
+        # header-language change are refused together instead of half-converted.
+        self.filtered_scan = bool(languages) or bool(include) or bool(exclude)
         self._exclude_matcher = _compile_path_patterns(self.exclude)
         self.storage = _Storage(db_path, create=create_storage)
         # Gitignore specs in force for a directory, keyed by its posix prefix
@@ -836,7 +1030,9 @@ class CodeIndex:
         # hit and a match tests only the path's own ancestors.
         self._gitignore_specs: dict[str, tuple[tuple[str, str, pathspec.PathSpec], ...]] = {}
 
-    def build(self) -> CodeIndex:
+    def build(self, *, header_language: str | None = None) -> CodeIndex:
+        if header_language is not None:
+            self.header_language = _validate_header_language(header_language)
         self.storage.clear()
         self._index_files(self._iter_indexable_files())
         return self
@@ -969,6 +1165,7 @@ class CodeIndex:
         symbol = _resolve_inspect_symbol(self, query, kind=kind, language=language, path=path, exact_only=exact_only)
         return _build_call_graph(self, symbol, direction="callers", depth=_clamp_depth(depth), limit=limit)
 
+    @_name_query
     def callees(
         self,
         query: str,
@@ -1067,6 +1264,7 @@ class CodeIndex:
         relative_path = self._relative_path(Path(path))
         return _format_outline_text(self, relative_path, self.outline(relative_path, symbol=symbol, max_symbols=max_symbols), symbol=symbol)
 
+    @_name_query
     def find_references(
         self,
         query: str,
@@ -1137,20 +1335,72 @@ class CodeIndex:
         if symbol is not None:
             return symbol
 
-        matches = self.search_symbols(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=1)
-        if matches:
-            return matches[0]
-        raise SymbolNotFoundError(f"No symbol matched: {query}")
+        # A declaration and its definition share name, kind and scope. ``refs`` and
+        # ``impls`` resolve through this path, so the body wins here too instead of
+        # whichever row the search happened to return first.
+        matches = self.search_symbols(
+            query, kind=kind, language=language, path=path, exact_only=exact_only, limit=MAX_INSPECT_CANDIDATES + 1
+        )
+        if not matches:
+            raise SymbolNotFoundError(f"No symbol matched: {query}")
+        if len(matches) > 1:
+            preferred = _preferred_candidate(self, matches)
+            if preferred is not None:
+                return preferred
+        return matches[0]
 
     def _index_files(self, paths: Iterable[Path]) -> None:
         for relative_path in paths:
             self._index_file(relative_path)
 
     def _index_file(self, relative_path: Path) -> None:
-        indexed = _parse_file(self.root, relative_path, self.languages)
+        indexed = _parse_file(
+            self.root,
+            relative_path,
+            self.languages,
+            header_language=self.write_header_language(),
+            collect_bodies=False,
+        )
         if indexed is None:
             return
         self.storage.insert_file_result(indexed)
+
+    def write_header_language(self) -> str | None:
+        """Language future writes use for ``.h`` files (``None`` = default C)."""
+        return self.header_language
+
+    def _write_spec(self, path: Path) -> LanguageSpec | None:
+        """Language to parse ``path`` with on this write pass."""
+        return _spec_for_path(path, self.languages, self.write_header_language())
+
+    def _stored_language(self, relative_path: Path) -> str | None:
+        """Language an already-indexed file was written with.
+
+        Reads must use the file's own language, never the pending write setting,
+        so a half-converted index still parses each file the way it was stored.
+        Look-ups are cached for one request; misses are one indexed row each.
+        """
+        cache = self._language_cache
+        if cache is None:
+            return self.storage.file_languages([relative_path.as_posix()]).get(relative_path.as_posix())
+        key = relative_path.as_posix()
+        if key not in cache:
+            stored = self.storage.file_languages([key])
+            cache[key] = stored.get(key)
+        return cache[key]
+
+    def _stored_spec(self, relative_path: Path) -> LanguageSpec | None:
+        stored = self._stored_language(relative_path)
+        if stored is not None:
+            spec = LANGUAGE_BY_NAME.get(stored)
+            if spec is not None:
+                try:
+                    _parser_for_language(spec.name)
+                except UnsupportedLanguageError:
+                    spec = None
+                if spec is not None:
+                    return spec
+        return self._write_spec(relative_path)
 
 
     def _iter_indexable_files(self) -> Iterable[Path]:
@@ -1160,7 +1410,8 @@ class CodeIndex:
         # directories (it had no specs yet), so it visited an order of magnitude
         # more directories than the scan itself needed.
         root_text = str(self.root)
-        for dirpath, dirnames, filenames in os.walk(root_text):
+        scan_errors: list[OSError] = []
+        for dirpath, dirnames, filenames in os.walk(root_text, onerror=scan_errors.append):
             relative_dir = os.path.relpath(dirpath, root_text)
             prefix = "" if relative_dir == "." else relative_dir.replace(os.sep, "/") + "/"
             specs = self._gitignore_specs_for_dir(prefix, has_gitignore=".gitignore" in filenames)
@@ -1177,6 +1428,8 @@ class CodeIndex:
                 path_text = prefix + filename
                 if self._should_index_text(path_text, specs):
                     yield Path(path_text)
+        if scan_errors:
+            raise scan_errors[0]  # An unreadable subtree is not evidence that its indexed files were deleted.
 
     def _should_index(self, relative_path: Path) -> bool:
         return self._should_index_text(relative_path.as_posix())
@@ -1188,7 +1441,7 @@ class CodeIndex:
     ) -> bool:
         # Extension first: it is the cheapest and most selective test, so most
         # files never reach the pattern and gitignore matching below.
-        if _spec_for_extension(_extension_of(path_text), self.languages) is None:
+        if _spec_for_extension(_extension_of(path_text), self.languages, self.write_header_language()) is None:
             return False
         if self.include and not any(fnmatch.fnmatch(path_text, pattern) for pattern in self.include):
             return False
@@ -1303,36 +1556,103 @@ class Repository(CodeIndex):
             create_storage=create_index,
         )
         self.progress = progress
+        # Outcome of the last ``update(paths)`` call, for command reporting: paths
+        # whose new symbols were written, and paths whose previous rows were kept
+        # because the file could not be read or parsed.
+        self.last_update_updated: tuple[str, ...] = ()
+        self.last_update_failed: tuple[str, ...] = ()
+        # (header language, converted, pending) of the last refresh.
+        self.last_header_language: tuple[str, int, int] = (DEFAULT_HEADER_LANGUAGE, 0, 0)
 
-    def refresh(self, *, progress: Any = _DEFAULT_PROGRESS) -> Repository:
+    def write_header_language(self) -> str | None:
+        """Header language saved for future writes, defaulting to C."""
+        if self.header_language is None:
+            self.header_language = self.storage.meta_value(HEADER_LANGUAGE_META) or DEFAULT_HEADER_LANGUAGE
+        return self.header_language
+
+    def _write_revision(self, path_text: str) -> str | None:
+        """Extraction-rule revision this scan would write for ``path``."""
+        extension = _extension_of(path_text)
+        spec = (LANGUAGE_BY_NAME[self.write_header_language() or DEFAULT_HEADER_LANGUAGE]
+                if extension == HEADER_EXTENSION else LANGUAGE_BY_EXTENSION.get(extension))
+        return EXTRACTOR_REVISIONS.get(spec.name) if spec is not None else None
+
+    def _scan_covers_language(self, language: str) -> bool:
+        """Whether this scan's language filter covers existing rows of ``language``.
+
+        A language-filtered refresh knows nothing about files it never walked, so
+        it must not turn its own narrow file set into whole-database deletions.
+        """
+        return self.languages is None or language in self.languages
+
+    def refresh(self, *, progress: Any = _DEFAULT_PROGRESS, header_language: str | None = None) -> Repository:
         git_before = _git_state(self.root)
         self._gitignore_specs.clear()
         progress_callback = self.progress if progress is _DEFAULT_PROGRESS else progress
         if self.storage.schema_version() != SCHEMA_VERSION:
             self.storage.reset_schema()
 
+        target = _validate_header_language(header_language)
+        stored_header = self.storage.meta_value(HEADER_LANGUAGE_META)
+        effective_header = target if target is not None else (stored_header or DEFAULT_HEADER_LANGUAGE)
+        if target is not None and target != (stored_header or DEFAULT_HEADER_LANGUAGE):
+            if self.filtered_scan:
+                raise HeaderLanguageError(
+                    "changing the header language requires an unfiltered refresh: rerun index "
+                    "without --language/--include/--exclude so every header file is converted"
+                )
+            # Saved as the language of future writes, not as a completion marker:
+            # files that fail keep their own language and are retried next time.
+            self.storage.set_meta_value(HEADER_LANGUAGE_META, target)
+        self.header_language = effective_header
+
         _emit_progress(progress_callback, "scan", done=0, total=0)
         current_files: dict[str, tuple[Path, os.stat_result]] = {}
+        unavailable_paths: set[str] = set()
         paths = list(self._iter_indexable_files())
         for path in paths:
             try:
                 stat = (self.root / path).stat()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
             except OSError:
+                unavailable_paths.add(path.as_posix())
                 continue
             current_files[path.as_posix()] = (path, stat)
 
         indexed_files = self.storage.files()
-        deleted = [Path(path) for path in indexed_files if path not in current_files]
+        # Only rows whose language this scan actually covers may be inferred
+        # deleted: a filtered refresh says nothing about other languages.
+        deleted = [
+            Path(path)
+            for path in indexed_files
+            if path not in current_files and path not in unavailable_paths
+            and self._scan_covers_language(indexed_files[path]["language"])
+            and (path[-2:].lower() != HEADER_EXTENSION or self._scan_covers_language(effective_header))
+        ]
 
         to_index: list[Path] = []
         to_summarize: list[tuple[Path, os.stat_result]] = []
+        rule_upgrades = 0
+        rule_upgrade_paths: set[str] = set()
         for path_text, (path, stat) in current_files.items():
             old = indexed_files.get(path_text)
-            if old is not None and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size:
-                if not _name_summary_current(old["summary_header"], stat):
-                    to_summarize.append((path, stat))
+            revision = self._write_revision(path_text)
+            needs_rules = revision is not None and (old is None or old["extractor_revision"] != revision)
+            metadata_changed = old is None or old["mtime_ns"] != stat.st_mtime_ns or old["size"] != stat.st_size
+            if old is not None and needs_rules and not metadata_changed:
+                # Unchanged file whose persisted extraction rules moved: one-time
+                # re-parse, counted and reported separately from normal work.
+                rule_upgrades += 1
+                rule_upgrade_paths.add(path_text)
+            if metadata_changed or needs_rules:
+                to_index.append(path)
                 continue
-            to_index.append(path)
+            if not _name_summary_current(old["summary_header"], stat):
+                to_summarize.append((path, stat))
+
+        if rule_upgrades:
+            _emit_progress(progress_callback, "upgrade", done=0, total=rule_upgrades)
 
         summary_updates: list[tuple[bytes, str]] = []
         if to_summarize:
@@ -1354,17 +1674,51 @@ class Repository(CodeIndex):
 
         total = len(to_index)
         _emit_progress(progress_callback, "start", done=0, total=total)
-        indexed_results = self._parse_files(to_index, include_references=False, progress=progress_callback)
+        # Start expensive files first using the scan's existing stat results.
+        # No additional filesystem calls are needed for scheduling.
+        to_index.sort(key=lambda path: current_files[path.as_posix()][1].st_size, reverse=True)
+        indexed_results = self._parse_files(
+            to_index, include_references=False, progress=progress_callback, header_language=effective_header
+        )
         self.storage.replace_files(
             deleted_paths=deleted,
             summary_updates=summary_updates,
             indexed_files=indexed_results,
             progress=getattr(progress_callback, "_storage_progress", None),
             schema_version=SCHEMA_VERSION,
-            git_baseline=_git_baseline(self.root, git_before),
+            git_baseline=None if self.filtered_scan else _git_baseline(self.root, git_before),
+            rule_upgrade_paths=rule_upgrade_paths,
         )
-        _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total)
+        self._record_header_language_outcome(
+            indexed_results, current_files, indexed_files, effective_header, unavailable_paths
+        )
+        _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total + len(unavailable_paths))
         return self
+
+    def _record_header_language_outcome(
+        self,
+        indexed_results: list[_IndexedFile],
+        current_files: dict[str, tuple[Path, os.stat_result]],
+        indexed_files: dict[str, sqlite3.Row],
+        effective_header: str,
+        unavailable_paths: set[str],
+    ) -> None:
+        """Note how many stored header files actually moved to the new language.
+
+        The meta value already means "future writes", so a partial conversion must
+        be reportable: callers compare converted with pending and say so instead
+        of claiming the whole index was converted.
+        """
+        published = {indexed_file.path for indexed_file in indexed_results}
+        pending = [
+            path
+            for path in indexed_files
+            if path[-2:].lower() == HEADER_EXTENSION
+            and (path in current_files or path in unavailable_paths)
+            and indexed_files[path]["language"] != effective_header
+        ]
+        converted = sum(1 for path in pending if Path(path) in published)
+        self.last_header_language = (effective_header, converted, len(pending))
 
     def build(self, *, progress: Any = _DEFAULT_PROGRESS) -> Repository:
         git_before = _git_state(self.root)
@@ -1374,7 +1728,9 @@ class Repository(CodeIndex):
         paths = list(self._iter_indexable_files())
         total = len(paths)
         _emit_progress(progress_callback, "start", done=0, total=total)
-        indexed_results = self._parse_files(paths, include_references=False, progress=progress_callback)
+        indexed_results = self._parse_files(
+            paths, include_references=False, progress=progress_callback, header_language=self.write_header_language()
+        )
         self.storage.replace_files(
             deleted_paths=(),
             indexed_files=indexed_results,
@@ -1398,22 +1754,48 @@ class Repository(CodeIndex):
             return self.refresh(progress=progress_callback)
 
         self._gitignore_specs.clear()
+        self.header_language = None  # Another Repository may have changed the write setting.
         relative_paths = list(dict.fromkeys(self._relative_path(path) for path in _coerce_paths(paths)))
-        to_index = [
-            path
-            for path in relative_paths
-            if (self.root / path).is_file() and self._should_index(path)
-        ]
+        from stat import S_ISREG
+
+        to_index: list[Path] = []
+        removed: list[Path] = []
+        unavailable: list[Path] = []
+        for path in relative_paths:
+            if not self._should_index(path):
+                removed.append(path)
+                continue
+            try:
+                mode = (self.root / path).stat().st_mode
+            except (FileNotFoundError, NotADirectoryError):
+                removed.append(path)
+            except OSError:
+                unavailable.append(path)
+            else:
+                (to_index if S_ISREG(mode) else removed).append(path)
         total = len(to_index)
         _emit_progress(progress_callback, "start", done=0, total=total)
-        indexed_results = self._parse_files(to_index, include_references=False, progress=progress_callback)
+        indexed_results = self._parse_files(
+            to_index,
+            include_references=False,
+            progress=progress_callback,
+            header_language=self.write_header_language(),
+        )
+        published = {indexed_file.path for indexed_file in indexed_results}
+        # Deletion candidates are only the requested paths that are gone or no
+        # longer indexable. A file that still exists but failed to read or parse
+        # keeps its previous rows and revision instead of losing them here.
         self.storage.replace_files(
-            deleted_paths=relative_paths,
+            deleted_paths=removed,
             indexed_files=indexed_results,
             progress=getattr(progress_callback, "_storage_progress", None),
             schema_version=SCHEMA_VERSION,
         )
-        _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total)
+        self.last_update_updated = tuple(
+            path.as_posix() for path in to_index if path in published
+        )
+        self.last_update_failed = tuple(path.as_posix() for path in [*to_index, *unavailable] if path not in published)
+        _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total + len(unavailable))
         return self
 
     def _parse_files(
@@ -1422,6 +1804,7 @@ class Repository(CodeIndex):
         *,
         include_references: bool = True,
         progress: Any | None = None,
+        header_language: str | None = None,
     ) -> list[_IndexedFile]:
         if not paths:
             return []
@@ -1440,7 +1823,14 @@ class Repository(CodeIndex):
         if serial:
             results = []
             for done, path in enumerate(paths, start=1):
-                result = _parse_file(self.root, path, self.languages, include_references=include_references)
+                result = _parse_file(
+                    self.root,
+                    path,
+                    self.languages,
+                    include_references=include_references,
+                    header_language=header_language,
+                    collect_bodies=include_references,
+                )
                 if result is not None:
                     results.append(result)
                 _emit_progress(progress, "file", done=done, total=len(paths), path=path.as_posix())
@@ -1450,23 +1840,35 @@ class Repository(CodeIndex):
 
         results: list[_IndexedFile] = []
         workers = min(MAX_WORKERS, len(paths))
+        # Keep several jobs per worker for load balancing, while amortizing IPC
+        # for repositories with thousands of tiny files. Small batches stay 1:1.
+        batch_size = min(16, max(1, len(paths) // (workers * 8)))
+        batch_count = (len(paths) + batch_size - 1) // batch_size
         executor = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+        future_to_paths = {}
         try:
-            future_to_path = {
-                executor.submit(_parse_file, self.root, path, self.languages, include_references): path
-                for path in paths
+            future_to_paths = {
+                executor.submit(
+                    _parse_file_batch, self.root, batch, self.languages, include_references, header_language,
+                ): batch
+                # Stripe size-ordered paths across jobs so the largest files
+                # do not accumulate in a single sequential worker batch.
+                for batch in (paths[offset::batch_count] for offset in range(batch_count))
             }
-            for done, future in enumerate(concurrent.futures.as_completed(future_to_path), start=1):
+            done = 0
+            for future in concurrent.futures.as_completed(future_to_paths):
+                batch = future_to_paths[future]
                 try:
-                    result = future.result()
+                    parsed = future.result()
                 except Exception:
-                    result = None
-                if result is not None:
-                    results.append(result)
-                path = future_to_path[future]
-                _emit_progress(progress, "file", done=done, total=len(paths), path=path.as_posix())
+                    parsed = [None] * len(batch)
+                for path, result in zip(batch, parsed, strict=True):
+                    if result is not None:
+                        results.append(result)
+                    done += 1
+                    _emit_progress(progress, "file", done=done, total=len(paths), path=path.as_posix())
         except KeyboardInterrupt:
-            for future in future_to_path:
+            for future in future_to_paths:
                 future.cancel()
             _terminate_executor(executor)
             raise
@@ -1486,6 +1888,7 @@ class Repository(CodeIndex):
     ) -> list[Symbol]:
         return super().search_symbols(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=limit)
 
+    @_name_query
     def find_references(
         self,
         query: str,
@@ -1546,7 +1949,13 @@ class Repository(CodeIndex):
         for path in paths:
             if not self._name_filter.may_contain(path, (needle,)) or not _file_contains_bytes(self.root / path, needle):
                 continue
-            indexed_file = _parse_file(self.root, path, self.languages, reference_name=symbol.name)
+            indexed_file = _parse_file(
+                self.root,
+                path,
+                self.languages,
+                reference_name=symbol.name,
+                language=self._stored_language(path),
+            )
             if indexed_file is None:
                 continue
             for reference in indexed_file.references:
@@ -2075,16 +2484,56 @@ class _Storage:
             self.connection.execute("DELETE FROM files")
 
     def files(self) -> dict[str, sqlite3.Row]:
+        """Stored file rows, tolerating any older column layout.
+
+        Readers never migrate: the base four columns always exist, while
+        ``name_summary`` and ``extractor_revision`` are optional additive
+        capabilities. Each is selected independently, so a database missing one of
+        them still reports the other instead of degrading to no capabilities.
+        """
+        columns = self._file_columns()
+        summary_select = (
+            "name_summary IS NOT NULL AS has_summary, substr(name_summary, 1, 41) AS summary_header"
+            if "name_summary" in columns
+            else "0 AS has_summary, NULL AS summary_header"
+        )
+        revision_select = "extractor_revision" if "extractor_revision" in columns else "NULL AS extractor_revision"
         try:
             rows = self.connection.execute(
-                "SELECT path, language, mtime_ns, size, name_summary IS NOT NULL AS has_summary, "
-                "substr(name_summary, 1, 41) AS summary_header FROM files",
+                f"SELECT path, language, mtime_ns, size, {summary_select}, {revision_select} FROM files",
             ).fetchall()
         except sqlite3.OperationalError:
-            rows = self.connection.execute(
-                "SELECT path, language, mtime_ns, size, 0 AS has_summary, NULL AS summary_header FROM files",
-            ).fetchall()
+            return {}
         return {row["path"]: row for row in rows}
+
+    def _file_columns(self) -> set[str]:
+        return {row[1] for row in self.connection.execute("PRAGMA table_info(files)")}
+
+    def file_languages(self, paths: Iterable[str]) -> dict[str, str]:
+        """Stored language per path, for the paths that have a row."""
+        wanted = list(dict.fromkeys(paths))
+        languages: dict[str, str] = {}
+        for chunk in _chunks(wanted, SQLITE_BATCH_SIZE):
+            placeholders = ", ".join("?" * len(chunk))
+            rows = self.connection.execute(
+                f"SELECT path, language FROM files WHERE path IN ({placeholders})", chunk
+            ).fetchall()
+            languages.update({row["path"]: row["language"] for row in rows})
+        return languages
+
+    def meta_value(self, key: str) -> str | None:
+        try:
+            row = self.connection.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return row["value"] if row is not None else None
+
+    def set_meta_value(self, key: str, value: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                (key, value),
+            )
 
     def schema_version(self) -> int | None:
         try:
@@ -2124,15 +2573,17 @@ class _Storage:
         size: int,
         symbols: Iterable[Symbol],
         references: Iterable[Reference],
+        revision: str | None = None,
     ) -> None:
         symbols = list(symbols)
+        self._ensure_file_columns()
         with self.connection:
             self.connection.execute(
                 """
-                INSERT OR REPLACE INTO files(path, language, mtime_ns, size)
-                VALUES (?, ?, ?, ?)
+                INSERT OR REPLACE INTO files(path, language, mtime_ns, size, extractor_revision)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (path.as_posix(), language, mtime_ns, size),
+                (path.as_posix(), language, mtime_ns, size, revision),
             )
             self.connection.executemany(
                 """
@@ -2175,7 +2626,26 @@ class _Storage:
             size=indexed_file.size,
             symbols=indexed_file.symbols,
             references=indexed_file.references,
+            revision=indexed_file.revision,
         )
+
+    def _ensure_file_columns(self) -> None:
+        """Add the optional, nullable ``files`` columns when they are missing.
+
+        Additive and on-demand: an old index is still readable without this, and
+        no read path calls it. Older writers use explicit column lists and turn
+        their values back into NULL, which is exactly what the revision check
+        detects. Downgraded semantics are not guaranteed.
+        """
+        columns = self._file_columns()
+        additions = (
+            ("name_summary", "BLOB"),
+            ("extractor_revision", "TEXT"),
+        )
+        with self.connection:
+            for column, column_type in additions:
+                if column not in columns:
+                    self.connection.execute(f"ALTER TABLE files ADD COLUMN {column} {column_type}")
 
     def replace_files(
         self,
@@ -2186,11 +2656,11 @@ class _Storage:
         progress: Any | None = None,
         git_baseline: str | None = None,
         summary_updates: Iterable[tuple[bytes, str]] = (),
+        rule_upgrade_paths: set[str] | None = None,
     ) -> None:
-        # Nullable, additive schema-5 capability: no row rewrite or backfill.
+        # Nullable, additive schema-5 capabilities: no row rewrite or backfill.
         # Older writers use explicit columns and replace summaries with NULL.
-        if not any(row[1] == "name_summary" for row in self.connection.execute("PRAGMA table_info(files)")):
-            self.connection.execute("ALTER TABLE files ADD COLUMN name_summary BLOB")
+        self._ensure_file_columns()
         indexed_files = list(indexed_files)
         deleted_paths = list(deleted_paths)
         symbol_count = sum(len(indexed_file.symbols) for indexed_file in indexed_files)
@@ -2209,6 +2679,9 @@ class _Storage:
             progress("write_start", done=0, total=write_total)
 
         for file_chunk in _chunks(indexed_files, SQLITE_FILE_BATCH_SIZE):
+            unchanged = self._unchanged_upgrade_symbols(file_chunk, rule_upgrade_paths) if rule_upgrade_paths else set()
+            changed_files = ([file for file in file_chunk if file.path.as_posix() not in unchanged]
+                             if unchanged else file_chunk)
             file_rows = [
                 (
                     indexed_file.path.as_posix(),
@@ -2216,29 +2689,37 @@ class _Storage:
                     indexed_file.mtime_ns,
                     indexed_file.size,
                     indexed_file.name_summary,
+                    indexed_file.revision,
                 )
                 for indexed_file in file_chunk
             ]
             symbol_rows = [
                 _symbol_row(symbol)
-                for indexed_file in file_chunk
+                for indexed_file in changed_files
                 for symbol in indexed_file.symbols
             ]
             fts_rows = [
                 _symbol_fts_row(symbol)
-                for indexed_file in file_chunk
+                for indexed_file in changed_files
                 for symbol in indexed_file.symbols
             ] if self.has_symbol_fts else []
             with self.connection:
                 _delete_paths_chunked(
                     self.connection,
-                    [indexed_file.path for indexed_file in file_chunk],
+                    [indexed_file.path for indexed_file in changed_files],
                     include_fts=self.has_symbol_fts,
                 )
+                if unchanged:
+                    placeholders = ','.join('?' for _ in unchanged)
+                    self.connection.execute(f'DELETE FROM refs WHERE path IN ({placeholders})', tuple(unchanged))
+                    # The equality checks complete this work without rewriting
+                    # identical symbol/FTS rows; metadata still advances below.
+                    write_done += sum(len(file.symbols) for file in file_chunk
+                                      if file.path.as_posix() in unchanged) * (2 if self.has_symbol_fts else 1)
                 self.connection.executemany(
                     """
-                    INSERT OR REPLACE INTO files(path, language, mtime_ns, size, name_summary)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO files(path, language, mtime_ns, size, name_summary, extractor_revision)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     file_rows,
                 )
@@ -2305,6 +2786,24 @@ class _Storage:
             if progress is not None:
                 progress("write_tick", done=write_done, total=write_total)
                 progress("finalize", done=write_done, total=write_total)
+
+    def _unchanged_upgrade_symbols(self, files: list[_IndexedFile], candidates: set[str]) -> set[str]:
+        """Compare only rule upgrades, in one bounded read per file batch."""
+        paths = [file.path.as_posix() for file in files if file.path.as_posix() in candidates]
+        if not paths:
+            return set()
+        previous: dict[str, dict[str, tuple]] = {path: {} for path in paths}
+        placeholders = ','.join('?' for _ in paths)
+        for row in self.connection.execute(
+            'SELECT id, name, kind, language, path, start_line, start_col, end_line, end_col, '
+            f'start_byte, end_byte, signature, container FROM symbols WHERE path IN ({placeholders})', paths,
+        ):
+            previous[row[4]][row[0]] = tuple(row)
+        return {
+            file.path.as_posix() for file in files
+            if file.path.as_posix() in previous
+            and previous[file.path.as_posix()] == {symbol.id: _symbol_row(symbol) for symbol in file.symbols}
+        }
 
     def search_symbols(
         self,
@@ -2789,12 +3288,23 @@ def _path_filter_clause(column: str, path: str | Path | Iterable[str | Path] | N
     return "(" + " OR ".join(clauses) + ")", params
 
 
-def _spec_for_path(path: Path, languages: set[str] | None = None) -> LanguageSpec | None:
-    return _spec_for_extension(path.suffix.lower(), languages)
+def _spec_for_path(
+    path: Path,
+    languages: set[str] | None = None,
+    header_language: str | None = None,
+) -> LanguageSpec | None:
+    return _spec_for_extension(path.suffix.lower(), languages, header_language)
 
 
-def _spec_for_extension(extension: str, languages: set[str] | None = None) -> LanguageSpec | None:
-    spec = LANGUAGE_BY_EXTENSION.get(extension)
+def _spec_for_extension(
+    extension: str,
+    languages: set[str] | None = None,
+    header_language: str | None = None,
+) -> LanguageSpec | None:
+    if header_language is not None and extension == HEADER_EXTENSION:
+        spec = LANGUAGE_BY_NAME.get(header_language)
+    else:
+        spec = LANGUAGE_BY_EXTENSION.get(extension)
     if spec is None:
         return None
     if languages is not None and spec.name not in languages:
@@ -2804,6 +3314,32 @@ def _spec_for_extension(extension: str, languages: set[str] | None = None) -> La
     except UnsupportedLanguageError:
         return None
     return spec
+
+
+def _validate_header_language(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value not in HEADER_LANGUAGES:
+        raise ValueError(f"header language must be one of: {', '.join(HEADER_LANGUAGES)}")
+    return value
+
+
+def _file_spec(repo: CodeIndex, path: Path) -> LanguageSpec | None:
+    """Language to parse an already-indexed file with.
+
+    Reads follow the language the file's own row was written with, so a header
+    conversion that is still in progress parses each file the way it was stored
+    instead of with today's pending setting.
+    """
+    resolver = getattr(repo, "_stored_spec", None)
+    if resolver is not None:
+        return resolver(path)
+    return _spec_for_path(path, getattr(repo, "languages", None))
+
+
+def _file_language(repo: CodeIndex, path: Path) -> str | None:
+    resolver = getattr(repo, "_stored_language", None)
+    return resolver(path) if resolver is not None else None
 
 
 def _name_summary_current(header: bytes | None, stat: os.stat_result) -> bool:
@@ -2928,9 +3464,22 @@ def _parse_file(
     include_references: bool = True,
     *,
     reference_name: str | frozenset[str] | None = None,
+    language: str | None = None,
+    header_language: str | None = None,
+    collect_bodies: bool = True,
 ) -> _IndexedFile | None:
     full_path = root / relative_path
-    spec = _spec_for_path(relative_path, languages)
+    spec = None
+    if language is not None:
+        candidate = LANGUAGE_BY_NAME.get(language)
+        if candidate is not None:
+            try:
+                _parser_for_language(candidate.name)
+            except UnsupportedLanguageError:
+                candidate = None
+            spec = candidate
+    if spec is None:
+        spec = _spec_for_path(relative_path, languages, header_language)
     if spec is None:
         return None
 
@@ -2943,17 +3492,20 @@ def _parse_file(
     tree = _parse_source(_parser_for_language(spec.name), source_text)
     root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
     source_bytes = source_text.encode("utf-8")
+    bodies: tuple[_CallableBody, ...] = ()
     if reference_name is not None:
         symbols = []
         references = _extract_named_references(source_bytes, root_node, relative_path, spec, reference_name)
     else:
-        symbols, references = _extract_symbols_and_references(
+        symbols, references, extracted_bodies = _extract_symbols_and_references(
             source=source_bytes,
             root_node=root_node,
             path=relative_path,
             language=spec,
             include_references=include_references,
+            collect_bodies=collect_bodies,
         )
+        bodies = tuple(extracted_bodies)
     return _IndexedFile(
         path=relative_path,
         language=spec.name,
@@ -2961,8 +3513,22 @@ def _parse_file(
         size=stat.st_size,
         symbols=tuple(symbols),
         references=tuple(references),
-        name_summary=_file_name_summary(source_bytes, stat) if not include_references else None,
+        bodies=tuple(bodies),
+        name_summary=_file_name_summary(source_bytes, stat) if not include_references and not collect_bodies else None,
+        revision=EXTRACTOR_REVISIONS.get(spec.name),
     )
+
+
+def _parse_file_batch(root, paths, languages, include_references, header_language):
+    results = []
+    for path in paths:
+        try:
+            result = _parse_file(root, path, languages, include_references,
+                                 header_language=header_language, collect_bodies=include_references)
+        except Exception:
+            result = None  # One failed file must not discard successful neighbours.
+        results.append(result)
+    return results
 
 
 def _terminate_executor(executor: concurrent.futures.ProcessPoolExecutor) -> None:
@@ -3023,13 +3589,24 @@ _PARSER_TLS = threading.local()
 
 
 def _parse_source(parser, source: str):
+    # Share immutable trees only within a query. Content is part of the key, so
+    # a live edit cannot return an old tree, even inside the same request.
+    cache = getattr(_PARSER_TLS, 'query_trees', None)
+    key = (id(parser), source) if cache is not None and len(source) <= QUERY_PARSE_MAX_SOURCE_CHARS else None
+    if key is not None and key in cache:
+        return cache[key]
     # tree-sitter's parse() signature varies across versions/builds: some accept str, others
     # require bytes (raising "source must be a bytestring or a callable, not str"). Try str first,
     # then fall back to encoded bytes so both bindings work. Byte offsets are identical either way.
     try:
-        return parser.parse(source)
+        tree = parser.parse(source)
     except TypeError:
-        return parser.parse(source.encode("utf-8"))
+        tree = parser.parse(source.encode("utf-8"))
+    if key is not None:
+        if len(cache) >= QUERY_PARSE_MAX_TREES:
+            del cache[next(iter(cache))]
+        cache[key] = tree
+    return tree
 
 
 def _parser_for_language(language: str):
@@ -3076,6 +3653,25 @@ def _field_child(node: Node | None, *names: str) -> Node | None:
     return None
 
 
+def _field_children(node: Node, field: str) -> list[Node]:
+    """Every child in ``field``, in source order.
+
+    ``child_by_field_name`` returns only the first one, which is why ``int a, b;``
+    and Swift's ``let a = 1, b = 2`` used to lose the later names.
+    """
+    getter = getattr(node, "children_by_field_name", None)
+    if getter is not None:
+        try:
+            return list(getter(field))
+        except Exception:
+            pass
+    return [
+        child
+        for index, child in enumerate(_node_children(node))
+        if _field_name_at(node, index) == field
+    ]
+
+
 def _member_name_node(member: Node | None, language: LanguageSpec) -> Node | None:
     """The name part of a member access node (``obj.NAME``), not the receiver."""
     field = _field_child(member, *_MEMBER_NAME_FIELDS)
@@ -3120,6 +3716,113 @@ def _child_reference_context(
     return ctx | added
 
 
+def _callable_body_node(node: Node, language: LanguageSpec) -> Node | None:
+    """The body node of ``node`` when it is a callable that owns its calls."""
+    node_types = _CALLABLE_BODY_NODE_TYPES.get(language.name)
+    if node_types is None or _node_kind(node) not in node_types:
+        return None
+    field = _field_child(node, *_BODY_FIELD_NAMES)
+    if field is not None:
+        return field
+    for child in _node_children(node):
+        if _node_kind(child) in _BODY_NODE_TYPES:
+            return child
+    return None
+
+
+# Containment is half-open; comparison is by byte offset so two callables on the
+# same line stay distinguishable.
+def _span_contains(outer: tuple[int, int], inner: tuple[int, int]) -> bool:
+    return outer[0] <= inner[0] and inner[1] <= outer[1]
+
+
+def _callable_bodies(source: bytes, node: Node, language: LanguageSpec, symbol: Symbol | None) -> _CallableBody | None:
+    body_node = _callable_body_node(node, language)
+    if body_node is None:
+        return None
+    return _CallableBody(
+        name=symbol.name if symbol is not None else "",
+        name_start_byte=symbol.range.start_byte if symbol is not None else _node_start_byte(node),
+        start_byte=_node_start_byte(body_node),
+        end_byte=_node_end_byte(body_node),
+    )
+
+
+def _owning_body(bodies: Sequence[_CallableBody], symbol: Symbol) -> _CallableBody | None:
+    """The body recorded for ``symbol``, or ``None`` when it has no body here."""
+    exact = [
+        body
+        for body in bodies
+        if body.name == symbol.name and body.name_start_byte == symbol.range.start_byte
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    containing = [
+        body
+        for body in bodies
+        if body.name == symbol.name and body.start_byte <= symbol.range.start_byte <= body.end_byte
+    ]
+    if containing:
+        return min(containing, key=lambda body: (body.end_byte - body.start_byte, body.start_byte))
+    return None
+
+
+def _callable_is_named(source: bytes, language: LanguageSpec, node: Node) -> bool:
+    """Whether a callable node is named by the declaration holding it.
+
+    ``const f = () => x`` and ``auto fn = [] { x };`` name the callable outside
+    the callable node, so a two-level look-up covers those grammars while staying
+    far away from unrelated ancestors (a lambda inside a function is anonymous).
+    """
+    candidate = node.parent
+    if _declares_call_owner(source, language, node):
+        return True
+    for _ in range(2):
+        if candidate is None:
+            return False
+        if _declares_call_owner(source, language, candidate):
+            name_node = _name_node(candidate, language)
+            return name_node is not None and bool(_node_text(source, name_node))
+        candidate = candidate.parent
+    return False
+
+
+def _declares_call_owner(source: bytes, language: LanguageSpec, node: Node) -> bool:
+    """Whether ``node`` declares something that can own a call."""
+    kind = _definition_kind(source, language, node)
+    return kind is not None and kind in CALL_OWNER_KINDS
+
+
+def _descendant_at(root_node: Node, start_byte: int, end_byte: int) -> Node | None:
+    getter = getattr(root_node, "descendant_for_byte_range", None)
+    if getter is None:
+        return None
+    try:
+        return getter(start_byte, max(end_byte, start_byte + 1))
+    except Exception:
+        return None
+
+
+def _call_owner_at(
+    root_node: Node, source: bytes, language: LanguageSpec, start_byte: int, end_byte: int
+) -> tuple[tuple[int, int], bool] | None:
+    """Innermost callable body containing a position, and whether it is named.
+
+    Anonymous bodies (lambdas, closures) are ownership boundaries but publish no
+    symbol, so a call inside one belongs to nobody the index can name.
+    """
+    node = _descendant_at(root_node, start_byte, end_byte)
+    span = (start_byte, end_byte)
+    while node is not None:
+        body = _callable_body_node(node, language)
+        if body is not None:
+            body_span = (_node_start_byte(body), _node_end_byte(body))
+            if _span_contains(body_span, span):
+                return body_span, _callable_is_named(source, language, node)
+        node = node.parent
+    return None
+
+
 def _opens_with_bracket(node: Node) -> bool:
     """Whether ``node``'s leftmost delimiter is ``[`` rather than ``(``."""
     for child in _node_children(node):
@@ -3156,6 +3859,16 @@ def _is_call_callee(node: Node, parent: Node | None, grandparent: Node | None, l
     parent_kind = _node_kind(parent)
     if parent_kind in language.call_node_types:
         return _same_node(_callee_node(parent, language), node)
+    # Qualified call: ``demo::helper()`` / ``Type::f()``. The callee is the
+    # qualified name; its terminal part is the call, and the scope stays as
+    # written in the source line that carries the reference.
+    if (
+        parent_kind in _QUALIFIED_NAME_NODE_TYPES
+        and grandparent is not None
+        and _node_kind(grandparent) in language.call_node_types
+        and _same_node(_callee_node(grandparent, language), parent)
+    ):
+        return _same_node(_field_child(parent, "name"), node)
     # Method call: ``obj.method()`` — node is the member of a member-access node
     # that is itself the callee of the surrounding call.
     if (
@@ -3267,11 +3980,17 @@ def _extract_symbols_and_references(
     path: Path,
     language: LanguageSpec,
     include_references: bool = True,
-) -> tuple[list[Symbol], list[Reference]]:
+    collect_bodies: bool = True,
+) -> tuple[list[Symbol], list[Reference], list[_CallableBody]]:
     symbols: list[Symbol] = []
     references: list[Reference] = []
+    bodies: list[_CallableBody] = []
     line_starts = _line_starts(source)
     lines = source.decode("utf-8", errors="replace").splitlines() if include_references else []
+    # Hoisted out of the walk: both are constant for the file, and the walk visits
+    # every node, so a per-node dict look-up would be paid tens of thousands of times.
+    body_node_types = _CALLABLE_BODY_NODE_TYPES.get(language.name) if collect_bodies else None
+    has_multi_symbol_rules = language.name in _MULTI_SYMBOL_LANGUAGES
 
     def walk(
         node: Node,
@@ -3280,18 +3999,60 @@ def _extract_symbols_and_references(
         grandparent: Node | None,
         ctx: frozenset[str],
         in_function: bool = False,
+        scope_kind: str | None = None,
     ) -> None:
-        symbol = _symbol_from_node(source, path, language, node, container, line_starts)
+        # Every node needs its kind: the declaration rule, the body rule, the
+        # reference rule and the transparency rule all branch on it, so it is
+        # resolved once instead of once per rule.
+        node_kind = _node_kind(node)
+        if c_state is not None:
+            declared = (
+                _c_node_symbols(source, path, language, node, container, scope_kind, line_starts, c_state)
+                if node_kind in _C_DECLARATION_NODE_TYPES
+                else []
+            )
+        else:
+            declared = (
+                _extra_node_symbols(source, path, language, node, container, line_starts)
+                if has_multi_symbol_rules
+                else None
+            )
+            if declared is None:
+                single = (_symbol_from_node(source, path, language, node, container, line_starts)
+                          if node_kind in language.definitions else None)
+                declared = (
+                    [(single, "container" if single.kind in CONTAINER_KINDS else None)]
+                    if single is not None
+                    else []
+                )
         next_container = container
-        next_in_function = in_function or (symbol is not None and symbol.kind in FUNCTION_KINDS)
-        if symbol is not None and in_function and symbol.kind in language.non_local_kinds:
-            symbol = None  # a local binding, not a declaration
-        if symbol is not None:
+        next_scope_kind = scope_kind
+        next_in_function = in_function
+        primary: Symbol | None = None
+        for symbol, opens in declared:
+            if symbol.kind in FUNCTION_KINDS:
+                next_in_function = True
+            if in_function and symbol.kind in language.non_local_kinds:
+                continue  # a local binding, not a declaration
             symbols.append(symbol)
-            if symbol.kind in CONTAINER_KINDS:
+            if primary is None:
+                primary = symbol
+            if opens is not None:
+                # Only a class, namespace or function opens a scope; two variables
+                # from one declaration must never become each other's container.
                 next_container = symbol.name if container is None else f"{container}.{symbol.name}"
+                if opens != "container":
+                    next_scope_kind = opens
 
-        if include_references and _node_kind(node) in language.identifier_node_types:
+        if body_node_types is not None and node_kind in body_node_types:
+            # The kind filter is the cheap part: only a plausible callable pays for
+            # the body look-up, and the kind test is what ``_callable_body_node``
+            # would have checked first anyway.
+            body = _callable_bodies(source, node, language, primary)
+            if body is not None:
+                bodies.append(body)
+
+        if include_references and node_kind in language.identifier_node_types:
             references.append(
                 Reference(
                     symbol_id="",
@@ -3305,37 +4066,114 @@ def _extract_symbols_and_references(
             )
 
         child_ctx = _child_reference_context(node, parent, ctx, language) if include_references else ctx
-        if _node_kind(node) in language.transparent_node_types:
+        if node_kind in language.transparent_node_types:
             child_parent, child_grandparent = parent, grandparent
         else:
             child_parent, child_grandparent = node, parent
-        for child in _node_children(node):
-            walk(child, next_container, child_parent, child_grandparent, child_ctx, next_in_function)
+        # C/C++ declaration nodes are named. A symbol-only write need not visit
+        # punctuation/keyword leaves; declaration handlers still see all children.
+        children = getattr(node, "named_children", None) if c_state is not None and not include_references else None
+        for child in children if children is not None else _node_children(node):
+            if c_state is not None and not include_references and getattr(child, 'child_count', 1) == 0:
+                continue  # C/C++ declarations own a name child; leaves cannot publish symbols.
+            walk(child, next_container, child_parent, child_grandparent, child_ctx, next_in_function, next_scope_kind)
 
+    c_state = _CFileState(source, root_node) if language.name in _C_LANGUAGE_NAMES else None
     walk(root_node, None, None, None, frozenset())
     if language.name == "python":
-        symbols.extend(_python_top_level_symbols(source, path, language, root_node, line_starts))
-    return symbols, references
+        symbols.extend(_python_symbols(source, path, language, root_node, line_starts))
+    return symbols, references, bodies
 
 
-def _python_top_level_symbols(
+def _python_symbols(
     source: bytes, path: Path, language: LanguageSpec, root_node: Node,
     line_starts: Sequence[int] | None = None,
 ) -> list[Symbol]:
+    """Module-level bindings and class-body fields.
+
+    The generic walk publishes nothing for an ``assignment``, so the module and
+    class scopes are handled here: every name bound by an assignment target
+    becomes a symbol, including chained (``a = b = 1``) and tuple/list targets.
+    A class body's assignments are fields of that class; a function body's
+    locals are not visited at all.
+    """
     symbols: list[Symbol] = []
     for node in _node_children(root_node):
-        if _node_kind(node) != "assignment":
-            continue
-        left = node.child_by_field_name("left")
-        if left is None:
-            continue
-        name_node = _first_identifier(left, language)
-        if name_node is None:
-            continue
+        if _node_kind(node) == "decorated_definition":
+            node = node.child_by_field_name("definition")
+            if node is None:
+                continue
+        node_kind = _node_kind(node)
+        if node_kind == "assignment":
+            symbols.extend(
+                _python_assignment_symbols(
+                    source, path, language, node, container=None, as_field=False, line_starts=line_starts
+                )
+            )
+        elif node_kind == "class_definition":
+            symbols.extend(
+                _python_class_field_symbols(source, path, language, node, container=None, line_starts=line_starts)
+            )
+    return symbols
+
+
+def _python_class_field_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    class_node: Node,
+    container: str | None,
+    line_starts: Sequence[int] | None = None,
+) -> list[Symbol]:
+    """Annotated and plain class-body assignments, plus nested classes."""
+    name_node = class_node.child_by_field_name("name")
+    class_name = _node_text(source, name_node) if name_node is not None else ""
+    if not class_name:
+        return []
+    qualified = class_name if container is None else f"{container}.{class_name}"
+    body = class_node.child_by_field_name("body")
+    if body is None:
+        return []
+    symbols: list[Symbol] = []
+    for child in _node_children(body):
+        if _node_kind(child) == "decorated_definition":
+            child = child.child_by_field_name("definition")
+            if child is None:
+                continue
+        child_kind = _node_kind(child)
+        if child_kind == "assignment":
+            symbols.extend(
+                _python_assignment_symbols(
+                    source, path, language, child, container=qualified, as_field=True, line_starts=line_starts
+                )
+            )
+        elif child_kind == "class_definition":
+            symbols.extend(
+                _python_class_field_symbols(
+                    source, path, language, child, container=qualified, line_starts=line_starts
+                )
+            )
+    return symbols
+
+
+def _python_assignment_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    assignment: Node,
+    *,
+    container: str | None,
+    as_field: bool,
+    line_starts: Sequence[int] | None = None,
+) -> list[Symbol]:
+    """One symbol per name the right-hand chain of ``assignment`` binds."""
+    symbols: list[Symbol] = []
+    first_name: str | None = None
+    for name_node in _python_assignment_bindings(language, assignment):
         name = _node_text(source, name_node)
         if not name or not _looks_like_symbol_name(name):
             continue
-        kind = "constant" if name.isupper() else "variable"
+        kind = "field" if as_field else ("constant" if name.isupper() else "variable")
         range_ = _node_range(source, name_node, line_starts)
         symbols.append(
             Symbol(
@@ -3345,12 +4183,63 @@ def _python_top_level_symbols(
                 language=language.name,
                 path=path,
                 range=range_,
-                signature=_signature(source, node),
-                container=None,
+                signature=_signature(source, assignment),
+                container=container,
             )
         )
-        symbols.extend(_python_dict_key_symbols(source, path, language, node, container=name, line_starts=line_starts))
+        if first_name is None:
+            first_name = name
+    if first_name is not None and not as_field:
+        # Dictionary keys keep their previous container and stay a single set of
+        # symbols: a multi-target assignment must not duplicate them.
+        symbols.extend(
+            _python_dict_key_symbols(
+                source, path, language, assignment, container=first_name, line_starts=line_starts
+            )
+        )
     return symbols
+
+
+def _python_assignment_bindings(language: LanguageSpec, assignment: Node) -> list[Node]:
+    """Name nodes an assignment chain binds, in target order.
+
+    ``a = b = 1`` nests the second target in the first assignment's value field,
+    so the chain is followed only while that value is itself an assignment.
+    """
+    bindings: list[Node] = []
+    node: Node | None = assignment
+    while node is not None and _node_kind(node) == "assignment":
+        left = node.child_by_field_name("left")
+        if left is not None:
+            bindings.extend(_python_binding_targets(language, left))
+        right = node.child_by_field_name("right")
+        node = right if right is not None and _node_kind(right) == "assignment" else None
+    return bindings
+
+
+def _python_binding_targets(language: LanguageSpec, node: Node) -> list[Node]:
+    """Identifier nodes bound by the target side of an assignment.
+
+    Attribute and subscript targets name objects that already exist, so
+    ``obj.value = 1`` defines neither ``obj`` nor ``value``; tuple, list and
+    starred patterns contribute every name they bind.
+    """
+    if _node_kind(node) in language.identifier_node_types:
+        return [node]
+    if _node_kind(node) in _PYTHON_UNBINDABLE_TARGET_NODE_TYPES:
+        return []
+    found: list[Node] = []
+    for child in _node_children(node):
+        found.extend(_python_binding_targets(language, child))
+    return found
+
+
+# Assignment targets that name existing objects or values instead of declaring a
+# binding. ``call`` and ``binary_operator`` are not valid Python targets, but a
+# grammar error must not turn their contents into definitions.
+_PYTHON_UNBINDABLE_TARGET_NODE_TYPES = frozenset(
+    {"attribute", "binary_operator", "call", "subscript"}
+)
 
 
 def _python_dict_key_symbols(
@@ -3401,6 +4290,361 @@ def _python_dict_key_name(source: bytes, language: LanguageSpec, node: Node) -> 
     if _node_kind(node) in language.identifier_node_types:
         return _node_text(source, node), node
     return None, node
+
+
+_C_LANGUAGE_NAMES = ("c", "cpp")
+
+# Declaration owners: the only C/C++ nodes allowed to publish symbols. Every other
+# node contributes nothing, so the traversal never hunts for an arbitrary
+# identifier inside an expression.
+_C_DECLARATION_NODE_TYPES = frozenset(
+    {
+        "alias_declaration",
+        "class_specifier",
+        "declaration",
+        "enum_specifier",
+        "enumerator",
+        "field_declaration",
+        "function_definition",
+        "namespace_definition",
+        "preproc_def",
+        "preproc_function_def",
+        "struct_specifier",
+        "type_definition",
+        "union_specifier",
+    }
+)
+
+_C_SCOPE_NODE_KINDS = {
+    "class_specifier": "class",
+    "enum_specifier": "enum",
+    "namespace_definition": "namespace",
+    "struct_specifier": "struct",
+    "union_specifier": "struct",  # union reuses struct: no new kind this round
+}
+
+# Nodes that carry declarators (possibly several, as in ``int a, b, c;``).
+_C_DECLARATOR_NODE_KINDS = ("declaration", "field_declaration", "function_definition", "type_definition")
+
+_C_TYPE_SCOPE_KINDS = frozenset({"class", "struct", "enum"})
+
+# Nodes whose text can be a declared name. ``destructor_name`` and
+# ``operator_name`` stay whole so ``~Widget`` and ``operator+`` survive as names.
+_C_NAME_NODE_TYPES = frozenset(
+    {
+        "destructor_name",
+        "field_identifier",
+        "identifier",
+        "operator_name",
+        "qualified_identifier",
+        "type_identifier",
+    }
+)
+
+# Fields that never hold the declared name: parameters, initialisers, bodies and
+# the type specifier, whose identifiers belong to nested declarations.
+_C_NAME_SKIP_FIELDS = frozenset(
+    {"arguments", "body", "default_value", "parameters", "size", "type", "value"}
+)
+
+# Subtrees skipped while looking for a declared name.
+_C_NAME_SKIP_NODE_TYPES = frozenset(
+    {
+        "argument_list",
+        "compound_statement",
+        "field_initializer_list",
+        "initializer_list",
+        "lambda_capture_specifier",
+        "parameter_list",
+        "parameters",
+        "template_argument_list",
+        "template_parameter_list",
+    }
+)
+
+_C_DECLARATOR_OPERATIONS = {
+    "array_declarator": "array",
+    "function_declarator": "function",
+    "pointer_declarator": "pointer",
+    "reference_declarator": "reference",
+}
+
+# What a resolved declaration means structurally, before scope refinement.
+_C_CONSTANT_NODE_KINDS = {
+    "enumerator": "constant",
+    "preproc_def": "constant",
+    "preproc_function_def": "constant",
+}
+
+
+def _field_name_at(node: Node, index: int) -> str | None:
+    getter = getattr(node, "field_name_for_child", None)
+    if getter is None:
+        return None
+    try:
+        return getter(index)
+    except Exception:
+        return None
+
+
+def _declarator_field_children(node: Node) -> list[Node]:
+    """Every ``declarator`` field child, in source order."""
+    return _field_children(node, "declarator")
+
+
+def _c_declarator_name_node(declarator: Node) -> Node | None:
+    """The declared name inside a declarator, following declarator structure.
+
+    Descends through pointer/reference/array/function/parenthesised/init
+    declarators but never into parameters, initialisers or function bodies.
+    """
+    kind = _node_kind(declarator)
+    if kind in _C_NAME_NODE_TYPES:
+        return declarator
+    if kind in _C_NAME_SKIP_NODE_TYPES:
+        return None
+    for index, child in enumerate(_node_children(declarator)):
+        if _field_name_at(declarator, index) in _C_NAME_SKIP_FIELDS:
+            continue
+        found = _c_declarator_name_node(child)
+        if found is not None:
+            return found
+    return None
+
+
+def _c_declarator_operation(name_node: Node, stop: Node) -> str | None:
+    """The first binding operation outward from the name, within ``stop``.
+
+    ``int *f(int)`` reads function then pointer (a function); ``int (*fp)(int)``
+    reads pointer then function (a variable). Parentheses are not operations.
+    """
+    node = name_node.parent
+    while node is not None and not _same_node(node, stop):
+        operation = _C_DECLARATOR_OPERATIONS.get(_node_kind(node))
+        if operation is not None:
+            return operation
+        node = node.parent
+    return None
+
+
+def _c_qualified_name(source: bytes, node: Node) -> tuple[Node, str | None]:
+    """Terminal name node and the scope written in the source, if any.
+
+    ``demo::Widget::run`` yields the ``run`` node and ``demo.Widget``; the scope
+    is read from ``qualified_identifier`` fields, never from the first identifier
+    found in the subtree.
+    """
+    if _node_kind(node) != "qualified_identifier":
+        return node, None
+    scope_node = _field_child(node, "scope")
+    name_node = _field_child(node, "name")
+    if scope_node is None or name_node is None:
+        return node, None
+    terminal, inner_scope = _c_qualified_name(source, name_node)
+    prefix = _node_text(source, scope_node)
+    return terminal, prefix if inner_scope is None else f"{prefix}.{inner_scope}"
+
+
+@dataclass(frozen=True, slots=True)
+class _CDeclaration:
+    """One declared entity inside a C/C++ declaration node.
+
+    Temporary extraction record: ``definition_node`` is the whole declaration the
+    preview must cover, ``name_node`` carries the name's byte range and identity.
+    """
+
+    name: str
+    kind: str
+    name_node: Node
+    definition_node: Node
+    explicit_scope: str | None = None
+
+
+def _c_declarator_declarations(source: bytes, node: Node, node_kind: str) -> list[_CDeclaration]:
+    records: list[_CDeclaration] = []
+    for declarator in _declarator_field_children(node):
+        name_node = _c_declarator_name_node(declarator)
+        if name_node is None:
+            continue
+        if node_kind == "type_definition":
+            kind = "type"  # typedef context wins: even a function pointer aliases a type
+        elif node_kind == "field_declaration":
+            kind = "method" if _c_declarator_operation(name_node, node) == "function" else "field"
+        elif node_kind == "function_definition":
+            kind = "function"
+        else:
+            kind = "function" if _c_declarator_operation(name_node, node) == "function" else "variable"
+        terminal, explicit_scope = _c_qualified_name(source, name_node)
+        records.append(
+            _CDeclaration(
+                name=_node_text(source, terminal),
+                kind=kind,
+                name_node=terminal,
+                definition_node=node,
+                explicit_scope=explicit_scope,
+            )
+        )
+    return records
+
+
+def _c_declarations(source: bytes, node: Node) -> list[_CDeclaration]:
+    """Declarations owned by one node; empty for anything else."""
+    node_kind = _node_kind(node)
+    if node_kind not in _C_DECLARATION_NODE_TYPES:
+        return []
+    if node_kind in _C_DECLARATOR_NODE_KINDS:
+        return _c_declarator_declarations(source, node, node_kind)
+    name_node = _field_child(node, "name")
+    if name_node is None:
+        return []  # anonymous struct/union/enum: no symbol of its own
+    scope_kind = _C_SCOPE_NODE_KINDS.get(node_kind)
+    if scope_kind is not None:
+        return [
+            _CDeclaration(
+                name=_node_text(source, name_node),
+                kind=scope_kind,
+                name_node=name_node,
+                definition_node=node,
+            )
+        ]
+    kind = _C_CONSTANT_NODE_KINDS.get(node_kind, "type")
+    return [
+        _CDeclaration(
+            name=_node_text(source, name_node),
+            kind=kind,
+            name_node=name_node,
+            definition_node=node,
+        )
+    ]
+
+
+# Qualified name nodes (``demo::helper``, ``Type::f``) whose terminal part is the
+# entity and whose leading parts are the explicitly written scope.
+_QUALIFIED_NAME_NODE_TYPES = ("qualified_identifier", "scoped_identifier", "scoped_type_identifier")
+
+
+class _CFileState:
+    """Per-file scope facts shared by extraction and definition-range lookup."""
+
+    __slots__ = ("root_node", "scanned", "source", "type_scopes")
+
+    def __init__(self, source: bytes, root_node: Node) -> None:
+        self.root_node = root_node
+        self.source = source
+        self.type_scopes: set[str] = set()
+        self.scanned = False
+
+
+def _c_last_segment(name: str | None) -> str | None:
+    if not name:
+        return None
+    return name.rsplit(".", 1)[-1]
+
+
+def _c_explicit_container(container: str | None, explicit_scope: str) -> str:
+    if container and explicit_scope != container and not explicit_scope.startswith(container + "."):
+        return f"{container}.{explicit_scope}"
+    return explicit_scope
+
+
+def _c_scope_opened_by(kind: str) -> str | None:
+    """The scope kind a symbol introduces, or ``None`` when it introduces none."""
+    if kind in _C_TYPE_SCOPE_KINDS:
+        return "type"
+    if kind == "namespace":
+        return "namespace"
+    if kind in FUNCTION_KINDS:
+        return "function"
+    return None
+
+
+def _c_scan_type_scopes(state: _CFileState) -> None:
+    """Collect every type-scope path in the file once, for late definitions."""
+    state.scanned = True
+    found = state.type_scopes
+
+    def visit(node: Node, container: str | None) -> None:
+        child_container = container
+        for record in _c_declarations(state.source, node):
+            if record.kind in _C_TYPE_SCOPE_KINDS or record.kind == "namespace":
+                child_container = record.name if container is None else f"{container}.{record.name}"
+                if record.kind in _C_TYPE_SCOPE_KINDS:
+                    found.add(child_container)
+                container = child_container
+        for child in _node_children(node):
+            visit(child, child_container)
+
+    visit(state.root_node, None)
+
+
+def _c_type_scope_known(name: str, state: _CFileState) -> bool:
+    if name in state.type_scopes:
+        return True
+    if not state.scanned:
+        _c_scan_type_scopes(state)
+    return name in state.type_scopes
+
+
+def _c_resolved_declarations(
+    source: bytes,
+    node: Node,
+    container: str | None,
+    scope_kind: str | None,
+    state: _CFileState,
+) -> list[tuple[_CDeclaration, str, str | None, str | None]]:
+    """Declarations of one node with their final kind, container and scope."""
+    resolved: list[tuple[_CDeclaration, str, str | None, str | None]] = []
+    for record in _c_declarations(source, node):
+        if not record.name or not _looks_like_symbol_name(record.name):
+            continue
+        kind = record.kind
+        container_name = container
+        if record.explicit_scope:
+            # Only syntax that is explicit is restored; no using-directive or
+            # type-inference lookup happens here.
+            container_name = _c_explicit_container(container, record.explicit_scope)
+            if kind == "function" and _c_type_scope_known(container_name, state):
+                kind = "constructor" if record.name == _c_last_segment(container_name) else "method"
+        elif kind == "function" and scope_kind == "type":
+            kind = "constructor" if record.name == _c_last_segment(container) else "method"
+        opens = _c_scope_opened_by(kind)
+        if opens == "type":
+            state.type_scopes.add(record.name if container is None else f"{container}.{record.name}")
+        resolved.append((record, kind, container_name, opens))
+    return resolved
+
+
+def _c_node_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    scope_kind: str | None,
+    line_starts: Sequence[int] | None,
+    state: _CFileState,
+) -> list[tuple[Symbol, str | None]]:
+    symbols: list[tuple[Symbol, str | None]] = []
+    for record, kind, container_name, opens in _c_resolved_declarations(
+        source, node, container, scope_kind, state
+    ):
+        range_ = _node_range(source, record.name_node, line_starts)
+        symbols.append(
+            (
+                Symbol(
+                    id=_symbol_id(language.name, path, kind, record.name, range_.start_byte),
+                    name=record.name,
+                    kind=kind,
+                    language=language.name,
+                    path=path,
+                    range=range_,
+                    signature=_signature(source, record.definition_node),
+                    container=container_name,
+                ),
+                opens,
+            )
+        )
+    return symbols
 
 
 def _symbol_from_node(
@@ -3479,6 +4723,186 @@ def _js_declarator_kind(node: Node, default: str) -> str:
     return default
 
 
+# Nodes whose extraction is language specific and can yield several symbols.
+# The walk consults this table by (language, node kind) and falls back to the
+# ordinary single-symbol path on a miss, so languages without an entry never
+# build intermediate lists.
+_MULTI_SYMBOL_RESOLVERS: dict[tuple[str, str], Any] = {}
+
+
+def _extra_node_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    line_starts: Sequence[int] | None,
+) -> list[tuple[Symbol, str | None]] | None:
+    """Symbols a language-specific resolver owns for ``node``, or ``None``.
+
+    ``None`` means "no special case, use the default rule"; an empty list means
+    "this node declares nothing", which is how a resolver drops a node the
+    generic rule would misread.
+    """
+    resolver = _MULTI_SYMBOL_RESOLVERS.get((language.name, _node_kind(node)))
+    if resolver is None:
+        return None
+    return resolver(source, path, language, node, container, line_starts)
+
+
+def _js_binding_nodes(node: Node) -> list[Node]:
+    """Identifier nodes a JS/TS binding pattern declares, in source order.
+
+    Only the binding side is visited: a ``pair_pattern`` binds its value and an
+    ``assignment_pattern`` its left side, so ``{first, second: renamed}`` yields
+    ``first`` and ``renamed`` -- never the property key ``second`` -- and a
+    default value expression contributes no binding.
+    """
+    kind = _node_kind(node)
+    if kind in ("identifier", "shorthand_property_identifier_pattern"):
+        return [node]
+    if kind in ("object_pattern", "array_pattern", "rest_pattern"):
+        found: list[Node] = []
+        for child in _node_children(node):
+            found.extend(_js_binding_nodes(child))
+        return found
+    if kind == "pair_pattern":
+        value = _field_child(node, "value")
+        return [] if value is None else _js_binding_nodes(value)
+    if kind in ("object_assignment_pattern", "assignment_pattern"):
+        left = _field_child(node, "left")
+        return [] if left is None else _js_binding_nodes(left)
+    return []
+
+
+def _js_declarator_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    line_starts: Sequence[int] | None,
+) -> list[tuple[Symbol, str | None]] | None:
+    """One symbol per name bound by a destructuring declarator."""
+    name_node = node.child_by_field_name("name")
+    if name_node is None or _node_kind(name_node) not in ("object_pattern", "array_pattern"):
+        return None
+    return _binding_symbols(source, path, language, node, container, _js_binding_nodes(name_node), "variable", line_starts)
+
+
+def _binding_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    name_nodes: Sequence[Node],
+    kind: str,
+    line_starts: Sequence[int] | None,
+) -> list[tuple[Symbol, str | None]]:
+    """One symbol per bound name, all sharing ``node``'s declaration preview."""
+    symbols: list[tuple[Symbol, str | None]] = []
+    for name_node in name_nodes:
+        name = _node_text(source, name_node)
+        if not name or name == "_" or not _looks_like_symbol_name(name):
+            continue
+        range_ = _node_range(source, name_node, line_starts)
+        signature = (
+            _signature_at_name(source, node, name_node)
+            if language.signature_starts_at_name
+            else _signature(source, node)
+        )
+        symbols.append(
+            (
+                Symbol(
+                    id=_symbol_id(language.name, path, kind, name, range_.start_byte),
+                    name=name,
+                    kind=kind,
+                    language=language.name,
+                    path=path,
+                    range=range_,
+                    signature=signature,
+                    container=container,
+                ),
+                None,
+            )
+        )
+    return symbols
+
+
+def _swift_binding_identifiers(node: Node) -> list[Node]:
+    """Identifier nodes a Swift pattern binds.
+
+    ``let a = 1, b = 2`` names one pattern per binding and ``let (a, b) = pair``
+    nests plain patterns, so the pattern tree is walked rather than the node's
+    first identifier taken.
+    """
+    if _node_kind(node) in ("simple_identifier", "identifier"):
+        return [node]
+    bound = _field_child(node, "bound_identifier")
+    if bound is not None:
+        return _swift_binding_identifiers(bound)
+    if _node_kind(node) not in ("pattern", "tuple_pattern"):
+        return []
+    found: list[Node] = []
+    for child in _node_children(node):
+        found.extend(_swift_binding_identifiers(child))
+    return found
+
+
+def _swift_property_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    line_starts: Sequence[int] | None,
+) -> list[tuple[Symbol, str | None]] | None:
+    """``let a = 1, b = 2`` declares two properties."""
+    names: list[Node] = []
+    for pattern in _field_children(node, "name"):
+        names.extend(_swift_binding_identifiers(pattern))
+    if len(names) < 2:
+        # A single binding keeps the ordinary path, and so do declarations whose
+        # initialiser holds the only name found.
+        return None
+    return _binding_symbols(source, path, language, node, container, names, "property", line_starts)
+
+
+def _kotlin_property_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    line_starts: Sequence[int] | None,
+) -> list[tuple[Symbol, str | None]] | None:
+    """``val (a, b) = pair`` declares one property per bound name."""
+    names: list[Node] = []
+    for child in _node_children(node):
+        if _node_kind(child) != "multi_variable_declaration":
+            continue
+        for declaration in _node_children(child):
+            if _node_kind(declaration) != "variable_declaration":
+                continue
+            for identifier in _node_children(declaration):
+                if _node_kind(identifier) in language.identifier_node_types:
+                    names.append(identifier)
+    if not names:
+        return None
+    return _binding_symbols(source, path, language, node, container, names, "property", line_starts)
+
+
+_MULTI_SYMBOL_RESOLVERS.update(
+    {(name, "variable_declarator"): _js_declarator_symbols for name in _JS_LANGUAGE_NAMES}
+)
+_MULTI_SYMBOL_RESOLVERS[("swift", "property_declaration")] = _swift_property_symbols
+_MULTI_SYMBOL_RESOLVERS[("kotlin", "property_declaration")] = _kotlin_property_symbols
+# Languages with at least one resolver, checked before building the (language,
+# kind) key for a node: most languages own no special case at all.
+_MULTI_SYMBOL_LANGUAGES = frozenset(name for name, _kind in _MULTI_SYMBOL_RESOLVERS)
+
+
 def _definition_kind(source: bytes, language: LanguageSpec, node: Node) -> str | None:
     """The symbol kind ``node`` defines, or ``None`` if it defines nothing."""
     node_kind = _node_kind(node)
@@ -3492,6 +4916,12 @@ def _definition_kind(source: bytes, language: LanguageSpec, node: Node) -> str |
             return _SWIFT_DECLARATION_KINDS.get(_node_text(source, marker), kind)
     if language.name == "kotlin" and node_kind == "class_declaration":
         return _kotlin_class_kind(node, kind)
+    if language.name == "kotlin" and node_kind == "class_parameter":
+        # A primary-constructor parameter is only a property when it owns its
+        # own ``val``/``var`` keyword; ``class Box(input: Int)`` declares nothing.
+        if not any(_node_kind(child) == "binding_pattern_kind" for child in _node_children(node)):
+            return None
+        return kind
     if language.name in _JS_LANGUAGE_NAMES and node_kind == "variable_declarator":
         return _js_declarator_kind(node, kind)
     return kind
@@ -3531,8 +4961,7 @@ def _node_text(source: bytes, node: Node) -> str:
 
 def _signature(source: bytes, node: Node) -> str:
     text = _node_text(source, node).strip()
-    first_line = text.splitlines()[0] if text else ""
-    return first_line[:240]
+    return text[:240].splitlines()[0] if text else ""
 
 
 def _signature_at_name(source: bytes, node: Node, name_node: Node) -> str:
@@ -3603,14 +5032,6 @@ def _node_start_byte(node: Node) -> int:
 
 def _node_end_byte(node: Node) -> int:
     return _node_value(node, "end_byte")
-
-
-def _node_start_point(node: Node) -> Any:
-    return _node_value(node, "start_point", "start_position")
-
-
-def _node_end_point(node: Node) -> Any:
-    return _node_value(node, "end_point", "end_position")
 
 
 def _node_value(node: Node, *names: str) -> Any:
@@ -3762,11 +5183,19 @@ def _inspect_text(
     if not candidates:
         return _bounded_text(f"not_found:\n  query: {query}\n", options.max_total_chars)
     if len(candidates) > 1:
-        lines = ["ambiguous:", "  candidates:"]
-        ranges = _result_definition_ranges(repo, candidates[:MAX_INSPECT_CANDIDATES])
-        for candidate in candidates[:MAX_INSPECT_CANDIDATES]:
-            lines.extend(_format_relation_item(repo, candidate, indent=4, range_=ranges.get(candidate.id, candidate.range)))
-        return _bounded_text("\n".join(lines) + "\n", options.max_total_chars)
+        # Text and JSON must resolve the same target: a declaration and its
+        # definition are not an ambiguity, the definition is the answer.
+        preferred = _preferred_candidate(repo, candidates)
+        if preferred is not None:
+            candidates = [preferred]
+        else:
+            lines = ["ambiguous:", "  candidates:"]
+            ranges = _result_definition_ranges(repo, candidates[:MAX_INSPECT_CANDIDATES])
+            for candidate in candidates[:MAX_INSPECT_CANDIDATES]:
+                lines.extend(
+                    _format_relation_item(repo, candidate, indent=4, range_=ranges.get(candidate.id, candidate.range))
+                )
+            return _bounded_text("\n".join(lines) + "\n", options.max_total_chars)
 
     symbol = candidates[0]
     source = repo.storage.file_source(repo.root, symbol.path) or ""
@@ -3854,6 +5283,76 @@ def _inspect_candidates(
     return matches
 
 
+def _defined_symbol_ids(repo: CodeIndex, candidates: Sequence[Symbol]) -> set[str]:
+    """Candidate ids that have a body in the current source.
+
+    A declaration and a definition share name, kind and scope, so the body is
+    what tells them apart. Files are parsed once for the whole candidate set
+    (candidates are already bounded by ``MAX_INSPECT_CANDIDATES``), and the parse
+    result is shared within the request instead of re-parsing per candidate.
+    """
+    by_path: dict[Path, list[Symbol]] = {}
+    for symbol in candidates:
+        by_path.setdefault(symbol.path, []).append(symbol)
+    defined: set[str] = set()
+    for path, group in by_path.items():
+        language = _file_language(repo, path)
+        if language in _C_LANGUAGE_NAMES:
+            source = repo.storage.file_source(repo.root, path)
+            if source is None:
+                continue
+            source_bytes = source.encode('utf-8')
+            tree = _parse_source(_parser_for_language(language), source)
+            root = tree.root_node() if callable(tree.root_node) else tree.root_node
+            if hasattr(root, 'descendant_for_byte_range'):
+                # Only these bounded candidates matter. Re-extracting every
+                # symbol in a large file just to test for a body is unnecessary.
+                for symbol in group:
+                    start = symbol.range.start_byte
+                    if not 0 <= start < len(source_bytes):
+                        continue
+                    node = root.descendant_for_byte_range(start, start + 1)
+                    while node is not None:
+                        if any(record.name == symbol.name and _node_start_byte(record.name_node) == start
+                               for record in _c_declarations(source_bytes, node)):
+                            if _callable_body_node(node, LANGUAGE_BY_NAME[language]) is not None:
+                                defined.add(symbol.id)
+                            break
+                        node = node.parent
+                continue
+        # The file's own stored language decides the parser, exactly as it does for
+        # every other read: parsing a C++ header as C yields an error tree whose
+        # bodies would mark the declaration as the owner and hide the definition.
+        indexed = _parse_file(
+            repo.root, path, repo.languages, include_references=False, language=language
+        )
+        if indexed is None:
+            continue
+        for symbol in group:
+            if _owning_body(indexed.bodies, symbol) is not None:
+                defined.add(symbol.id)
+    return defined
+
+
+def _preferred_candidate(repo: CodeIndex, candidates: Sequence[Symbol]) -> Symbol | None:
+    """The one candidate that has a body, when exactly one does.
+
+    A declaration and its definition share name, kind and scope, so the body is the
+    navigation target. Scopes are deliberately not compared here, because a
+    declaration and its definition legitimately live in different scopes (a Rust
+    trait method versus its impl, a Swift protocol member versus its conformance),
+    and indexing the declaration must not hide a target that used to resolve.
+    Anything less clear-cut stays ambiguous rather than guessing.
+    """
+    if (len(candidates) > MAX_INSPECT_CANDIDATES
+            or len({(candidate.name, candidate.language) for candidate in candidates}) != 1
+            or any(candidate.kind not in FUNCTION_KINDS for candidate in candidates)):
+        return None
+    defined = _defined_symbol_ids(repo, candidates)
+    preferred = [candidate for candidate in candidates if candidate.id in defined]
+    return preferred[0] if len(preferred) == 1 else None
+
+
 def _resolve_inspect_symbol(
     repo: CodeIndex,
     query: str,
@@ -3870,7 +5369,10 @@ def _resolve_inspect_symbol(
     if not candidates:
         raise SymbolNotFoundError(f"No symbol matched: {query}")
     if len(candidates) > 1:
-        raise SymbolNotFoundError(f"Ambiguous symbol: {query}")
+        preferred = _preferred_candidate(repo, candidates)
+        if preferred is None:
+            raise SymbolNotFoundError(f"Ambiguous symbol: {query}")
+        return preferred
     return candidates[0]
 
 
@@ -4055,7 +5557,13 @@ def _direct_callers_batch(repo: Repository, symbols: list[Symbol], *, limit: int
         for path in repo.storage.file_paths(language=language):
             if not name_filter.may_contain(path, needles) or not _file_contains_pattern(repo.root / path, pattern, overlap):
                 continue
-            indexed = _parse_file(repo.root, path, repo.languages, reference_name=names)
+            indexed = _parse_file(
+                repo.root,
+                path,
+                repo.languages,
+                reference_name=names,
+                language=repo._stored_language(path),
+            )
             if indexed is None:
                 continue
             for reference in indexed.references:
@@ -4220,15 +5728,41 @@ def _callers_for_symbol(
         return ()
     file_symbols_cache: dict[Path, list[Symbol]] = {}
     def_ranges_cache: dict[Path, dict[str, Range]] = {}
+    trees_cache: dict[Path, tuple[Node | None, bytes]] = {}
     callers: list[Symbol] = []
     seen: set[str] = set()
     for reference in references:
+        if reference.reference_kind != 'call':
+            continue
         path = reference.path
         if path not in file_symbols_cache:
             file_symbols = repo.storage.symbols_in_file(path)
             file_symbols_cache[path] = file_symbols
-            def_ranges_cache[path] = _definition_ranges_for_symbols(repo, path, file_symbols)
-        caller = _enclosing_symbol(file_symbols_cache[path], def_ranges_cache[path], reference.range, exclude_id=symbol.id)
+            # One read and one parse per file: this request needs the definition
+            # ranges and the per-reference owner from the same tree.
+            source = repo.storage.file_source(repo.root, path)
+            ranges, tree = _definition_ranges_and_tree(repo, path, file_symbols, source=source)
+            def_ranges_cache[path] = ranges
+            trees_cache[path] = (tree, source.encode("utf-8") if source is not None else b"")
+        tree, source_bytes = trees_cache[path]
+        owner = None
+        body_known = False
+        if tree is not None and source_bytes:
+            spec = _file_spec(repo, path)
+            body_known = spec is not None and spec.name in _CALLABLE_BODY_NODE_TYPES
+            owner = (
+                _call_owner_at(tree, source_bytes, spec, reference.range.start_byte, reference.range.end_byte)
+                if spec is not None
+                else None
+            )
+            if owner is not None and not owner[1]:
+                # The call sits in an anonymous callable's body: that body is an
+                # ownership boundary, and no public symbol stands for it.
+                continue
+        caller = _enclosing_symbol(
+            file_symbols_cache[path], def_ranges_cache[path], reference.range, exclude_id=symbol.id,
+            owner_span=owner[0] if owner is not None else None, body_known=body_known,
+        )
         if caller is None or caller.id in seen:
             continue
         callers.append(caller)
@@ -4244,20 +5778,47 @@ def _callees_for_symbol(
     range_: Range,
     *,
     limit: int,
-    ref_kinds: frozenset[str] | None = None,
+    ref_kinds: frozenset[str] | None = frozenset({'call'}),
     loose: bool = False,
 ) -> tuple[Symbol, ...]:
     if limit <= 0:
         return ()
-    indexed = _parse_file(repo.root, symbol.path, repo.languages)
+    indexed = _parse_file(repo.root, symbol.path, repo.languages, language=_file_language(repo, symbol.path))
     if indexed is None:
         return ()
     known = repo.storage.symbol_names_by_language().get(symbol.language, set())
     definition_spans = {(candidate.range.start_byte, candidate.range.end_byte) for candidate in indexed.symbols}
+    owner = _owning_body(indexed.bodies, symbol)
+    if owner is not None:
+        owner_span = (owner.start_byte, owner.end_byte)
+        # A call inside a nested callable belongs to that callable, not to the
+        # callable being queried: depth-1 must not leak inner calls outwards.
+        nested_spans = [
+            (body.start_byte, body.end_byte)
+            for body in indexed.bodies
+            if body is not owner and _span_contains(owner_span, (body.start_byte, body.end_byte))
+        ]
+    else:
+        # No body recorded for this symbol: keep the declaration span, and stay
+        # conservative because nested boundaries cannot be identified here.
+        owner_span = (range_.start_byte, range_.end_byte)
+        nested_spans = []
+    # A reference must not scan every nested function. Coalesce body intervals
+    # once, then find the only possible containing interval by binary search.
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(nested_spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    nested_starts = [start for start, _ in merged]
     names: list[str] = []
     seen_names: set[str] = set()
     for reference in indexed.references:
-        if reference.range.start.line < range_.start.line or reference.range.start.line >= range_.end.line + 1:
+        if not _span_contains(owner_span, (reference.range.start_byte, reference.range.end_byte)):
+            continue
+        nested_index = bisect_right(nested_starts, reference.range.start_byte) - 1
+        if nested_index >= 0 and reference.range.end_byte <= merged[nested_index][1]:
             continue
         if ref_kinds is not None and reference.reference_kind not in ref_kinds:
             continue
@@ -4272,14 +5833,21 @@ def _callees_for_symbol(
     callees: list[Symbol] = []
     seen_ids: set[str] = set()
     for name in names:
-        candidate = _resolve_callee(repo, name, symbol, loose=loose)
+        candidate = _resolve_callee(repo, name, symbol, loose=loose, bodies=indexed.bodies)
         if candidate is not None and candidate.id not in seen_ids:
             callees.append(candidate)
             seen_ids.add(candidate.id)
     return tuple(callees)
 
 
-def _resolve_callee(repo: CodeIndex, name: str, symbol: Symbol, *, loose: bool) -> Symbol | None:
+def _resolve_callee(
+    repo: CodeIndex,
+    name: str,
+    symbol: Symbol,
+    *,
+    loose: bool,
+    bodies: Sequence[_CallableBody] | None = None,
+) -> Symbol | None:
     """Resolve a called name to a callable symbol, preferring locality.
 
     Prefers a unique callable in the same file, then the same package
@@ -4296,6 +5864,19 @@ def _resolve_callee(repo: CodeIndex, name: str, symbol: Symbol, *, loose: bool) 
 
     same_file = exact(symbol.path, 3)
     if same_file:
+        # A declaration and its definition can both live in this file; prefer the
+        # one with a body so adding a declaration does not steal the target. The
+        # caller passes the file's already-parsed bodies: no extra parse here.
+        defined = [
+            candidate
+            for candidate in same_file
+            if any(
+                body.name == candidate.name and body.name_start_byte == candidate.range.start_byte
+                for body in bodies or ()
+            )
+        ]
+        if len(same_file) > 1 and len(defined) == 1:
+            return defined[0]
         return same_file[0]
 
     package = symbol.path.parent
@@ -4313,19 +5894,42 @@ def _resolve_callee(repo: CodeIndex, name: str, symbol: Symbol, *, loose: bool) 
 
 
 def _enclosing_symbol(
-    symbols: list[Symbol], def_ranges: dict[str, Range], range_: Range, *, exclude_id: str
+    symbols: list[Symbol], def_ranges: dict[str, Range], range_: Range, *, exclude_id: str,
+    owner_span: tuple[int, int] | None = None, body_known: bool = False,
 ) -> Symbol | None:
+    """The innermost callable or container whose byte range contains ``range_``.
+
+    Line-based containment cannot separate two definitions that share a line, so
+    positions are compared by byte offset (half-open). A symbol with no known
+    definition range is skipped instead of falling back to its name range: a
+    name range would masquerade as a body and produce a plausible-looking but
+    wrong owner.
+    """
+    span = owner_span if owner_span is not None else (range_.start_byte, range_.end_byte)
     candidates: list[tuple[Symbol, Range]] = []
     for symbol in symbols:
-        if symbol.id == exclude_id:
+        if symbol.id == exclude_id or symbol.kind not in CALL_OWNER_KINDS:
             continue
-        body = def_ranges.get(symbol.id, symbol.range)
-        if body.start.line <= range_.start.line <= body.end.line:
+        if body_known and owner_span is None and symbol.kind in FUNCTION_KINDS:
+            continue  # A default argument outside every callable body is not called by that function.
+        body = def_ranges.get(symbol.id)
+        if body is None:
+            continue
+        if _span_contains((body.start_byte, body.end_byte), span):
             candidates.append((symbol, body))
     if not candidates:
         return None
-    # Innermost enclosing definition: deepest start, then tightest end.
-    return max(candidates, key=lambda item: (item[1].start.line, -item[1].end.line))[0]
+    # Innermost definition first (deepest start, then tightest end), then
+    # callables over containers, then a stable id so ties are not incidental.
+    return max(
+        candidates,
+        key=lambda item: (
+            item[1].start_byte,
+            -item[1].end_byte,
+            item[0].kind in FUNCTION_KINDS,
+            item[0].id,
+        ),
+    )[0]
 
 
 def _search_page(
@@ -4363,6 +5967,112 @@ def _search_page(
     return _page_from_extra([symbol for symbol, _ in ranked], limit=limit, offset=0)
 
 
+def _c_native_definition_ranges(
+    source: bytes,
+    root_node: Node,
+    wanted: dict[tuple[str, int], Symbol],
+    line_starts: Sequence[int] | None,
+    state: _CFileState,
+) -> dict[str, Range] | None:
+    """Definition spans found by native descent, or ``None`` to traverse instead.
+
+    A result page holds few symbols, so each name is located in native code and its
+    ancestors are walked upwards. The enclosing scopes are rebuilt from those same
+    ancestors, which keeps a class member's ``method``/``constructor`` kind. ``None``
+    means the traversal has to decide: too many symbols at once, a stale byte
+    position, or a name whose resolved kind the reconstruction does not confirm.
+    """
+    from tree_sitter import Node
+
+    if not isinstance(root_node, Node) or len(wanted) > NATIVE_DEFINITION_MAX_SYMBOLS:
+        return None
+    ranges: dict[str, Range] = {}
+    for (kind, start), symbol in wanted.items():
+        if not 0 <= start < len(source):
+            return None
+        ancestors: list[Node] = []
+        node = root_node.descendant_for_byte_range(start, start + 1)
+        while node is not None:
+            ancestors.append(node)
+            node = node.parent
+        located: int | None = None
+        for index, ancestor in enumerate(ancestors):
+            if any(_node_start_byte(record.name_node) == start for record in _c_declarations(source, ancestor)):
+                located = index
+                break
+        if located is None:
+            return None
+        container: str | None = None
+        scope_kind: str | None = None
+        for ancestor in reversed(ancestors[located + 1 :]):
+            for record, _kind, _name, opens in _c_resolved_declarations(
+                source, ancestor, container, scope_kind, state
+            ):
+                if opens is not None:
+                    container = record.name if container is None else f"{container}.{record.name}"
+                    scope_kind = opens
+        matched = False
+        for record, resolved_kind, _name, _opens in _c_resolved_declarations(
+            source, ancestors[located], container, scope_kind, state
+        ):
+            if _node_start_byte(record.name_node) != start:
+                continue
+            if resolved_kind != kind:
+                return None
+            ranges[symbol.id] = _node_range(source, record.definition_node, line_starts)
+            matched = True
+            break
+        if not matched:
+            return None
+    return ranges
+
+
+def _c_definition_ranges_for_symbols(
+    source: bytes,
+    root_node: Node,
+    wanted: dict[tuple[str, int], Symbol],
+    line_starts: Sequence[int] | None,
+) -> dict[str, Range]:
+    """Definition spans for C/C++ symbols using the extraction's own rules.
+
+    Extraction and this lookup both resolve declarations through
+    ``_c_resolved_declarations``, so a second declarator (``int a, b;``), a
+    destructor name or a class-scoped definition preview all match, and a symbol
+    whose description is not found keeps its name range instead of guessing.
+
+    ``_c_native_definition_ranges`` answers a small lookup first, in native code;
+    the traversal below stays the reference for what it cannot confirm.
+    """
+    ranges: dict[str, Range] = {}
+    if not wanted:
+        return ranges
+    state = _CFileState(source, root_node)
+    native = _c_native_definition_ranges(source, root_node, wanted, line_starts, state)
+    if native is not None:
+        return native
+
+    def visit(node: Node, container: str | None, scope_kind: str | None) -> None:
+        if len(ranges) >= len(wanted):
+            return
+        next_container = container
+        next_scope_kind = scope_kind
+        for record, kind, _container_name, opens in _c_resolved_declarations(
+            source, node, container, scope_kind, state
+        ):
+            symbol = wanted.get((kind, _node_start_byte(record.name_node)))
+            if symbol is not None and symbol.id not in ranges:
+                ranges[symbol.id] = _node_range(source, record.definition_node, line_starts)
+            if opens is not None:
+                next_container = record.name if container is None else f"{container}.{record.name}"
+                if opens != "container":
+                    next_scope_kind = opens
+        for child in _node_children(node):
+            visit(child, next_container, next_scope_kind)
+
+    visit(root_node, None, None)
+    return ranges
+
+
 def _definition_range(repo: CodeIndex, symbol: Symbol) -> Range | None:
     return _definition_ranges_for_symbols(repo, symbol.path, (symbol,)).get(symbol.id)
 
@@ -4374,18 +6084,57 @@ def _definition_ranges_for_symbols(
     *,
     source: str | None = None,
 ) -> dict[str, Range]:
+    return _definition_ranges_and_tree(repo, path, symbols, source=source)[0]
+
+
+def _definition_name_keys(
+    source: bytes, path: Path, spec: LanguageSpec, node: Node, line_starts: Sequence[int],
+) -> tuple[tuple[str, int], ...]:
+    extra = _extra_node_symbols(source, path, spec, node, None, line_starts)
+    if extra is not None:
+        return tuple((symbol.kind, symbol.range.start_byte) for symbol, _ in extra)
+    if spec.name == 'python' and _node_kind(node) == 'assignment':
+        parent = node.parent
+        while parent is not None and _node_kind(parent) not in ('class_definition', 'function_definition'):
+            parent = parent.parent
+        if parent is not None and _node_kind(parent) == 'function_definition':
+            return ()
+        symbols = _python_assignment_symbols(
+            source, path, spec, node, container=None, as_field=parent is not None, line_starts=line_starts,
+        )
+        return tuple((symbol.kind, symbol.range.start_byte) for symbol in symbols)
+    kind = _definition_kind(source, spec, node)
+    if kind is not None:
+        name = _name_node(node, spec)
+        if name is not None:
+            return ((kind, _node_start_byte(name)),)
+    return ()
+
+
+def _definition_ranges_and_tree(
+    repo: CodeIndex,
+    path: Path,
+    symbols: Iterable[Symbol],
+    *,
+    source: str | None = None,
+) -> tuple[dict[str, Range], Node | None]:
+    """Definition ranges plus the parse they came from.
+
+    Callers that also need per-reference ownership reuse the same parse instead
+    of paying a second one: every source file is read and parsed once per request.
+    """
     symbols = tuple(symbols)
     if not symbols:
-        return {}
+        return {}, None
     from tree_sitter import Node
 
     if source is None:
         source = repo.storage.file_source(repo.root, path)
     if source is None:
-        return {}
-    spec = _spec_for_path(path, repo.languages)
+        return {}, None
+    spec = _file_spec(repo, path)
     if spec is None:
-        return {}
+        return {}, None
     source_bytes = source.encode("utf-8")
 
     wanted: dict[tuple[str, int], Symbol] = {
@@ -4399,6 +6148,17 @@ def _definition_ranges_for_symbols(
 
     # Locate a few names in native code instead of walking every AST node in
     # Python. Large outlines still benefit from one sequential traversal.
+    if spec.name in _C_LANGUAGE_NAMES:
+        return _c_definition_ranges_for_symbols(source_bytes, root_node, wanted, line_starts), root_node
+
+    declaration_keys: dict[tuple[int, int, str], tuple[tuple[str, int], ...]] = {}
+
+    def name_keys(node: Node) -> tuple[tuple[str, int], ...]:
+        key = (_node_start_byte(node), _node_end_byte(node), _node_kind(node))
+        if key not in declaration_keys:
+            declaration_keys[key] = _definition_name_keys(source_bytes, path, spec, node, line_starts)
+        return declaration_keys[key]
+
     if isinstance(root_node, Node) and len(wanted) <= NATIVE_DEFINITION_MAX_SYMBOLS:
         for symbol in wanted.values():
             start = symbol.range.start_byte
@@ -4410,37 +6170,32 @@ def _definition_ranges_for_symbols(
             match = None
             ambiguous = False
             while node is not None:
-                if _definition_kind(source_bytes, spec, node) == symbol.kind:
-                    name = _name_node(node, spec)
-                    if name is not None and _node_start_byte(name) == start:
-                        if match is not None:
-                            ambiguous = True
-                            break
-                        match = node
+                if (symbol.kind, start) in name_keys(node):
+                    if match is not None:
+                        ambiguous = True
+                        break
+                    match = node
                 node = node.parent
             if ambiguous:
                 break  # Preserve traversal order for nested grammar wrappers.
             if match is not None:
                 ranges[symbol.id] = _node_range(source_bytes, match, line_starts)
         else:
-            return ranges
+            return ranges, root_node
         ranges.clear()
 
     def walk(node: Node) -> None:
         if len(ranges) >= len(wanted):
             return
-        kind = _definition_kind(source_bytes, spec, node)
-        if kind is not None:
-            name_node = _name_node(node, spec)
-            if name_node is not None:
-                symbol = wanted.get((kind, _node_start_byte(name_node)))
-                if symbol is not None:
-                    ranges[symbol.id] = _node_range(source_bytes, node, line_starts)
+        for key in _definition_name_keys(source_bytes, path, spec, node, line_starts):
+            symbol = wanted.get(key)
+            if symbol is not None:
+                ranges[symbol.id] = _node_range(source_bytes, node, line_starts)
         for child in _node_children(node):
             walk(child)
 
     walk(root_node)
-    return ranges
+    return ranges, root_node
 
 
 def _format_symbol_fields(symbol: Symbol, *, indent: int, range_: Range | None = None) -> list[str]:
@@ -4826,6 +6581,7 @@ def _index_status(
                 exclude=exclude,
                 indexed_files=data["indexed_files"],
                 max_files=max_pending_files,
+                header_language=data["header_language"],
             )
         else:
             pending_changes = "unknown"
@@ -4875,6 +6631,9 @@ def _read_index_metadata(db_path: Path, *, include_files: bool = True) -> dict[s
             "SELECT value FROM meta WHERE key = 'updated_at'",
         ).fetchone()
         git_row = connection.execute("SELECT value FROM meta WHERE key = 'git_baseline'").fetchone()
+        header_row = connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (HEADER_LANGUAGE_META,),
+        ).fetchone() if include_files else None
         files = connection.execute("SELECT count(*) FROM files").fetchone()[0]
         symbols = connection.execute("SELECT count(*) FROM symbols").fetchone()[0]
         languages = tuple(
@@ -4901,6 +6660,7 @@ def _read_index_metadata(db_path: Path, *, include_files: bool = True) -> dict[s
         "schema_version": int(schema_row["value"]) if schema_row is not None else None,
         "updated_at": updated_at_row["value"] if updated_at_row is not None else None,
         "git_baseline": git_row["value"] if git_row is not None else None,
+        "header_language": header_row["value"] if header_row is not None else DEFAULT_HEADER_LANGUAGE,
         "files": files,
         "symbols": symbols,
         "languages": languages,
@@ -4917,6 +6677,7 @@ def _pending_index_changes(
     exclude: Iterable[str],
     indexed_files: dict[str, tuple[str, int, int]],
     max_files: int,
+    header_language: str | None = None,
 ) -> tuple[int, tuple[str, ...]]:
     language_filter = set(languages) if languages is not None else None
     filtered_indexed_files = {
@@ -4930,6 +6691,7 @@ def _pending_index_changes(
         include=include,
         exclude=exclude,
         db_path=":memory:",
+        header_language=header_language,
     )
     current_files: dict[str, tuple[int, int]] = {}
     for path in scanner._iter_indexable_files():
@@ -5245,15 +7007,6 @@ def _extension_of(path_text: str) -> str:
     return path_text[dot:].lower()
 
 
-def _matches_path_pattern(path_text: str, pattern: str) -> bool:
-    if fnmatch.fnmatch(path_text, pattern):
-        return True
-    if pattern.endswith("/**"):
-        directory = pattern[:-3].rstrip("/")
-        return path_text == directory or path_text.startswith(f"{directory}/")
-    return False
-
-
 def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return value.as_posix()
@@ -5445,20 +7198,39 @@ class _CliProgress:
         isatty = getattr(target, "isatty", None)
         self.interactive = bool(isatty()) if callable(isatty) else False
         self._last_bucket = -1
+        self._last_write_percent = -1
         self._line_open = False
         # Private CLI hook: preserve the public Repository callback protocol.
         self._storage_progress = self._write_progress if self.interactive else None
 
     def _write_progress(self, event: str, *, done: int = 0, total: int = 0) -> None:
+        if not self.interactive:
+            return
+        stream = self.stream if self.stream is not None else sys.stderr
+        if event in {"write_start", "write_tick", "commit_batch"}:
+            if event == "write_start":
+                self._last_write_percent = -1
+                if self._line_open:
+                    stream.write("\n")
+                    self._line_open = False
+            # Rows are counted by the existing writer; this is work completed,
+            # not a time estimate. Final transaction commit is a separate stage.
+            percent = min(100, max(0, done * 100 // total)) if total else 0
+            if percent <= self._last_write_percent:
+                return
+            self._last_write_percent = percent
+            prefix = "\r" if self._line_open else ""
+            stream.write(f"{prefix}writing index... {percent}%")
+            self._line_open = True
+            stream.flush()
+            return
         messages = {
             "delete_start": "removing old index entries...",
-            "write_start": "writing index...",
             "finalize": "committing index...",
         }
         message = messages.get(event)
         if message is None:
             return
-        stream = self.stream if self.stream is not None else sys.stderr
         if self._line_open:
             stream.write("\n")
             self._line_open = False
@@ -5481,8 +7253,15 @@ class _CliProgress:
             stream.write("\n")
             stream.flush()
             self._line_open = False
+        if event == "upgrade":
+            # One-time cost of a new extraction rule; only a terminal shows it.
+            if self.interactive:
+                stream.write(f"re-extracting {total} files to apply updated extraction rules (one-time)\n")
+                stream.flush()
+            return
         if event == "finish" and done < total:
             stream.write(f"warning: {total - done}/{total} files could not be indexed; "
+                         "existing index entries for them were kept. "
                          "check file readability/encoding or exclude unsupported files. "
                          "Git freshness only tracks the checkout.\n")
             stream.flush()
@@ -5513,6 +7292,13 @@ def _add_index_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--include", action="append", default=(), help="Glob include pattern. Repeatable.")
     parser.add_argument("--exclude", action="append", default=(), help="Glob exclude pattern. Repeatable.")
     parser.add_argument("--db", help="SQLite index path. Defaults to .code-symbol-index/index.sqlite.")
+    parser.add_argument(
+        "--header-language",
+        choices=HEADER_LANGUAGES,
+        default=None,
+        help="Language for .h files (default: c, unchanged). Saved for later writes; "
+             "changing it requires an unfiltered index run.",
+    )
 
 
 def _add_match_options(parser: argparse.ArgumentParser) -> None:
@@ -5900,17 +7686,33 @@ def main(argv: list[str] | None = None) -> int:
             _warn_git_freshness(repo)
 
         if args.command == "index":
-            repo.refresh()
+            repo.refresh(header_language=getattr(args, "header_language", None))
+            header_language, converted, pending = repo.last_header_language
+            if pending and converted < pending:
+                # The saved setting only means "future writes": never claim a
+                # conversion that still has files on their previous language.
+                sys.stderr.write(
+                    f"warning: header language for future writes is {header_language}, but "
+                    f"{pending - converted}/{pending} header files could not be converted and keep "
+                    "their previous language; rerun index to retry them\n"
+                )
+            elif pending and converted == pending:
+                sys.stderr.write(
+                    f"header language for future writes is {header_language}: "
+                    f"converted {converted} header files\n"
+                )
             _print_json({"index": str(Path(repo.storage.db_path)), "root": str(repo.root)})
         elif args.command == "update":
             repo.update(args.paths)
-            _print_json(
-                {
-                    "index": str(Path(repo.storage.db_path)),
-                    "root": str(repo.root),
-                    "updated": [Path(path).as_posix() for path in args.paths],
-                }
-            )
+            payload = {
+                "index": str(Path(repo.storage.db_path)),
+                "root": str(repo.root),
+                "updated": list(repo.last_update_updated),
+            }
+            if repo.last_update_failed:
+                # Never report a failed path as updated: its previous rows stand.
+                payload["failed"] = list(repo.last_update_failed)
+            _print_json(payload)
         elif args.command == "search":
             page = repo.search_page(
                 args.query,
@@ -6019,6 +7821,9 @@ def main(argv: list[str] | None = None) -> int:
     except IndexNotFoundError:
         sys.stderr.write("index not found; run `code-symbol-index index` first\n")
         return 2
+    except HeaderLanguageError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 2
     except SymbolNotFoundError as exc:
         sys.stderr.write(f"{exc}; narrow with --path/--kind/--exact-only\n")
         return 2
@@ -6035,6 +7840,7 @@ __all__ = [
     "CodeSymbolIndexError",
     "EntryPoint",
     "HashLine",
+    "HeaderLanguageError",
     "ImportItem",
     "IndexNotFoundError",
     "IndexStatus",

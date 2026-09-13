@@ -81,7 +81,10 @@ def legacy_files_table(repo):
         ''')
 
 
-def test_old_database_reads_do_not_migrate_and_refresh_only_fills_metadata(tmp_path):
+def test_old_database_reads_do_not_migrate_and_refresh_only_fills_metadata(tmp_path, monkeypatch):
+    # Rule upgrades are out of scope for this test: it checks that a refresh
+    # backfills summary metadata without rebuilding any AST.
+    monkeypatch.setattr(c, 'EXTRACTOR_REVISIONS', {})
     repo = fixture_repo(tmp_path)
     legacy_files_table(repo)
     before = repo.storage.connection.execute('SELECT * FROM symbols ORDER BY id').fetchall()

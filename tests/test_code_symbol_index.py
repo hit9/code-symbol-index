@@ -58,16 +58,18 @@ def test_python_ranges_do_not_depend_on_tree_sitter_points(monkeypatch) -> None:
     )
     source_bytes = source.encode("utf-8")
 
-    def fail_point_access(*_args):
-        raise AssertionError("tree-sitter point access should not be used")
+    node_value = code_symbol_index._node_value
 
-    monkeypatch.setattr(code_symbol_index, "_node_start_point", fail_point_access)
-    monkeypatch.setattr(code_symbol_index, "_node_end_point", fail_point_access)
+    def byte_only_value(node, *names):
+        assert not any("point" in name or "position" in name for name in names)
+        return node_value(node, *names)
+
+    monkeypatch.setattr(code_symbol_index, "_node_value", byte_only_value)
 
     parser = code_symbol_index._parser_for_language("python")
     tree = parser.parse(source_bytes)
     root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
-    symbols, references = code_symbol_index._extract_symbols_and_references(
+    symbols, references, _bodies = code_symbol_index._extract_symbols_and_references(
         source=source_bytes,
         root_node=root_node,
         path=Path("app.py"),
@@ -1396,7 +1398,7 @@ def test_cli_status_defaults_to_text_and_supports_json(tmp_path: Path, capsys) -
 
 
 def test_cli_keyboard_interrupt_returns_130(monkeypatch, capsys) -> None:
-    def interrupt(self: Repository) -> Repository:
+    def interrupt(self: Repository, **kwargs: object) -> Repository:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(Repository, "refresh", interrupt)
@@ -1781,6 +1783,40 @@ def test_repository_cli_progress_reports_writing_before_final_commit(tmp_path) -
 def test_cli_captured_progress_does_not_enable_storage_callbacks() -> None:
     progress = code_symbol_index._CliProgress(_FakeStream(interactive=False))
     assert progress._storage_progress is None
+
+
+def test_cli_write_progress_refreshes_one_line_and_bounds_output() -> None:
+    stream = _FakeStream(interactive=True)
+    progress = code_symbol_index._CliProgress(stream)
+    progress._write_progress('write_start', total=1000)
+    for done in range(1, 1001):
+        progress._write_progress('write_tick', done=done, total=1000)
+        progress._write_progress('commit_batch', done=done, total=1000)
+    assert len(stream.writes) == 101
+    assert stream.writes[0] == 'writing index... 0%'
+    assert stream.writes[50] == '\rwriting index... 50%'
+    assert stream.writes[-1] == '\rwriting index... 100%'
+    progress._write_progress('finalize', done=1000, total=1000)
+    assert ''.join(stream.writes).endswith('100%\ncommitting index...\n')
+    progress._write_progress('write_start', total=1)
+    assert stream.writes[-1] == 'writing index... 0%'
+
+
+def test_cli_write_progress_separates_partial_parse_and_stays_silent_in_capture() -> None:
+    stream = _FakeStream(interactive=True)
+    progress = code_symbol_index._CliProgress(stream)
+    progress('start', total=2)
+    progress('file', done=1, total=2)
+    progress._write_progress('write_start', total=1)
+    progress._write_progress('write_tick', done=1, total=1)
+    progress('finish', done=1, total=2)
+    output = ''.join(stream.writes)
+    assert '(50%)\nwriting index... 0%\rwriting index... 100%\nwarning:' in output
+    captured = _FakeStream(interactive=False)
+    progress = code_symbol_index._CliProgress(captured)
+    for event in ('write_start', 'write_tick', 'commit_batch', 'finalize'):
+        progress._write_progress(event, done=1, total=1)
+    assert captured.writes == []
 
 
 def _write_call_chain_fixture(tmp_path: Path) -> None:
