@@ -197,3 +197,21 @@ def test_decorated_python_class_fields_and_upgrade(tmp_path):
     assert parse.call_count == 1
     with mock.patch.object(c, '_parse_file', side_effect=AssertionError('upgrade repeated')):
         repo.refresh()
+
+
+@pytest.mark.parametrize(('extension', 'source'), [
+    ('c', 'int target(int);\nint target(int x) { return x; }\n'),
+    ('cpp', 'namespace n { struct Box { Box(); ~Box(); int run(); }; }\n'
+     'n::Box::Box() {}\nn::Box::~Box() {}\nint n::Box::run() { return 1; }\n'),
+    ('cpp', 'template<class T> T target(T);\ntemplate<class T> T target(T x) { return x; }\n'),
+])
+def test_candidate_body_lookup_matches_full_extraction_without_reextracting(tmp_path, extension, source):
+    path = Path(f'app.{extension}')
+    (tmp_path / path).write_text(source)
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    candidates = repo.search_symbols('', kind=c.FUNCTION_KINDS)
+    parsed = c._parse_file(tmp_path, path, None)
+    expected = {s.id for s in candidates if c._owning_body(parsed.bodies, s) is not None}
+    assert expected and len(expected) < len(candidates)
+    with mock.patch.object(c, '_parse_file', side_effect=AssertionError('full re-extraction')):
+        assert c._defined_symbol_ids(repo, candidates) == expected

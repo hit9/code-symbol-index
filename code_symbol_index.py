@@ -3931,9 +3931,11 @@ def _extract_symbols_and_references(
                 )
         next_container = container
         next_scope_kind = scope_kind
-        next_in_function = in_function or any(symbol.kind in FUNCTION_KINDS for symbol, _ in declared)
+        next_in_function = in_function
         primary: Symbol | None = None
         for symbol, opens in declared:
+            if symbol.kind in FUNCTION_KINDS:
+                next_in_function = True
             if in_function and symbol.kind in language.non_local_kinds:
                 continue  # a local binding, not a declaration
             symbols.append(symbol)
@@ -5194,11 +5196,35 @@ def _defined_symbol_ids(repo: CodeIndex, candidates: Sequence[Symbol]) -> set[st
         by_path.setdefault(symbol.path, []).append(symbol)
     defined: set[str] = set()
     for path, group in by_path.items():
+        language = _file_language(repo, path)
+        if language in _C_LANGUAGE_NAMES:
+            source = repo.storage.file_source(repo.root, path)
+            if source is None:
+                continue
+            source_bytes = source.encode('utf-8')
+            tree = _parse_source(_parser_for_language(language), source)
+            root = tree.root_node() if callable(tree.root_node) else tree.root_node
+            if hasattr(root, 'descendant_for_byte_range'):
+                # Only these bounded candidates matter. Re-extracting every
+                # symbol in a large file just to test for a body is unnecessary.
+                for symbol in group:
+                    start = symbol.range.start_byte
+                    if not 0 <= start < len(source_bytes):
+                        continue
+                    node = root.descendant_for_byte_range(start, start + 1)
+                    while node is not None:
+                        if any(record.name == symbol.name and _node_start_byte(record.name_node) == start
+                               for record in _c_declarations(source_bytes, node)):
+                            if _callable_body_node(node, LANGUAGE_BY_NAME[language]) is not None:
+                                defined.add(symbol.id)
+                            break
+                        node = node.parent
+                continue
         # The file's own stored language decides the parser, exactly as it does for
         # every other read: parsing a C++ header as C yields an error tree whose
         # bodies would mark the declaration as the owner and hide the definition.
         indexed = _parse_file(
-            repo.root, path, repo.languages, include_references=False, language=_file_language(repo, path)
+            repo.root, path, repo.languages, include_references=False, language=language
         )
         if indexed is None:
             continue
