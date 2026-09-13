@@ -73,7 +73,7 @@ def test_unchanged_c_files_are_upgraded_without_touching_other_languages(tmp_pat
     assert ("upgrade", 0, 2) in events
     rows = _file_rows(repo)
     assert rows["app.c"]["extractor_revision"] == "c:1"
-    assert rows["app.cpp"]["extractor_revision"] == "cpp:1"
+    assert rows["app.cpp"]["extractor_revision"] == code_symbol_index.EXTRACTOR_REVISIONS['cpp']
     assert rows["app.go"]["extractor_revision"] is None
 
 

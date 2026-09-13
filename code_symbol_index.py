@@ -35,7 +35,7 @@ SCHEMA_VERSION = 5
 # value each indexed file was written with.
 EXTRACTOR_REVISIONS: dict[str, str] = {
     "c": "c:1",
-    "cpp": "cpp:1",
+    "cpp": "cpp:2",
     "javascript": "javascript:1",
     "kotlin": "kotlin:2",
     "python": "python:1",
@@ -4317,12 +4317,9 @@ class _CDeclaration:
     name_node: Node
     definition_node: Node
     explicit_scope: str | None = None
-    opens_scope: bool = False
-    has_body: bool = False
 
 
 def _c_declarator_declarations(source: bytes, node: Node, node_kind: str) -> list[_CDeclaration]:
-    has_body = _field_child(node, "body") is not None
     records: list[_CDeclaration] = []
     for declarator in _declarator_field_children(node):
         name_node = _c_declarator_name_node(declarator)
@@ -4344,7 +4341,6 @@ def _c_declarator_declarations(source: bytes, node: Node, node_kind: str) -> lis
                 name_node=terminal,
                 definition_node=node,
                 explicit_scope=explicit_scope,
-                has_body=has_body,
             )
         )
     return records
@@ -4368,8 +4364,6 @@ def _c_declarations(source: bytes, node: Node) -> list[_CDeclaration]:
                 kind=scope_kind,
                 name_node=name_node,
                 definition_node=node,
-                opens_scope=True,
-                has_body=_field_child(node, "body") is not None,
             )
         ]
     kind = _C_CONSTANT_NODE_KINDS.get(node_kind, "type")
@@ -4433,7 +4427,8 @@ def _c_scan_type_scopes(state: _CFileState) -> None:
         for record in _c_declarations(state.source, node):
             if record.kind in _C_TYPE_SCOPE_KINDS or record.kind == "namespace":
                 child_container = record.name if container is None else f"{container}.{record.name}"
-                found.add(child_container)
+                if record.kind in _C_TYPE_SCOPE_KINDS:
+                    found.add(child_container)
                 container = child_container
         for child in _node_children(node):
             visit(child, child_container)
@@ -4467,8 +4462,8 @@ def _c_resolved_declarations(
             # Only syntax that is explicit is restored; no using-directive or
             # type-inference lookup happens here.
             container_name = _c_explicit_container(container, record.explicit_scope)
-            if kind == "function":
-                kind = "method" if _c_type_scope_known(container_name, state) else "function"
+            if kind == "function" and _c_type_scope_known(container_name, state):
+                kind = "constructor" if record.name == _c_last_segment(container_name) else "method"
         elif kind == "function" and scope_kind == "type":
             kind = "constructor" if record.name == _c_last_segment(container) else "method"
         opens = _c_scope_opened_by(kind)

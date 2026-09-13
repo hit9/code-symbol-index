@@ -46,3 +46,27 @@ def test_reused_repository_reads_header_language_again_after_conversion(tmp_path
     repo.update(['app.h'])
     assert other.storage.file_languages(['app.h']) == {'app.h': 'cpp'}
     assert repo._stored_language(Path('app.h')) == 'cpp'
+
+
+@pytest.mark.parametrize(('source', 'name', 'expected'), [
+    ('namespace demo { int f(); }\nint demo::f() { return 1; }\n', 'f', 'function'),
+    ('struct S { S(); };\nS::S() {}\n', 'S', 'constructor'),
+])
+def test_cpp_qualified_definition_agrees_with_declaration_kind(tmp_path, source, name, expected):
+    (tmp_path / 'app.cpp').write_text(source)
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    matches = [s for s in repo.search_symbols(name, exact_only=True) if s.kind in c.FUNCTION_KINDS]
+    assert len(matches) == 2
+    assert {s.kind for s in matches} == {expected}
+
+
+def test_cpp_revision_reextracts_old_namespace_classification(tmp_path):
+    (tmp_path / 'app.cpp').write_text('namespace demo { int f(); }\nint demo::f() { return 1; }\n')
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    with repo.storage.connection:
+        repo.storage.connection.execute("UPDATE files SET extractor_revision='cpp:1'")
+    with mock.patch.object(c, '_parse_file', wraps=c._parse_file) as parse:
+        repo.refresh()
+    assert parse.call_count == 1
+    with mock.patch.object(c, '_parse_file', side_effect=AssertionError('upgrade repeated')):
+        repo.refresh()
