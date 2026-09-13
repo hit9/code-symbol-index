@@ -36,6 +36,7 @@ SCHEMA_VERSION = 5
 EXTRACTOR_REVISIONS: dict[str, str] = {
     "c": "c:1",
     "cpp": "cpp:1",
+    "kotlin": "kotlin:1",
 }
 # C/C++ header files are the one extension whose language is ambiguous. The
 # default stays C (unchanged behaviour); ``c_header_language`` in the meta table
@@ -4427,6 +4428,12 @@ def _definition_kind(source: bytes, language: LanguageSpec, node: Node) -> str |
             return _SWIFT_DECLARATION_KINDS.get(_node_text(source, marker), kind)
     if language.name == "kotlin" and node_kind == "class_declaration":
         return _kotlin_class_kind(node, kind)
+    if language.name == "kotlin" and node_kind == "class_parameter":
+        # A primary-constructor parameter is only a property when it owns its
+        # own ``val``/``var`` keyword; ``class Box(input: Int)`` declares nothing.
+        if not any(_node_kind(child) == "binding_pattern_kind" for child in _node_children(node)):
+            return None
+        return kind
     if language.name in _JS_LANGUAGE_NAMES and node_kind == "variable_declarator":
         return _js_declarator_kind(node, kind)
     return kind
