@@ -44,19 +44,39 @@
   abstract classes and destructuring bindings; Swift indexes every name of a
   multi-property declaration; Kotlin indexes destructuring bindings and no longer
   treats a plain primary-constructor parameter as a property.
+- Review fixes preserve existing rows when files or directories are unreadable,
+  keep filtered refreshes from acknowledging a repository-wide Git checkout, and
+  preserve headers excluded by a language filter during partial conversion.
+  Full status checks honor the saved header language. Decorated Python classes
+  retain their fields, and multi-binding previews cover the complete declaration.
+- `inspect` no longer counts a plain read of a function value as a call relation, so
+  a function passed as an argument is not reported as calling or being called.
+- Index writers omit query-only body metadata, send flattened symbol rows between
+  workers, and avoid unnecessary traversal work. C/C++ definition preference uses
+  bounded ancestor lookups instead of re-extracting whole candidate files. A rule
+  upgrade compares old and new symbols in batches and skips rewriting identical
+  symbol/FTS rows. Index writes print a percentage while writing on a terminal.
 
 ### Notes
 
 - Upgrading an existing index needs an explicit `index` (or `index --sync`): reading
   never migrates and never re-parses for rules. Symbol IDs, kinds and result contents
   are expected to differ from 0.5.5, and query results may contain more matches.
-- Measured comparison against `4d942db` plus the remaining untested boundaries are
-  recorded in `LANGUAGE-SUPPORT-VALIDATION.md`; `benchmarks/bench_language_support.py`
-  reproduces the numbers.
-- The one-time rule upgrade re-parses only the affected files: about 0.54 ms per file
-  on a 10001-file corpus (≈5.4 s), after which `index` is back at steady state. Steady
-  state timings stay within a few percent of `4d942db`; the handful of measurements
-  above 5% and their disposition are listed in §5.4 of the validation record.
+- Independent acceptance findings, the full measurement matrix and the untested
+  boundaries are recorded in `benchmarks/REVIEW-language-support.md`, with every raw
+  sample in `benchmarks/language-support-review.json`. The original fresh-index
+  benchmark actually timed an already-populated index; that has been corrected.
+- Fresh indexing of C/C++-heavy sources is up to 8% slower than 0.5.5 because the
+  corrected rules publish up to 36% more symbols; per symbol it is about 19%
+  cheaper. The effect does not scale: 1,001- and 10,001-file C corpora index 29%
+  and 11% faster. Queries are unchanged or faster (large C `refs` 0.74x, `inspect`
+  0.82x). Measured warm-cache, on local storage, in independent processes; cold
+  cache, p95 and shared mounts are untested.
+- The one-time rule upgrade costs about 5.1 s for 10,001 C files, after which
+  `index` is back at steady state. Comparing it against 0.5.5's unchanged `index`
+  compares against work 0.5.5 never does; against the previous upgrade
+  implementation it is 0.58x where a file's symbols are unchanged and even
+  otherwise.
 
 ## 0.5.5 - 2026-09-10
 
