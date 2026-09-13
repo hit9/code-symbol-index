@@ -19,18 +19,30 @@ C_DECLARATOR_SOURCE = (
 )
 
 
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
 @pytest.mark.parametrize('language', ['c', 'cpp'])
-def test_symbol_only_walk_matches_full_walk(tmp_path, language):
+def test_symbol_only_walk_matches_full_walk(tmp_path, language, newline):
+    # The write path skips punctuation and keyword leaves; only this test keeps it
+    # honest, so it must exercise every construct whose symbols hang off a leaf.
     source = C_DECLARATOR_SOURCE + (
         '#define VALUE 1\n#define DOUBLE(x) ((x) * 2)\n'
         'struct Box { int first, second; };\n'
         'enum Mode { FAST, SLOW };\n'
-        'int call(void) { int local = 1; return local; }\n'
+        'int call(void) { int local = 1; struct Local { int f; }; return local; }\n'
+        'int broken( ;\n'  # error recovery must not drop the symbols around it
+        'int after_error;\n'
     )
     if language == 'cpp':
-        source += CPP_CLASS_SOURCE
+        source += CPP_CLASS_SOURCE + (
+            'namespace outer { namespace inner {\n'
+            'template <typename T> struct Holder { T value; T get() const { return value; } };\n'
+            'template <typename T> T combine(T a, T b) { return a + b; }\n'
+            'using Alias = int;\n'
+            'enum class Level { Low, High };\n'
+            '} }\n'
+        )
     path = Path('app.' + language)
-    (tmp_path / path).write_text(source)
+    (tmp_path / path).write_bytes(source.replace('\n', newline).encode('utf-8'))
     full = code_symbol_index._parse_file(tmp_path, path, None)
     symbols_only = code_symbol_index._parse_file(
         tmp_path, path, None, include_references=False, collect_bodies=False,
