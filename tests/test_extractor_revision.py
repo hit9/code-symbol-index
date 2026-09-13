@@ -11,6 +11,9 @@ from code_symbol_index import CodeIndex, Repository
 C_SOURCE = "int declared(int);\nint helper(int v) { return v; }\nint caller(int v) { return helper(v); }\n"
 CPP_SOURCE = "int helper(int v);\nint caller(int v) { return helper(v); }\n"
 PY_SOURCE = "def target(): return 1\ndef caller(): return target()\n"
+# A language whose extraction rules carry no revision: files of that language must
+# never be re-parsed by a rules upgrade.
+GO_SOURCE = "package main\n\nfunc Target() int { return 1 }\n\nfunc Caller() int { return Target() }\n"
 
 
 def _write_python(tmp_path: Path) -> Path:
@@ -19,12 +22,18 @@ def _write_python(tmp_path: Path) -> Path:
     return path
 
 
+def _write_go(tmp_path: Path) -> Path:
+    path = tmp_path / "app.go"
+    path.write_text(GO_SOURCE, encoding="utf-8")
+    return path
+
+
 def _file_rows(repo: Repository) -> dict[str, dict]:
     return {path: dict(row) for path, row in repo.storage.files().items()}
 
 
 def test_registered_languages_get_a_revision_and_others_stay_null(tmp_path: Path) -> None:
-    _write_python(tmp_path)
+    _write_go(tmp_path)
     (tmp_path / "app.c").write_text(C_SOURCE, encoding="utf-8")
     (tmp_path / "app.cpp").write_text(CPP_SOURCE, encoding="utf-8")
     repo = Repository(tmp_path, create_index=True, progress=None).build()
@@ -33,11 +42,11 @@ def test_registered_languages_get_a_revision_and_others_stay_null(tmp_path: Path
     assert rows["app.c"]["extractor_revision"] == code_symbol_index.EXTRACTOR_REVISIONS["c"]
     assert rows["app.cpp"]["extractor_revision"] == code_symbol_index.EXTRACTOR_REVISIONS["cpp"]
     # A language without registered rules is not part of the upgrade story.
-    assert rows["app.py"]["extractor_revision"] is None
+    assert rows["app.go"]["extractor_revision"] is None
 
 
 def test_unchanged_c_files_are_upgraded_without_touching_other_languages(tmp_path: Path, monkeypatch) -> None:
-    _write_python(tmp_path)
+    _write_go(tmp_path)
     c_path = tmp_path / "app.c"
     c_path.write_text(C_SOURCE, encoding="utf-8")
     cpp_path = tmp_path / "app.cpp"
@@ -65,7 +74,7 @@ def test_unchanged_c_files_are_upgraded_without_touching_other_languages(tmp_pat
     rows = _file_rows(repo)
     assert rows["app.c"]["extractor_revision"] == "c:1"
     assert rows["app.cpp"]["extractor_revision"] == "cpp:1"
-    assert rows["app.py"]["extractor_revision"] is None
+    assert rows["app.go"]["extractor_revision"] is None
 
 
 @pytest.mark.parametrize("layout", ["raw", "summary", "summary_and_revision"])

@@ -209,3 +209,183 @@ def test_binding_results_do_not_depend_on_line_endings(tmp_path: Path) -> None:
         (symbol.name, symbol.kind) for symbol in crlf_index.search_symbols("", language="typescript", limit=50)
     }
     assert lf_symbols == crlf_symbols
+
+
+PYTHON_BINDINGS = (
+    "first, second = 1, 2\n"
+    "chained_one = chained_two = 3\n"
+    "[listed, *rest_names] = items\n"
+    "(paren_one, paren_two) = pair\n"
+    "single = 1\n"
+    "CONFIG = {'alpha': 1, 'beta': 2}\n"
+    "obj.attribute = 4\n"
+    "mapping['key'] = 5\n"
+    "\n"
+    "class Holder:\n"
+    "    annotated: int = 1\n"
+    "    declared: str\n"
+    "    plain = 2\n"
+    "    member_one, member_two = 1, 2\n"
+    "\n"
+    "    class Nested:\n"
+    "        inner = 3\n"
+    "\n"
+    "    def method(self):\n"
+    "        first_local, second_local = 6, 7\n"
+    "        return first_local\n"
+    "\n"
+    "def outer():\n"
+    "    tuple_local_a, tuple_local_b = 8, 9\n"
+    "    return tuple_local_a\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "kind", "container"),
+    [
+        ("first", "variable", None),
+        ("second", "variable", None),
+        ("chained_one", "variable", None),
+        ("chained_two", "variable", None),
+        ("listed", "variable", None),
+        ("rest_names", "variable", None),
+        ("paren_one", "variable", None),
+        ("paren_two", "variable", None),
+        ("annotated", "field", "Holder"),
+        ("declared", "field", "Holder"),
+        ("plain", "field", "Holder"),
+        ("member_one", "field", "Holder"),
+        ("member_two", "field", "Holder"),
+        ("inner", "field", "Holder.Nested"),
+    ],
+)
+def test_python_bindings_cover_multi_target_chains_and_class_bodies(
+    tmp_path: Path, name: str, kind: str, container: str | None
+) -> None:
+    (tmp_path / "bindings.py").write_text(PYTHON_BINDINGS, encoding="utf-8")
+    index = CodeIndex(tmp_path).build()
+
+    symbol = _symbols(index, "python")[name]
+    assert (symbol.kind, symbol.container) == (kind, container)
+
+
+def test_python_multi_bindings_keep_one_preview_and_no_duplicates(tmp_path: Path) -> None:
+    (tmp_path / "bindings.py").write_text(PYTHON_BINDINGS, encoding="utf-8")
+    index = CodeIndex(tmp_path).build()
+
+    symbols = _symbols(index, "python")
+    assert symbols["first"].signature == "first, second = 1, 2"
+    assert symbols["second"].signature == "first, second = 1, 2"
+    assert symbols["first"].range.start_byte != symbols["second"].range.start_byte
+    # Dictionary keys stay one symbol each, attached to the first bound name.
+    for key in ("alpha", "beta"):
+        assert (symbols[key].kind, symbols[key].container) == ("dict_key", "CONFIG")
+    assert len(index.search_symbols("alpha", language="python", exact_only=True)) == 1
+
+
+def test_python_attribute_and_local_targets_define_nothing(tmp_path: Path) -> None:
+    (tmp_path / "bindings.py").write_text(PYTHON_BINDINGS, encoding="utf-8")
+    index = CodeIndex(tmp_path).build()
+
+    for absent in ("obj", "attribute", "mapping", "key", "first_local", "second_local", "tuple_local_a"):
+        assert index.search_symbols(absent, language="python", exact_only=True) == [], absent
+
+
+SWIFT_BINDINGS = (
+    "let first = 1, second = 2\n"
+    "var (tuple_a, tuple_b) = pair\n"
+    "let alpha = makeDefault(), beta = compute()\n"
+    "\n"
+    "struct Sizes {\n"
+    "    let width: Int, height: Int\n"
+    "    var count = 0\n"
+    "\n"
+    "    func area() -> Int {\n"
+    "        let local_one = 1, local_two = 2\n"
+    "        return local_one\n"
+    "    }\n"
+    "}\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "kind", "container"),
+    [
+        ("first", "property", None),
+        ("second", "property", None),
+        ("tuple_a", "property", None),
+        ("tuple_b", "property", None),
+        ("alpha", "property", None),
+        ("beta", "property", None),
+        ("width", "property", "Sizes"),
+        ("height", "property", "Sizes"),
+        ("count", "property", "Sizes"),
+    ],
+)
+def test_swift_multi_property_declarations_produce_every_name(
+    tmp_path: Path, name: str, kind: str, container: str | None
+) -> None:
+    (tmp_path / "bindings.swift").write_text(SWIFT_BINDINGS, encoding="utf-8")
+    index = CodeIndex(tmp_path).build()
+
+    symbol = _symbols(index, "swift")[name]
+    assert (symbol.kind, symbol.container) == (kind, container)
+
+
+def test_swift_property_names_do_not_come_from_initialisers(tmp_path: Path) -> None:
+    (tmp_path / "bindings.swift").write_text(SWIFT_BINDINGS, encoding="utf-8")
+    index = CodeIndex(tmp_path).build()
+
+    symbols = _symbols(index, "swift")
+    assert symbols["first"].signature == "let first = 1, second = 2"
+    assert symbols["second"].signature == "let first = 1, second = 2"
+    assert symbols["second"].range.start_byte > symbols["first"].range.start_byte
+    for absent in ("makeDefault", "compute", "pair", "local_one", "local_two"):
+        assert index.search_symbols(absent, language="swift", exact_only=True) == [], absent
+    # Protocol members, initialisers and functions keep their existing kinds.
+    assert (symbols["area"].kind, symbols["area"].container) == ("function", "Sizes")
+
+
+KOTLIN_DESTRUCTURING = (
+    "val (destructured_one, destructured_two) = pair\n"
+    "val (_, skipped) = ignored\n"
+    "\n"
+    "class Holder {\n"
+    "    val (member_one, member_two) = pair\n"
+    "\n"
+    "    fun local(): Int {\n"
+    "        val (inner_one, inner_two) = pair\n"
+    "        return inner_one\n"
+    "    }\n"
+    "}\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "container"),
+    [
+        ("destructured_one", None),
+        ("destructured_two", None),
+        ("skipped", None),
+        ("member_one", "Holder"),
+        ("member_two", "Holder"),
+    ],
+)
+def test_kotlin_destructuring_declares_every_binding(tmp_path: Path, name: str, container: str | None) -> None:
+    (tmp_path / "bindings.kt").write_text(KOTLIN_DESTRUCTURING, encoding="utf-8")
+    index = CodeIndex(tmp_path).build()
+
+    symbol = _symbols(index, "kotlin")[name]
+    assert (symbol.kind, symbol.container) == ("property", container)
+
+
+def test_kotlin_destructuring_skips_placeholder_and_locals(tmp_path: Path) -> None:
+    (tmp_path / "bindings.kt").write_text(KOTLIN_DESTRUCTURING, encoding="utf-8")
+    index = CodeIndex(tmp_path).build()
+
+    assert index.search_symbols("_", language="kotlin", exact_only=True) == []
+    for absent in ("inner_one", "inner_two", "pair"):
+        assert index.search_symbols(absent, language="kotlin", exact_only=True) == [], absent
+    symbols = _symbols(index, "kotlin")
+    assert symbols["destructured_one"].signature == "val (destructured_one, destructured_two) = pair"
+    assert symbols["destructured_one"].range.start_byte != symbols["destructured_two"].range.start_byte

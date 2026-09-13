@@ -37,7 +37,9 @@ EXTRACTOR_REVISIONS: dict[str, str] = {
     "c": "c:1",
     "cpp": "cpp:1",
     "javascript": "javascript:1",
-    "kotlin": "kotlin:1",
+    "kotlin": "kotlin:2",
+    "python": "python:1",
+    "swift": "swift:1",
     "tsx": "tsx:1",
     "typescript": "typescript:1",
 }
@@ -3511,6 +3513,25 @@ def _field_child(node: Node | None, *names: str) -> Node | None:
     return None
 
 
+def _field_children(node: Node, field: str) -> list[Node]:
+    """Every child in ``field``, in source order.
+
+    ``child_by_field_name`` returns only the first one, which is why ``int a, b;``
+    and Swift's ``let a = 1, b = 2`` used to lose the later names.
+    """
+    getter = getattr(node, "children_by_field_name", None)
+    if getter is not None:
+        try:
+            return list(getter(field))
+        except Exception:
+            pass
+    return [
+        child
+        for index, child in enumerate(_node_children(node))
+        if _field_name_at(node, index) == field
+    ]
+
+
 def _member_name_node(member: Node | None, language: LanguageSpec) -> Node | None:
     """The name part of a member access node (``obj.NAME``), not the receiver."""
     field = _field_child(member, *_MEMBER_NAME_FIELDS)
@@ -3893,28 +3914,91 @@ def _extract_symbols_and_references(
     c_state = _CFileState(source, root_node) if language.name in _C_LANGUAGE_NAMES else None
     walk(root_node, None, None, None, frozenset())
     if language.name == "python":
-        symbols.extend(_python_top_level_symbols(source, path, language, root_node, line_starts))
+        symbols.extend(_python_symbols(source, path, language, root_node, line_starts))
     return symbols, references, bodies
 
 
-def _python_top_level_symbols(
+def _python_symbols(
     source: bytes, path: Path, language: LanguageSpec, root_node: Node,
     line_starts: Sequence[int] | None = None,
 ) -> list[Symbol]:
+    """Module-level bindings and class-body fields.
+
+    The generic walk publishes nothing for an ``assignment``, so the module and
+    class scopes are handled here: every name bound by an assignment target
+    becomes a symbol, including chained (``a = b = 1``) and tuple/list targets.
+    A class body's assignments are fields of that class; a function body's
+    locals are not visited at all.
+    """
     symbols: list[Symbol] = []
     for node in _node_children(root_node):
-        if _node_kind(node) != "assignment":
-            continue
-        left = node.child_by_field_name("left")
-        if left is None:
-            continue
-        name_node = _first_identifier(left, language)
-        if name_node is None:
-            continue
+        node_kind = _node_kind(node)
+        if node_kind == "assignment":
+            symbols.extend(
+                _python_assignment_symbols(
+                    source, path, language, node, container=None, as_field=False, line_starts=line_starts
+                )
+            )
+        elif node_kind == "class_definition":
+            symbols.extend(
+                _python_class_field_symbols(source, path, language, node, container=None, line_starts=line_starts)
+            )
+    return symbols
+
+
+def _python_class_field_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    class_node: Node,
+    container: str | None,
+    line_starts: Sequence[int] | None = None,
+) -> list[Symbol]:
+    """Annotated and plain class-body assignments, plus nested classes."""
+    name_node = class_node.child_by_field_name("name")
+    class_name = _node_text(source, name_node) if name_node is not None else ""
+    if not class_name:
+        return []
+    qualified = class_name if container is None else f"{container}.{class_name}"
+    body = class_node.child_by_field_name("body")
+    if body is None:
+        return []
+    symbols: list[Symbol] = []
+    for child in _node_children(body):
+        child_kind = _node_kind(child)
+        if child_kind == "assignment":
+            symbols.extend(
+                _python_assignment_symbols(
+                    source, path, language, child, container=qualified, as_field=True, line_starts=line_starts
+                )
+            )
+        elif child_kind == "class_definition":
+            symbols.extend(
+                _python_class_field_symbols(
+                    source, path, language, child, container=qualified, line_starts=line_starts
+                )
+            )
+    return symbols
+
+
+def _python_assignment_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    assignment: Node,
+    *,
+    container: str | None,
+    as_field: bool,
+    line_starts: Sequence[int] | None = None,
+) -> list[Symbol]:
+    """One symbol per name the right-hand chain of ``assignment`` binds."""
+    symbols: list[Symbol] = []
+    first_name: str | None = None
+    for name_node in _python_assignment_bindings(language, assignment):
         name = _node_text(source, name_node)
         if not name or not _looks_like_symbol_name(name):
             continue
-        kind = "constant" if name.isupper() else "variable"
+        kind = "field" if as_field else ("constant" if name.isupper() else "variable")
         range_ = _node_range(source, name_node, line_starts)
         symbols.append(
             Symbol(
@@ -3924,12 +4008,63 @@ def _python_top_level_symbols(
                 language=language.name,
                 path=path,
                 range=range_,
-                signature=_signature(source, node),
-                container=None,
+                signature=_signature(source, assignment),
+                container=container,
             )
         )
-        symbols.extend(_python_dict_key_symbols(source, path, language, node, container=name, line_starts=line_starts))
+        if first_name is None:
+            first_name = name
+    if first_name is not None and not as_field:
+        # Dictionary keys keep their previous container and stay a single set of
+        # symbols: a multi-target assignment must not duplicate them.
+        symbols.extend(
+            _python_dict_key_symbols(
+                source, path, language, assignment, container=first_name, line_starts=line_starts
+            )
+        )
     return symbols
+
+
+def _python_assignment_bindings(language: LanguageSpec, assignment: Node) -> list[Node]:
+    """Name nodes an assignment chain binds, in target order.
+
+    ``a = b = 1`` nests the second target in the first assignment's value field,
+    so the chain is followed only while that value is itself an assignment.
+    """
+    bindings: list[Node] = []
+    node: Node | None = assignment
+    while node is not None and _node_kind(node) == "assignment":
+        left = node.child_by_field_name("left")
+        if left is not None:
+            bindings.extend(_python_binding_targets(language, left))
+        right = node.child_by_field_name("right")
+        node = right if right is not None and _node_kind(right) == "assignment" else None
+    return bindings
+
+
+def _python_binding_targets(language: LanguageSpec, node: Node) -> list[Node]:
+    """Identifier nodes bound by the target side of an assignment.
+
+    Attribute and subscript targets name objects that already exist, so
+    ``obj.value = 1`` defines neither ``obj`` nor ``value``; tuple, list and
+    starred patterns contribute every name they bind.
+    """
+    if _node_kind(node) in language.identifier_node_types:
+        return [node]
+    if _node_kind(node) in _PYTHON_UNBINDABLE_TARGET_NODE_TYPES:
+        return []
+    found: list[Node] = []
+    for child in _node_children(node):
+        found.extend(_python_binding_targets(language, child))
+    return found
+
+
+# Assignment targets that name existing objects or values instead of declaring a
+# binding. ``call`` and ``binary_operator`` are not valid Python targets, but a
+# grammar error must not turn their contents into definitions.
+_PYTHON_UNBINDABLE_TARGET_NODE_TYPES = frozenset(
+    {"attribute", "binary_operator", "call", "subscript"}
+)
 
 
 def _python_dict_key_symbols(
@@ -4078,22 +4213,8 @@ def _field_name_at(node: Node, index: int) -> str | None:
 
 
 def _declarator_field_children(node: Node) -> list[Node]:
-    """Every ``declarator`` field child, in source order.
-
-    ``child_by_field_name`` returns only the first one, which is why ``int a, b;``
-    used to lose ``b``.
-    """
-    getter = getattr(node, "children_by_field_name", None)
-    if getter is not None:
-        try:
-            return list(getter("declarator"))
-        except Exception:
-            pass
-    return [
-        child
-        for index, child in enumerate(_node_children(node))
-        if _field_name_at(node, index) == "declarator"
-    ]
+    """Every ``declarator`` field child, in source order."""
+    return _field_children(node, "declarator")
 
 
 def _c_declarator_name_node(declarator: Node) -> Node | None:
@@ -4496,22 +4617,41 @@ def _js_declarator_symbols(
     name_node = node.child_by_field_name("name")
     if name_node is None or _node_kind(name_node) not in ("object_pattern", "array_pattern"):
         return None
+    return _binding_symbols(source, path, language, node, container, _js_binding_nodes(name_node), "variable", line_starts)
+
+
+def _binding_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    name_nodes: Sequence[Node],
+    kind: str,
+    line_starts: Sequence[int] | None,
+) -> list[tuple[Symbol, str | None]]:
+    """One symbol per bound name, all sharing ``node``'s declaration preview."""
     symbols: list[tuple[Symbol, str | None]] = []
-    for bound in _js_binding_nodes(name_node):
-        name = _node_text(source, bound)
-        if not name or not _looks_like_symbol_name(name):
+    for name_node in name_nodes:
+        name = _node_text(source, name_node)
+        if not name or name == "_" or not _looks_like_symbol_name(name):
             continue
-        range_ = _node_range(source, bound, line_starts)
+        range_ = _node_range(source, name_node, line_starts)
+        signature = (
+            _signature_at_name(source, node, name_node)
+            if language.signature_starts_at_name
+            else _signature(source, node)
+        )
         symbols.append(
             (
                 Symbol(
-                    id=_symbol_id(language.name, path, "variable", name, range_.start_byte),
+                    id=_symbol_id(language.name, path, kind, name, range_.start_byte),
                     name=name,
-                    kind="variable",
+                    kind=kind,
                     language=language.name,
                     path=path,
                     range=range_,
-                    signature=_signature(source, node),
+                    signature=signature,
                     container=container,
                 ),
                 None,
@@ -4520,9 +4660,74 @@ def _js_declarator_symbols(
     return symbols
 
 
+def _swift_binding_identifiers(node: Node) -> list[Node]:
+    """Identifier nodes a Swift pattern binds.
+
+    ``let a = 1, b = 2`` names one pattern per binding and ``let (a, b) = pair``
+    nests plain patterns, so the pattern tree is walked rather than the node's
+    first identifier taken.
+    """
+    if _node_kind(node) in ("simple_identifier", "identifier"):
+        return [node]
+    bound = _field_child(node, "bound_identifier")
+    if bound is not None:
+        return _swift_binding_identifiers(bound)
+    if _node_kind(node) not in ("pattern", "tuple_pattern"):
+        return []
+    found: list[Node] = []
+    for child in _node_children(node):
+        found.extend(_swift_binding_identifiers(child))
+    return found
+
+
+def _swift_property_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    line_starts: Sequence[int] | None,
+) -> list[tuple[Symbol, str | None]] | None:
+    """``let a = 1, b = 2`` declares two properties."""
+    names: list[Node] = []
+    for pattern in _field_children(node, "name"):
+        names.extend(_swift_binding_identifiers(pattern))
+    if len(names) < 2:
+        # A single binding keeps the ordinary path, and so do declarations whose
+        # initialiser holds the only name found.
+        return None
+    return _binding_symbols(source, path, language, node, container, names, "property", line_starts)
+
+
+def _kotlin_property_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    line_starts: Sequence[int] | None,
+) -> list[tuple[Symbol, str | None]] | None:
+    """``val (a, b) = pair`` declares one property per bound name."""
+    names: list[Node] = []
+    for child in _node_children(node):
+        if _node_kind(child) != "multi_variable_declaration":
+            continue
+        for declaration in _node_children(child):
+            if _node_kind(declaration) != "variable_declaration":
+                continue
+            for identifier in _node_children(declaration):
+                if _node_kind(identifier) in language.identifier_node_types:
+                    names.append(identifier)
+    if not names:
+        return None
+    return _binding_symbols(source, path, language, node, container, names, "property", line_starts)
+
+
 _MULTI_SYMBOL_RESOLVERS.update(
     {(name, "variable_declarator"): _js_declarator_symbols for name in _JS_LANGUAGE_NAMES}
 )
+_MULTI_SYMBOL_RESOLVERS[("swift", "property_declaration")] = _swift_property_symbols
+_MULTI_SYMBOL_RESOLVERS[("kotlin", "property_declaration")] = _kotlin_property_symbols
 
 
 def _definition_kind(source: bytes, language: LanguageSpec, node: Node) -> str | None:
