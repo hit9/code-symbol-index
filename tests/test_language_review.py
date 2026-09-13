@@ -70,3 +70,22 @@ def test_cpp_revision_reextracts_old_namespace_classification(tmp_path):
     assert parse.call_count == 1
     with mock.patch.object(c, '_parse_file', side_effect=AssertionError('upgrade repeated')):
         repo.refresh()
+
+
+def test_index_writer_does_not_build_or_return_query_only_bodies(tmp_path):
+    (tmp_path / 'app.py').write_text('def target(): return 1\n')
+    repo = c.Repository(tmp_path, create_index=True)
+    with mock.patch.object(c, '_callable_bodies', side_effect=AssertionError('query metadata on write')):
+        results = repo._parse_files([Path('app.py')], include_references=False)
+    assert len(results) == 1 and results[0].bodies == ()
+    assert results[0].symbols[0].name == 'target'
+
+
+def test_many_nested_bodies_do_not_leak_calls_to_outer(tmp_path):
+    source = 'def target(): return 1\ndef other(): return 2\ndef outer():\n'
+    source += ''.join(f'    def inner_{i}(): return target()\n' for i in range(80))
+    source += '    return other()\n'
+    (tmp_path / 'app.py').write_text(source)
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    assert [n.symbol.name for n in repo.callees('outer', depth=1).roots] == ['other']
+    assert len(repo.callers('target', depth=1, limit=100).roots) == 80

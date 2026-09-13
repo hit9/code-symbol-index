@@ -1331,6 +1331,7 @@ class CodeIndex:
             relative_path,
             self.languages,
             header_language=self.write_header_language(),
+            collect_bodies=False,
         )
         if indexed is None:
             return
@@ -1538,9 +1539,11 @@ class Repository(CodeIndex):
             self.header_language = self.storage.meta_value(HEADER_LANGUAGE_META) or DEFAULT_HEADER_LANGUAGE
         return self.header_language
 
-    def _write_revision(self, path: Path) -> str | None:
+    def _write_revision(self, path_text: str) -> str | None:
         """Extraction-rule revision this scan would write for ``path``."""
-        spec = self._write_spec(path)
+        extension = _extension_of(path_text)
+        spec = (LANGUAGE_BY_NAME[self.write_header_language() or DEFAULT_HEADER_LANGUAGE]
+                if extension == HEADER_EXTENSION else LANGUAGE_BY_EXTENSION.get(extension))
         return EXTRACTOR_REVISIONS.get(spec.name) if spec is not None else None
 
     def _scan_covers_language(self, language: str) -> bool:
@@ -1596,7 +1599,7 @@ class Repository(CodeIndex):
         rule_upgrades = 0
         for path_text, (path, stat) in current_files.items():
             old = indexed_files.get(path_text)
-            revision = self._write_revision(path)
+            revision = self._write_revision(path_text)
             needs_rules = revision is not None and (old is None or old["extractor_revision"] != revision)
             metadata_changed = old is None or old["mtime_ns"] != stat.st_mtime_ns or old["size"] != stat.st_size
             if old is not None and needs_rules and not metadata_changed:
@@ -1664,7 +1667,7 @@ class Repository(CodeIndex):
         pending = [
             path
             for path, (relative_path, _stat) in current_files.items()
-            if relative_path.suffix.lower() == HEADER_EXTENSION
+            if path[-2:].lower() == HEADER_EXTENSION
             and path in indexed_files
             and indexed_files[path]["language"] != effective_header
         ]
@@ -1770,6 +1773,7 @@ class Repository(CodeIndex):
                     self.languages,
                     include_references=include_references,
                     header_language=header_language,
+                    collect_bodies=include_references,
                 )
                 if result is not None:
                     results.append(result)
@@ -1786,6 +1790,7 @@ class Repository(CodeIndex):
                 executor.submit(
                     _parse_file, self.root, path, self.languages, include_references,
                     header_language=header_language,
+                    collect_bodies=include_references,
                 ): path
                 for path in paths
             }
@@ -3367,6 +3372,7 @@ def _parse_file(
     reference_name: str | frozenset[str] | None = None,
     language: str | None = None,
     header_language: str | None = None,
+    collect_bodies: bool = True,
 ) -> _IndexedFile | None:
     full_path = root / relative_path
     spec = None
@@ -3403,6 +3409,7 @@ def _parse_file(
             path=relative_path,
             language=spec,
             include_references=include_references,
+            collect_bodies=collect_bodies,
         )
         bodies = tuple(extracted_bodies)
     return _IndexedFile(
@@ -3413,7 +3420,7 @@ def _parse_file(
         symbols=tuple(symbols),
         references=tuple(references),
         bodies=tuple(bodies),
-        name_summary=_file_name_summary(source_bytes, stat) if not include_references else None,
+        name_summary=_file_name_summary(source_bytes, stat) if not include_references and not collect_bodies else None,
         revision=EXTRACTOR_REVISIONS.get(spec.name),
     )
 
@@ -3856,6 +3863,7 @@ def _extract_symbols_and_references(
     path: Path,
     language: LanguageSpec,
     include_references: bool = True,
+    collect_bodies: bool = True,
 ) -> tuple[list[Symbol], list[Reference], list[_CallableBody]]:
     symbols: list[Symbol] = []
     references: list[Reference] = []
@@ -3864,7 +3872,7 @@ def _extract_symbols_and_references(
     lines = source.decode("utf-8", errors="replace").splitlines() if include_references else []
     # Hoisted out of the walk: both are constant for the file, and the walk visits
     # every node, so a per-node dict look-up would be paid tens of thousands of times.
-    body_node_types = _CALLABLE_BODY_NODE_TYPES.get(language.name)
+    body_node_types = _CALLABLE_BODY_NODE_TYPES.get(language.name) if collect_bodies else None
     has_multi_symbol_rules = language.name in _MULTI_SYMBOL_LANGUAGES
 
     def walk(
@@ -5645,12 +5653,22 @@ def _callees_for_symbol(
         # conservative because nested boundaries cannot be identified here.
         owner_span = (range_.start_byte, range_.end_byte)
         nested_spans = []
+    # A reference must not scan every nested function. Coalesce body intervals
+    # once, then find the only possible containing interval by binary search.
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(nested_spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    nested_starts = [start for start, _ in merged]
     names: list[str] = []
     seen_names: set[str] = set()
     for reference in indexed.references:
         if not _span_contains(owner_span, (reference.range.start_byte, reference.range.end_byte)):
             continue
-        if any(_span_contains(nested, (reference.range.start_byte, reference.range.end_byte)) for nested in nested_spans):
+        nested_index = bisect_right(nested_starts, reference.range.start_byte) - 1
+        if nested_index >= 0 and reference.range.end_byte <= merged[nested_index][1]:
             continue
         if ref_kinds is not None and reference.reference_kind not in ref_kinds:
             continue
@@ -6803,15 +6821,6 @@ def _extension_of(path_text: str) -> str:
     if dot <= path_text.rfind("/") + 1:
         return ""
     return path_text[dot:].lower()
-
-
-def _matches_path_pattern(path_text: str, pattern: str) -> bool:
-    if fnmatch.fnmatch(path_text, pattern):
-        return True
-    if pattern.endswith("/**"):
-        directory = pattern[:-3].rstrip("/")
-        return path_text == directory or path_text.startswith(f"{directory}/")
-    return False
 
 
 def _json_default(value: Any) -> Any:
