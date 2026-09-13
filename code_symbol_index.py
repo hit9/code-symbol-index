@@ -38,7 +38,7 @@ EXTRACTOR_REVISIONS: dict[str, str] = {
     "cpp": "cpp:2",
     "javascript": "javascript:1",
     "kotlin": "kotlin:2",
-    "python": "python:1",
+    "python": "python:2",
     "rust": "rust:1",
     "swift": "swift:1",
     "tsx": "tsx:1",
@@ -1600,6 +1600,7 @@ class Repository(CodeIndex):
             for path in indexed_files
             if path not in current_files and path not in unavailable_paths
             and self._scan_covers_language(indexed_files[path]["language"])
+            and (path[-2:].lower() != HEADER_EXTENSION or self._scan_covers_language(effective_header))
         ]
 
         to_index: list[Path] = []
@@ -3995,6 +3996,10 @@ def _python_symbols(
     """
     symbols: list[Symbol] = []
     for node in _node_children(root_node):
+        if _node_kind(node) == "decorated_definition":
+            node = node.child_by_field_name("definition")
+            if node is None:
+                continue
         node_kind = _node_kind(node)
         if node_kind == "assignment":
             symbols.extend(
@@ -4028,6 +4033,10 @@ def _python_class_field_symbols(
         return []
     symbols: list[Symbol] = []
     for child in _node_children(body):
+        if _node_kind(child) == "decorated_definition":
+            child = child.child_by_field_name("definition")
+            if child is None:
+                continue
         child_kind = _node_kind(child)
         if child_kind == "assignment":
             symbols.extend(
@@ -4921,14 +4930,6 @@ def _node_start_byte(node: Node) -> int:
 
 def _node_end_byte(node: Node) -> int:
     return _node_value(node, "end_byte")
-
-
-def _node_start_point(node: Node) -> Any:
-    return _node_value(node, "start_point", "start_position")
-
-
-def _node_end_point(node: Node) -> Any:
-    return _node_value(node, "end_point", "end_position")
 
 
 def _node_value(node: Node, *names: str) -> Any:
@@ -6452,6 +6453,7 @@ def _index_status(
                 exclude=exclude,
                 indexed_files=data["indexed_files"],
                 max_files=max_pending_files,
+                header_language=data["header_language"],
             )
         else:
             pending_changes = "unknown"
@@ -6501,6 +6503,9 @@ def _read_index_metadata(db_path: Path, *, include_files: bool = True) -> dict[s
             "SELECT value FROM meta WHERE key = 'updated_at'",
         ).fetchone()
         git_row = connection.execute("SELECT value FROM meta WHERE key = 'git_baseline'").fetchone()
+        header_row = connection.execute(
+            "SELECT value FROM meta WHERE key = ?", (HEADER_LANGUAGE_META,),
+        ).fetchone() if include_files else None
         files = connection.execute("SELECT count(*) FROM files").fetchone()[0]
         symbols = connection.execute("SELECT count(*) FROM symbols").fetchone()[0]
         languages = tuple(
@@ -6527,6 +6532,7 @@ def _read_index_metadata(db_path: Path, *, include_files: bool = True) -> dict[s
         "schema_version": int(schema_row["value"]) if schema_row is not None else None,
         "updated_at": updated_at_row["value"] if updated_at_row is not None else None,
         "git_baseline": git_row["value"] if git_row is not None else None,
+        "header_language": header_row["value"] if header_row is not None else DEFAULT_HEADER_LANGUAGE,
         "files": files,
         "symbols": symbols,
         "languages": languages,
@@ -6543,6 +6549,7 @@ def _pending_index_changes(
     exclude: Iterable[str],
     indexed_files: dict[str, tuple[str, int, int]],
     max_files: int,
+    header_language: str | None = None,
 ) -> tuple[int, tuple[str, ...]]:
     language_filter = set(languages) if languages is not None else None
     filtered_indexed_files = {
@@ -6556,6 +6563,7 @@ def _pending_index_changes(
         include=include,
         exclude=exclude,
         db_path=":memory:",
+        header_language=header_language,
     )
     current_files: dict[str, tuple[int, int]] = {}
     for path in scanner._iter_indexable_files():

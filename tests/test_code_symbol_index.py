@@ -58,11 +58,13 @@ def test_python_ranges_do_not_depend_on_tree_sitter_points(monkeypatch) -> None:
     )
     source_bytes = source.encode("utf-8")
 
-    def fail_point_access(*_args):
-        raise AssertionError("tree-sitter point access should not be used")
+    node_value = code_symbol_index._node_value
 
-    monkeypatch.setattr(code_symbol_index, "_node_start_point", fail_point_access)
-    monkeypatch.setattr(code_symbol_index, "_node_end_point", fail_point_access)
+    def byte_only_value(node, *names):
+        assert not any("point" in name or "position" in name for name in names)
+        return node_value(node, *names)
+
+    monkeypatch.setattr(code_symbol_index, "_node_value", byte_only_value)
 
     parser = code_symbol_index._parser_for_language("python")
     tree = parser.parse(source_bytes)

@@ -158,3 +158,42 @@ def test_multi_binding_preview_uses_full_declaration_in_both_paths(tmp_path, mon
     assert c._definition_range(repo, symbol) == native
     assert native is not None
     assert source.encode()[native.start_byte:native.end_byte].decode() == declaration
+
+
+def test_full_status_check_respects_cpp_header_configuration(tmp_path):
+    (tmp_path / 'app.h').write_text('class Box {};\n')
+    c.Repository(tmp_path, create_index=True).refresh(header_language='cpp')
+    result = c.status(tmp_path, language='cpp', check=True)
+    assert result.status == 'ready'
+    assert result.pending_changes == 0
+
+
+def test_filtered_refresh_preserves_header_after_failed_conversion(tmp_path):
+    (tmp_path / 'app.h').write_text('int target() { return 1; }\n')
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    with mock.patch.object(c, '_parse_file', return_value=None):
+        repo.refresh(header_language='cpp')
+    c.Repository(tmp_path, languages=['c']).refresh()
+    assert repo.storage.file_languages(['app.h']) == {'app.h': 'c'}
+    assert repo.search_symbols('target', exact_only=True)
+    repo.refresh()
+    assert repo.storage.file_languages(['app.h']) == {'app.h': 'cpp'}
+
+
+def test_decorated_python_class_fields_and_upgrade(tmp_path):
+    (tmp_path / 'app.py').write_text(
+        '@decorate\nclass Box:\n    a, b = 1, 2\n'
+        '    @decorate\n    class Inner:\n        value: int = 1\n'
+        '    @decorate\n    def method(self):\n        local = 1\n'
+    )
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    fields = {(s.name, s.container) for s in repo.search_symbols('', kind='field')}
+    assert fields == {('a', 'Box'), ('b', 'Box'), ('value', 'Box.Inner')}
+    assert not repo.search_symbols('local', exact_only=True)
+    with repo.storage.connection:
+        repo.storage.connection.execute("UPDATE files SET extractor_revision='python:1'")
+    with mock.patch.object(c, '_parse_file', wraps=c._parse_file) as parse:
+        repo.refresh()
+    assert parse.call_count == 1
+    with mock.patch.object(c, '_parse_file', side_effect=AssertionError('upgrade repeated')):
+        repo.refresh()
