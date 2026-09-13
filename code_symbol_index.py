@@ -1667,6 +1667,9 @@ class Repository(CodeIndex):
 
         total = len(to_index)
         _emit_progress(progress_callback, "start", done=0, total=total)
+        # Start expensive files first using the scan's existing stat results.
+        # No additional filesystem calls are needed for scheduling.
+        to_index.sort(key=lambda path: current_files[path.as_posix()][1].st_size, reverse=True)
         indexed_results = self._parse_files(
             to_index, include_references=False, progress=progress_callback, header_language=effective_header
         )
@@ -1830,27 +1833,35 @@ class Repository(CodeIndex):
 
         results: list[_IndexedFile] = []
         workers = min(MAX_WORKERS, len(paths))
+        # Keep several jobs per worker for load balancing, while amortizing IPC
+        # for repositories with thousands of tiny files. Small batches stay 1:1.
+        batch_size = min(16, max(1, len(paths) // (workers * 8)))
+        batch_count = (len(paths) + batch_size - 1) // batch_size
         executor = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+        future_to_paths = {}
         try:
-            future_to_path = {
+            future_to_paths = {
                 executor.submit(
-                    _parse_file, self.root, path, self.languages, include_references,
-                    header_language=header_language,
-                    collect_bodies=include_references,
-                ): path
-                for path in paths
+                    _parse_file_batch, self.root, batch, self.languages, include_references, header_language,
+                ): batch
+                # Stripe size-ordered paths across jobs so the largest files
+                # do not accumulate in a single sequential worker batch.
+                for batch in (paths[offset::batch_count] for offset in range(batch_count))
             }
-            for done, future in enumerate(concurrent.futures.as_completed(future_to_path), start=1):
+            done = 0
+            for future in concurrent.futures.as_completed(future_to_paths):
+                batch = future_to_paths[future]
                 try:
-                    result = future.result()
+                    parsed = future.result()
                 except Exception:
-                    result = None
-                if result is not None:
-                    results.append(result)
-                path = future_to_path[future]
-                _emit_progress(progress, "file", done=done, total=len(paths), path=path.as_posix())
+                    parsed = [None] * len(batch)
+                for path, result in zip(batch, parsed, strict=True):
+                    if result is not None:
+                        results.append(result)
+                    done += 1
+                    _emit_progress(progress, "file", done=done, total=len(paths), path=path.as_posix())
         except KeyboardInterrupt:
-            for future in future_to_path:
+            for future in future_to_paths:
                 future.cancel()
             _terminate_executor(executor)
             raise
@@ -3498,6 +3509,18 @@ def _parse_file(
         name_summary=_file_name_summary(source_bytes, stat) if not include_references and not collect_bodies else None,
         revision=EXTRACTOR_REVISIONS.get(spec.name),
     )
+
+
+def _parse_file_batch(root, paths, languages, include_references, header_language):
+    results = []
+    for path in paths:
+        try:
+            result = _parse_file(root, path, languages, include_references,
+                                 header_language=header_language, collect_bodies=include_references)
+        except Exception:
+            result = None  # One failed file must not discard successful neighbours.
+        results.append(result)
+    return results
 
 
 def _terminate_executor(executor: concurrent.futures.ProcessPoolExecutor) -> None:

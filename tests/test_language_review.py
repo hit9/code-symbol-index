@@ -226,3 +226,30 @@ def test_worker_result_serialization_preserves_all_metadata(tmp_path, include_re
                             collect_bodies=include_references)
     assert indexed.symbols and indexed.revision
     assert pickle.loads(pickle.dumps(indexed)) == indexed
+
+
+def test_batched_pool_preserves_every_result_and_file_progress(tmp_path, monkeypatch):
+    paths = [Path(f'unit_{i}.c') for i in range(70)]
+    for i, path in enumerate(paths):
+        (tmp_path / path).write_text(f'int target_{i}(void) {{ return {i}; }}\n')
+    repo = c.Repository(tmp_path, create_index=True)
+    monkeypatch.setattr(c, 'MAX_WORKERS', 2)
+    events = []
+    pooled = repo._parse_files(paths, include_references=False,
+                              progress=lambda event, **kw: events.append((event, kw)))
+    monkeypatch.setattr(c, 'MAX_WORKERS', 1)
+    serial = repo._parse_files(paths, include_references=False)
+    assert sorted(pooled, key=lambda f: f.path) == sorted(serial, key=lambda f: f.path)
+    assert [kw['done'] for event, kw in events if event == 'file'] == list(range(1, 71))
+    assert {kw['path'] for event, kw in events if event == 'file'} == {p.as_posix() for p in paths}
+
+
+def test_worker_batch_keeps_neighbours_when_one_parse_raises(tmp_path, monkeypatch):
+    def parse(root, path, *args, **kwargs):
+        if path == Path('bad.c'):
+            raise RuntimeError('fixture parse failure')
+        return path
+    monkeypatch.setattr(c, '_parse_file', parse)
+    paths = [Path('first.c'), Path('bad.c'), Path('last.c')]
+    assert c._parse_file_batch(tmp_path, paths, None, False, None) == [paths[0], None, paths[2]]
+
