@@ -73,9 +73,9 @@ def test_named_extraction_matches_full_extraction(language, source):
         data = text.encode()
         tree = c._parse_source(c._parser_for_language(language), text)
         node = tree.root_node() if callable(tree.root_node) else tree.root_node
-        _, references = c._extract_symbols_and_references(source=data, root_node=node, path=Path("sample"), language=spec)
+        _, references, _bodies = c._extract_symbols_and_references(source=data, root_node=node, path=Path("sample"), language=spec)
         assert references
-        symbols, _ = c._extract_symbols_and_references(
+        symbols, _, _bodies = c._extract_symbols_and_references(
             source=data, root_node=node, path=Path("sample" + spec.extensions[0]), language=spec,
         )
         from types import SimpleNamespace

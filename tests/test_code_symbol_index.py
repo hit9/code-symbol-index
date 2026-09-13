@@ -67,7 +67,7 @@ def test_python_ranges_do_not_depend_on_tree_sitter_points(monkeypatch) -> None:
     parser = code_symbol_index._parser_for_language("python")
     tree = parser.parse(source_bytes)
     root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
-    symbols, references = code_symbol_index._extract_symbols_and_references(
+    symbols, references, _bodies = code_symbol_index._extract_symbols_and_references(
         source=source_bytes,
         root_node=root_node,
         path=Path("app.py"),

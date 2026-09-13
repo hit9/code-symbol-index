@@ -279,6 +279,78 @@ IMPLEMENTATION_KINDS = {
     "trait",
 }
 
+# Symbol kinds that can own a call reference. Callables own calls directly;
+# containers own what their member initialisers and class-level statements call.
+# Variables, fields, constants and type aliases are deliberately excluded: an
+# initialiser call is not a call from the field, and letting those win would
+# hide the enclosing class behind a tighter range.
+CALL_OWNER_KINDS = frozenset(FUNCTION_KINDS | CONTAINER_KINDS)
+
+# Node types whose body bounds call ownership, per language. Only languages
+# listed here get body-based depth-1 edges; others keep the older
+# definition-range containment. Anonymous callable nodes are included because
+# their bodies must still fence off the enclosing function.
+_CALLABLE_BODY_NODE_TYPES: dict[str, tuple[str, ...]] = {
+    "c": ("function_definition", "lambda_expression"),
+    "cpp": ("function_definition", "lambda_expression"),
+    "csharp": ("method_declaration", "constructor_declaration", "local_function_statement", "lambda_expression", "anonymous_method_expression"),
+    "go": ("function_declaration", "method_declaration", "func_literal"),
+    "java": ("method_declaration", "constructor_declaration", "lambda_expression"),
+    "javascript": (
+        "function_declaration",
+        "generator_function_declaration",
+        "function_expression",
+        "generator_function",
+        "arrow_function",
+        "method_definition",
+    ),
+    "kotlin": ("function_declaration", "lambda_literal", "anonymous_function"),
+    "php": ("function_definition", "method_declaration", "anonymous_function", "arrow_function"),
+    "python": ("function_definition", "lambda"),
+    "ruby": ("method", "singleton_method", "lambda", "block"),
+    "rust": ("function_item", "closure_expression"),
+    "swift": (
+        "function_declaration",
+        "init_declaration",
+        "deinit_declaration",
+        "subscript_declaration",
+        "lambda_literal",
+        "computed_property",
+    ),
+    "tsx": (
+        "function_declaration",
+        "generator_function_declaration",
+        "function_expression",
+        "generator_function",
+        "arrow_function",
+        "method_definition",
+    ),
+    "typescript": (
+        "function_declaration",
+        "generator_function_declaration",
+        "function_expression",
+        "generator_function",
+        "arrow_function",
+        "method_definition",
+    ),
+}
+
+# Field names that hold a callable's body when the grammar names the field.
+_BODY_FIELD_NAMES = ("body", "computed_value")
+
+# Body node types used when the grammar leaves the body child unnamed
+# (Kotlin/Swift ``function_body``, bare ``statements`` blocks).
+_BODY_NODE_TYPES = frozenset(
+    {
+        "block",
+        "body_statement",
+        "compound_statement",
+        "function_body",
+        "statement_block",
+        "statements",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Position:
@@ -449,6 +521,29 @@ class _IndexedFile:
     symbols: tuple[Symbol, ...]
     references: tuple[Reference, ...]
     name_summary: bytes | None = None
+    # Transient parse metadata; never persisted. Empty when only references were
+    # extracted (``reference_name`` path) or when the grammar has no known
+    # function body nodes.
+    bodies: tuple[_CallableBody, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _CallableBody:
+    """Body span of one callable in the file that produced it.
+
+    Depth-1 call ownership needs the body, not the whole declaration: a call
+    inside a nested callable belongs to that nested callable. ``name`` is empty
+    for anonymous callables (lambdas, closures), which still act as ownership
+    boundaries even though no symbol is published for them.
+
+    ``name_start_byte`` locates the defining name so a stored symbol can be
+    matched to its own body without re-deriving the name.
+    """
+
+    name: str
+    name_start_byte: int
+    start_byte: int
+    end_byte: int
 
 
 class CodeSymbolIndexError(Exception):
@@ -652,11 +747,17 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
         name="c",
         extensions=(".c", ".h"),
         definitions={
+            "alias_declaration": "type",
             "declaration": "variable",
             "enum_specifier": "enum",
+            "enumerator": "constant",
+            "field_declaration": "field",
             "function_definition": "function",
+            "preproc_def": "constant",
+            "preproc_function_def": "constant",
             "struct_specifier": "struct",
             "type_definition": "type",
+            "union_specifier": "struct",
         },
         # ``declaration`` also matches locals and for-loop initialisers.
         non_local_kinds=("variable",),
@@ -665,14 +766,23 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
         name="cpp",
         extensions=(".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx"),
         definitions={
+            "alias_declaration": "type",
             "class_specifier": "class",
             "declaration": "variable",
             "enum_specifier": "enum",
+            "enumerator": "constant",
+            "field_declaration": "field",
             "function_definition": "function",
             "namespace_definition": "namespace",
+            "preproc_def": "constant",
+            "preproc_function_def": "constant",
             "struct_specifier": "struct",
             "type_definition": "type",
+            "union_specifier": "struct",
         },
+        # C++ names its base classes in a dedicated clause, which carries the
+        # ``inherit`` context for reference classification and ``impls``.
+        inherit_node_types=("base_class_clause",),
         # ``declaration`` also matches locals and for-loop initialisers.
         non_local_kinds=("variable",),
     ),
@@ -2943,17 +3053,19 @@ def _parse_file(
     tree = _parse_source(_parser_for_language(spec.name), source_text)
     root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
     source_bytes = source_text.encode("utf-8")
+    bodies: tuple[_CallableBody, ...] = ()
     if reference_name is not None:
         symbols = []
         references = _extract_named_references(source_bytes, root_node, relative_path, spec, reference_name)
     else:
-        symbols, references = _extract_symbols_and_references(
+        symbols, references, extracted_bodies = _extract_symbols_and_references(
             source=source_bytes,
             root_node=root_node,
             path=relative_path,
             language=spec,
             include_references=include_references,
         )
+        bodies = tuple(extracted_bodies)
     return _IndexedFile(
         path=relative_path,
         language=spec.name,
@@ -2961,6 +3073,7 @@ def _parse_file(
         size=stat.st_size,
         symbols=tuple(symbols),
         references=tuple(references),
+        bodies=tuple(bodies),
         name_summary=_file_name_summary(source_bytes, stat) if not include_references else None,
     )
 
@@ -3120,6 +3233,113 @@ def _child_reference_context(
     return ctx | added
 
 
+def _callable_body_node(node: Node, language: LanguageSpec) -> Node | None:
+    """The body node of ``node`` when it is a callable that owns its calls."""
+    node_types = _CALLABLE_BODY_NODE_TYPES.get(language.name)
+    if node_types is None or _node_kind(node) not in node_types:
+        return None
+    field = _field_child(node, *_BODY_FIELD_NAMES)
+    if field is not None:
+        return field
+    for child in _node_children(node):
+        if _node_kind(child) in _BODY_NODE_TYPES:
+            return child
+    return None
+
+
+# Containment is half-open; comparison is by byte offset so two callables on the
+# same line stay distinguishable.
+def _span_contains(outer: tuple[int, int], inner: tuple[int, int]) -> bool:
+    return outer[0] <= inner[0] and inner[1] <= outer[1]
+
+
+def _callable_bodies(source: bytes, node: Node, language: LanguageSpec, symbol: Symbol | None) -> _CallableBody | None:
+    body_node = _callable_body_node(node, language)
+    if body_node is None:
+        return None
+    return _CallableBody(
+        name=symbol.name if symbol is not None else "",
+        name_start_byte=symbol.range.start_byte if symbol is not None else _node_start_byte(node),
+        start_byte=_node_start_byte(body_node),
+        end_byte=_node_end_byte(body_node),
+    )
+
+
+def _owning_body(bodies: Sequence[_CallableBody], symbol: Symbol) -> _CallableBody | None:
+    """The body recorded for ``symbol``, or ``None`` when it has no body here."""
+    exact = [
+        body
+        for body in bodies
+        if body.name == symbol.name and body.name_start_byte == symbol.range.start_byte
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    containing = [
+        body
+        for body in bodies
+        if body.name == symbol.name and body.start_byte <= symbol.range.start_byte <= body.end_byte
+    ]
+    if containing:
+        return min(containing, key=lambda body: (body.end_byte - body.start_byte, body.start_byte))
+    return None
+
+
+def _callable_is_named(source: bytes, language: LanguageSpec, node: Node) -> bool:
+    """Whether a callable node is named by the declaration holding it.
+
+    ``const f = () => x`` and ``auto fn = [] { x };`` name the callable outside
+    the callable node, so a two-level look-up covers those grammars while staying
+    far away from unrelated ancestors (a lambda inside a function is anonymous).
+    """
+    candidate = node.parent
+    if _declares_call_owner(source, language, node):
+        return True
+    for _ in range(2):
+        if candidate is None:
+            return False
+        if _declares_call_owner(source, language, candidate):
+            name_node = _name_node(candidate, language)
+            return name_node is not None and bool(_node_text(source, name_node))
+        candidate = candidate.parent
+    return False
+
+
+def _declares_call_owner(source: bytes, language: LanguageSpec, node: Node) -> bool:
+    """Whether ``node`` declares something that can own a call."""
+    kind = _definition_kind(source, language, node)
+    return kind is not None and kind in CALL_OWNER_KINDS
+
+
+def _descendant_at(root_node: Node, start_byte: int, end_byte: int) -> Node | None:
+    getter = getattr(root_node, "descendant_for_byte_range", None)
+    if getter is None:
+        return None
+    try:
+        return getter(start_byte, max(end_byte, start_byte + 1))
+    except Exception:
+        return None
+
+
+def _call_owner_at(
+    root_node: Node, source: bytes, language: LanguageSpec, start_byte: int, end_byte: int
+) -> tuple[tuple[int, int], bool] | None:
+    """Innermost callable body containing a position, and whether it is named.
+
+    Anonymous bodies (lambdas, closures) are ownership boundaries but publish no
+    symbol, so a call inside one belongs to nobody the index can name.
+    """
+    node = _descendant_at(root_node, start_byte, end_byte)
+    span = (start_byte, end_byte)
+    while node is not None:
+        body = _callable_body_node(node, language)
+        if body is not None:
+            body_span = (_node_start_byte(body), _node_end_byte(body))
+            if _span_contains(body_span, span):
+                return body_span, _callable_is_named(source, language, node)
+        node = node.parent
+    return None
+
+
 def _opens_with_bracket(node: Node) -> bool:
     """Whether ``node``'s leftmost delimiter is ``[`` rather than ``(``."""
     for child in _node_children(node):
@@ -3156,6 +3376,16 @@ def _is_call_callee(node: Node, parent: Node | None, grandparent: Node | None, l
     parent_kind = _node_kind(parent)
     if parent_kind in language.call_node_types:
         return _same_node(_callee_node(parent, language), node)
+    # Qualified call: ``demo::helper()`` / ``Type::f()``. The callee is the
+    # qualified name; its terminal part is the call, and the scope stays as
+    # written in the source line that carries the reference.
+    if (
+        parent_kind in _QUALIFIED_NAME_NODE_TYPES
+        and grandparent is not None
+        and _node_kind(grandparent) in language.call_node_types
+        and _same_node(_callee_node(grandparent, language), parent)
+    ):
+        return _same_node(_field_child(parent, "name"), node)
     # Method call: ``obj.method()`` — node is the member of a member-access node
     # that is itself the callee of the surrounding call.
     if (
@@ -3267,9 +3497,10 @@ def _extract_symbols_and_references(
     path: Path,
     language: LanguageSpec,
     include_references: bool = True,
-) -> tuple[list[Symbol], list[Reference]]:
+) -> tuple[list[Symbol], list[Reference], list[_CallableBody]]:
     symbols: list[Symbol] = []
     references: list[Reference] = []
+    bodies: list[_CallableBody] = []
     line_starts = _line_starts(source)
     lines = source.decode("utf-8", errors="replace").splitlines() if include_references else []
 
@@ -3280,16 +3511,39 @@ def _extract_symbols_and_references(
         grandparent: Node | None,
         ctx: frozenset[str],
         in_function: bool = False,
+        scope_kind: str | None = None,
     ) -> None:
-        symbol = _symbol_from_node(source, path, language, node, container, line_starts)
+        if c_state is not None:
+            declared = _c_node_symbols(
+                source, path, language, node, container, scope_kind, line_starts, c_state
+            )
+        else:
+            single = _symbol_from_node(source, path, language, node, container, line_starts)
+            declared = (
+                [(single, "container" if single.kind in CONTAINER_KINDS else None)]
+                if single is not None
+                else []
+            )
         next_container = container
-        next_in_function = in_function or (symbol is not None and symbol.kind in FUNCTION_KINDS)
-        if symbol is not None and in_function and symbol.kind in language.non_local_kinds:
-            symbol = None  # a local binding, not a declaration
-        if symbol is not None:
+        next_scope_kind = scope_kind
+        next_in_function = in_function or any(symbol.kind in FUNCTION_KINDS for symbol, _ in declared)
+        primary: Symbol | None = None
+        for symbol, opens in declared:
+            if in_function and symbol.kind in language.non_local_kinds:
+                continue  # a local binding, not a declaration
             symbols.append(symbol)
-            if symbol.kind in CONTAINER_KINDS:
+            if primary is None:
+                primary = symbol
+            if opens is not None:
+                # Only a class, namespace or function opens a scope; two variables
+                # from one declaration must never become each other's container.
                 next_container = symbol.name if container is None else f"{container}.{symbol.name}"
+                if opens != "container":
+                    next_scope_kind = opens
+
+        body = _callable_bodies(source, node, language, primary)
+        if body is not None:
+            bodies.append(body)
 
         if include_references and _node_kind(node) in language.identifier_node_types:
             references.append(
@@ -3310,12 +3564,13 @@ def _extract_symbols_and_references(
         else:
             child_parent, child_grandparent = node, parent
         for child in _node_children(node):
-            walk(child, next_container, child_parent, child_grandparent, child_ctx, next_in_function)
+            walk(child, next_container, child_parent, child_grandparent, child_ctx, next_in_function, next_scope_kind)
 
+    c_state = _CFileState(source, root_node) if language.name in _C_LANGUAGE_NAMES else None
     walk(root_node, None, None, None, frozenset())
     if language.name == "python":
         symbols.extend(_python_top_level_symbols(source, path, language, root_node, line_starts))
-    return symbols, references
+    return symbols, references, bodies
 
 
 def _python_top_level_symbols(
@@ -3401,6 +3656,380 @@ def _python_dict_key_name(source: bytes, language: LanguageSpec, node: Node) -> 
     if _node_kind(node) in language.identifier_node_types:
         return _node_text(source, node), node
     return None, node
+
+
+_C_LANGUAGE_NAMES = ("c", "cpp")
+
+# Declaration owners: the only C/C++ nodes allowed to publish symbols. Every other
+# node contributes nothing, so the traversal never hunts for an arbitrary
+# identifier inside an expression.
+_C_DECLARATION_NODE_TYPES = frozenset(
+    {
+        "alias_declaration",
+        "class_specifier",
+        "declaration",
+        "enum_specifier",
+        "enumerator",
+        "field_declaration",
+        "function_definition",
+        "namespace_definition",
+        "preproc_def",
+        "preproc_function_def",
+        "struct_specifier",
+        "type_definition",
+        "union_specifier",
+    }
+)
+
+_C_SCOPE_NODE_KINDS = {
+    "class_specifier": "class",
+    "enum_specifier": "enum",
+    "namespace_definition": "namespace",
+    "struct_specifier": "struct",
+    "union_specifier": "struct",  # union reuses struct: no new kind this round
+}
+
+# Nodes that carry declarators (possibly several, as in ``int a, b, c;``).
+_C_DECLARATOR_NODE_KINDS = ("declaration", "field_declaration", "function_definition", "type_definition")
+
+_C_TYPE_SCOPE_KINDS = frozenset({"class", "struct", "enum"})
+
+# Nodes whose text can be a declared name. ``destructor_name`` and
+# ``operator_name`` stay whole so ``~Widget`` and ``operator+`` survive as names.
+_C_NAME_NODE_TYPES = frozenset(
+    {
+        "destructor_name",
+        "field_identifier",
+        "identifier",
+        "operator_name",
+        "qualified_identifier",
+        "type_identifier",
+    }
+)
+
+# Fields that never hold the declared name: parameters, initialisers, bodies and
+# the type specifier, whose identifiers belong to nested declarations.
+_C_NAME_SKIP_FIELDS = frozenset(
+    {"arguments", "body", "default_value", "parameters", "size", "type", "value"}
+)
+
+# Subtrees skipped while looking for a declared name.
+_C_NAME_SKIP_NODE_TYPES = frozenset(
+    {
+        "argument_list",
+        "compound_statement",
+        "field_initializer_list",
+        "initializer_list",
+        "lambda_capture_specifier",
+        "parameter_list",
+        "parameters",
+        "template_argument_list",
+        "template_parameter_list",
+    }
+)
+
+_C_DECLARATOR_OPERATIONS = {
+    "array_declarator": "array",
+    "function_declarator": "function",
+    "pointer_declarator": "pointer",
+    "reference_declarator": "reference",
+}
+
+# What a resolved declaration means structurally, before scope refinement.
+_C_CONSTANT_NODE_KINDS = {
+    "enumerator": "constant",
+    "preproc_def": "constant",
+    "preproc_function_def": "constant",
+}
+
+
+def _field_name_at(node: Node, index: int) -> str | None:
+    getter = getattr(node, "field_name_for_child", None)
+    if getter is None:
+        return None
+    try:
+        return getter(index)
+    except Exception:
+        return None
+
+
+def _declarator_field_children(node: Node) -> list[Node]:
+    """Every ``declarator`` field child, in source order.
+
+    ``child_by_field_name`` returns only the first one, which is why ``int a, b;``
+    used to lose ``b``.
+    """
+    getter = getattr(node, "children_by_field_name", None)
+    if getter is not None:
+        try:
+            return list(getter("declarator"))
+        except Exception:
+            pass
+    return [
+        child
+        for index, child in enumerate(_node_children(node))
+        if _field_name_at(node, index) == "declarator"
+    ]
+
+
+def _c_declarator_name_node(declarator: Node) -> Node | None:
+    """The declared name inside a declarator, following declarator structure.
+
+    Descends through pointer/reference/array/function/parenthesised/init
+    declarators but never into parameters, initialisers or function bodies.
+    """
+    kind = _node_kind(declarator)
+    if kind in _C_NAME_NODE_TYPES:
+        return declarator
+    if kind in _C_NAME_SKIP_NODE_TYPES:
+        return None
+    for index, child in enumerate(_node_children(declarator)):
+        if _field_name_at(declarator, index) in _C_NAME_SKIP_FIELDS:
+            continue
+        found = _c_declarator_name_node(child)
+        if found is not None:
+            return found
+    return None
+
+
+def _c_declarator_operation(name_node: Node, stop: Node) -> str | None:
+    """The first binding operation outward from the name, within ``stop``.
+
+    ``int *f(int)`` reads function then pointer (a function); ``int (*fp)(int)``
+    reads pointer then function (a variable). Parentheses are not operations.
+    """
+    node = name_node.parent
+    while node is not None and not _same_node(node, stop):
+        operation = _C_DECLARATOR_OPERATIONS.get(_node_kind(node))
+        if operation is not None:
+            return operation
+        node = node.parent
+    return None
+
+
+def _c_qualified_name(source: bytes, node: Node) -> tuple[Node, str | None]:
+    """Terminal name node and the scope written in the source, if any.
+
+    ``demo::Widget::run`` yields the ``run`` node and ``demo.Widget``; the scope
+    is read from ``qualified_identifier`` fields, never from the first identifier
+    found in the subtree.
+    """
+    if _node_kind(node) != "qualified_identifier":
+        return node, None
+    scope_node = _field_child(node, "scope")
+    name_node = _field_child(node, "name")
+    if scope_node is None or name_node is None:
+        return node, None
+    terminal, inner_scope = _c_qualified_name(source, name_node)
+    prefix = _node_text(source, scope_node)
+    return terminal, prefix if inner_scope is None else f"{prefix}.{inner_scope}"
+
+
+@dataclass(frozen=True, slots=True)
+class _CDeclaration:
+    """One declared entity inside a C/C++ declaration node.
+
+    Temporary extraction record: ``definition_node`` is the whole declaration the
+    preview must cover, ``name_node`` carries the name's byte range and identity.
+    """
+
+    name: str
+    kind: str
+    name_node: Node
+    definition_node: Node
+    explicit_scope: str | None = None
+    opens_scope: bool = False
+    has_body: bool = False
+
+
+def _c_declarator_declarations(source: bytes, node: Node, node_kind: str) -> list[_CDeclaration]:
+    has_body = _field_child(node, "body") is not None
+    records: list[_CDeclaration] = []
+    for declarator in _declarator_field_children(node):
+        name_node = _c_declarator_name_node(declarator)
+        if name_node is None:
+            continue
+        if node_kind == "type_definition":
+            kind = "type"  # typedef context wins: even a function pointer aliases a type
+        elif node_kind == "field_declaration":
+            kind = "method" if _c_declarator_operation(name_node, node) == "function" else "field"
+        elif node_kind == "function_definition":
+            kind = "function"
+        else:
+            kind = "function" if _c_declarator_operation(name_node, node) == "function" else "variable"
+        terminal, explicit_scope = _c_qualified_name(source, name_node)
+        records.append(
+            _CDeclaration(
+                name=_node_text(source, terminal),
+                kind=kind,
+                name_node=terminal,
+                definition_node=node,
+                explicit_scope=explicit_scope,
+                has_body=has_body,
+            )
+        )
+    return records
+
+
+def _c_declarations(source: bytes, node: Node) -> list[_CDeclaration]:
+    """Declarations owned by one node; empty for anything else."""
+    node_kind = _node_kind(node)
+    if node_kind not in _C_DECLARATION_NODE_TYPES:
+        return []
+    if node_kind in _C_DECLARATOR_NODE_KINDS:
+        return _c_declarator_declarations(source, node, node_kind)
+    name_node = _field_child(node, "name")
+    if name_node is None:
+        return []  # anonymous struct/union/enum: no symbol of its own
+    scope_kind = _C_SCOPE_NODE_KINDS.get(node_kind)
+    if scope_kind is not None:
+        return [
+            _CDeclaration(
+                name=_node_text(source, name_node),
+                kind=scope_kind,
+                name_node=name_node,
+                definition_node=node,
+                opens_scope=True,
+                has_body=_field_child(node, "body") is not None,
+            )
+        ]
+    kind = _C_CONSTANT_NODE_KINDS.get(node_kind, "type")
+    return [
+        _CDeclaration(
+            name=_node_text(source, name_node),
+            kind=kind,
+            name_node=name_node,
+            definition_node=node,
+        )
+    ]
+
+
+# Qualified name nodes (``demo::helper``, ``Type::f``) whose terminal part is the
+# entity and whose leading parts are the explicitly written scope.
+_QUALIFIED_NAME_NODE_TYPES = ("qualified_identifier", "scoped_identifier", "scoped_type_identifier")
+
+
+class _CFileState:
+    """Per-file scope facts shared by extraction and definition-range lookup."""
+
+    __slots__ = ("root_node", "scanned", "source", "type_scopes")
+
+    def __init__(self, source: bytes, root_node: Node) -> None:
+        self.root_node = root_node
+        self.source = source
+        self.type_scopes: set[str] = set()
+        self.scanned = False
+
+
+def _c_last_segment(name: str | None) -> str | None:
+    if not name:
+        return None
+    return name.rsplit(".", 1)[-1]
+
+
+def _c_explicit_container(container: str | None, explicit_scope: str) -> str:
+    if container and explicit_scope != container and not explicit_scope.startswith(container + "."):
+        return f"{container}.{explicit_scope}"
+    return explicit_scope
+
+
+def _c_scope_opened_by(kind: str) -> str | None:
+    """The scope kind a symbol introduces, or ``None`` when it introduces none."""
+    if kind in _C_TYPE_SCOPE_KINDS:
+        return "type"
+    if kind == "namespace":
+        return "namespace"
+    if kind in FUNCTION_KINDS:
+        return "function"
+    return None
+
+
+def _c_scan_type_scopes(state: _CFileState) -> None:
+    """Collect every type-scope path in the file once, for late definitions."""
+    state.scanned = True
+    found = state.type_scopes
+
+    def visit(node: Node, container: str | None) -> None:
+        child_container = container
+        for record in _c_declarations(state.source, node):
+            if record.kind in _C_TYPE_SCOPE_KINDS or record.kind == "namespace":
+                child_container = record.name if container is None else f"{container}.{record.name}"
+                found.add(child_container)
+                container = child_container
+        for child in _node_children(node):
+            visit(child, child_container)
+
+    visit(state.root_node, None)
+
+
+def _c_type_scope_known(name: str, state: _CFileState) -> bool:
+    if name in state.type_scopes:
+        return True
+    if not state.scanned:
+        _c_scan_type_scopes(state)
+    return name in state.type_scopes
+
+
+def _c_resolved_declarations(
+    source: bytes,
+    node: Node,
+    container: str | None,
+    scope_kind: str | None,
+    state: _CFileState,
+) -> list[tuple[_CDeclaration, str, str | None, str | None]]:
+    """Declarations of one node with their final kind, container and scope."""
+    resolved: list[tuple[_CDeclaration, str, str | None, str | None]] = []
+    for record in _c_declarations(source, node):
+        if not record.name or not _looks_like_symbol_name(record.name):
+            continue
+        kind = record.kind
+        container_name = container
+        if record.explicit_scope:
+            # Only syntax that is explicit is restored; no using-directive or
+            # type-inference lookup happens here.
+            container_name = _c_explicit_container(container, record.explicit_scope)
+            if kind == "function":
+                kind = "method" if _c_type_scope_known(container_name, state) else "function"
+        elif kind == "function" and scope_kind == "type":
+            kind = "constructor" if record.name == _c_last_segment(container) else "method"
+        opens = _c_scope_opened_by(kind)
+        if opens == "type":
+            state.type_scopes.add(record.name if container is None else f"{container}.{record.name}")
+        resolved.append((record, kind, container_name, opens))
+    return resolved
+
+
+def _c_node_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    scope_kind: str | None,
+    line_starts: Sequence[int] | None,
+    state: _CFileState,
+) -> list[tuple[Symbol, str | None]]:
+    symbols: list[tuple[Symbol, str | None]] = []
+    for record, kind, container_name, opens in _c_resolved_declarations(
+        source, node, container, scope_kind, state
+    ):
+        range_ = _node_range(source, record.name_node, line_starts)
+        symbols.append(
+            (
+                Symbol(
+                    id=_symbol_id(language.name, path, kind, record.name, range_.start_byte),
+                    name=record.name,
+                    kind=kind,
+                    language=language.name,
+                    path=path,
+                    range=range_,
+                    signature=_signature(source, record.definition_node),
+                    container=container_name,
+                ),
+                opens,
+            )
+        )
+    return symbols
 
 
 def _symbol_from_node(
@@ -3854,6 +4483,28 @@ def _inspect_candidates(
     return matches
 
 
+def _defined_symbol_ids(repo: CodeIndex, candidates: Sequence[Symbol]) -> set[str]:
+    """Candidate ids that have a body in the current source.
+
+    A declaration and a definition share name, kind and scope, so the body is
+    what tells them apart. Files are parsed once for the whole candidate set
+    (candidates are already bounded by ``MAX_INSPECT_CANDIDATES``), and the parse
+    result is shared within the request instead of re-parsing per candidate.
+    """
+    by_path: dict[Path, list[Symbol]] = {}
+    for symbol in candidates:
+        by_path.setdefault(symbol.path, []).append(symbol)
+    defined: set[str] = set()
+    for path, group in by_path.items():
+        indexed = _parse_file(repo.root, path, repo.languages, include_references=False)
+        if indexed is None:
+            continue
+        for symbol in group:
+            if _owning_body(indexed.bodies, symbol) is not None:
+                defined.add(symbol.id)
+    return defined
+
+
 def _resolve_inspect_symbol(
     repo: CodeIndex,
     query: str,
@@ -3870,6 +4521,14 @@ def _resolve_inspect_symbol(
     if not candidates:
         raise SymbolNotFoundError(f"No symbol matched: {query}")
     if len(candidates) > 1:
+        # Same name and scope, but one of them has a body: the definition is the
+        # navigation target. Anything else stays ambiguous rather than guessing.
+        scopes = {(candidate.name, candidate.container) for candidate in candidates}
+        if len(scopes) == 1:
+            defined = _defined_symbol_ids(repo, candidates)
+            preferred = [candidate for candidate in candidates if candidate.id in defined]
+            if len(preferred) == 1:
+                return preferred[0]
         raise SymbolNotFoundError(f"Ambiguous symbol: {query}")
     return candidates[0]
 
@@ -4220,6 +4879,7 @@ def _callers_for_symbol(
         return ()
     file_symbols_cache: dict[Path, list[Symbol]] = {}
     def_ranges_cache: dict[Path, dict[str, Range]] = {}
+    trees_cache: dict[Path, tuple[Node | None, bytes]] = {}
     callers: list[Symbol] = []
     seen: set[str] = set()
     for reference in references:
@@ -4227,7 +4887,24 @@ def _callers_for_symbol(
         if path not in file_symbols_cache:
             file_symbols = repo.storage.symbols_in_file(path)
             file_symbols_cache[path] = file_symbols
-            def_ranges_cache[path] = _definition_ranges_for_symbols(repo, path, file_symbols)
+            # One read and one parse per file: this request needs the definition
+            # ranges and the per-reference owner from the same tree.
+            source = repo.storage.file_source(repo.root, path)
+            ranges, tree = _definition_ranges_and_tree(repo, path, file_symbols, source=source)
+            def_ranges_cache[path] = ranges
+            trees_cache[path] = (tree, source.encode("utf-8") if source is not None else b"")
+        tree, source_bytes = trees_cache[path]
+        if tree is not None and source_bytes:
+            spec = _spec_for_path(path, repo.languages)
+            owner = (
+                _call_owner_at(tree, source_bytes, spec, reference.range.start_byte, reference.range.end_byte)
+                if spec is not None
+                else None
+            )
+            if owner is not None and not owner[1]:
+                # The call sits in an anonymous callable's body: that body is an
+                # ownership boundary, and no public symbol stands for it.
+                continue
         caller = _enclosing_symbol(file_symbols_cache[path], def_ranges_cache[path], reference.range, exclude_id=symbol.id)
         if caller is None or caller.id in seen:
             continue
@@ -4254,10 +4931,27 @@ def _callees_for_symbol(
         return ()
     known = repo.storage.symbol_names_by_language().get(symbol.language, set())
     definition_spans = {(candidate.range.start_byte, candidate.range.end_byte) for candidate in indexed.symbols}
+    owner = _owning_body(indexed.bodies, symbol)
+    if owner is not None:
+        owner_span = (owner.start_byte, owner.end_byte)
+        # A call inside a nested callable belongs to that callable, not to the
+        # callable being queried: depth-1 must not leak inner calls outwards.
+        nested_spans = [
+            (body.start_byte, body.end_byte)
+            for body in indexed.bodies
+            if body is not owner and _span_contains(owner_span, (body.start_byte, body.end_byte))
+        ]
+    else:
+        # No body recorded for this symbol: keep the declaration span, and stay
+        # conservative because nested boundaries cannot be identified here.
+        owner_span = (range_.start_byte, range_.end_byte)
+        nested_spans = []
     names: list[str] = []
     seen_names: set[str] = set()
     for reference in indexed.references:
-        if reference.range.start.line < range_.start.line or reference.range.start.line >= range_.end.line + 1:
+        if not _span_contains(owner_span, (reference.range.start_byte, reference.range.end_byte)):
+            continue
+        if any(_span_contains(nested, (reference.range.start_byte, reference.range.end_byte)) for nested in nested_spans):
             continue
         if ref_kinds is not None and reference.reference_kind not in ref_kinds:
             continue
@@ -4272,14 +4966,21 @@ def _callees_for_symbol(
     callees: list[Symbol] = []
     seen_ids: set[str] = set()
     for name in names:
-        candidate = _resolve_callee(repo, name, symbol, loose=loose)
+        candidate = _resolve_callee(repo, name, symbol, loose=loose, bodies=indexed.bodies)
         if candidate is not None and candidate.id not in seen_ids:
             callees.append(candidate)
             seen_ids.add(candidate.id)
     return tuple(callees)
 
 
-def _resolve_callee(repo: CodeIndex, name: str, symbol: Symbol, *, loose: bool) -> Symbol | None:
+def _resolve_callee(
+    repo: CodeIndex,
+    name: str,
+    symbol: Symbol,
+    *,
+    loose: bool,
+    bodies: Sequence[_CallableBody] | None = None,
+) -> Symbol | None:
     """Resolve a called name to a callable symbol, preferring locality.
 
     Prefers a unique callable in the same file, then the same package
@@ -4296,6 +4997,19 @@ def _resolve_callee(repo: CodeIndex, name: str, symbol: Symbol, *, loose: bool) 
 
     same_file = exact(symbol.path, 3)
     if same_file:
+        # A declaration and its definition can both live in this file; prefer the
+        # one with a body so adding a declaration does not steal the target. The
+        # caller passes the file's already-parsed bodies: no extra parse here.
+        defined = [
+            candidate
+            for candidate in same_file
+            if any(
+                body.name == candidate.name and body.name_start_byte == candidate.range.start_byte
+                for body in bodies or ()
+            )
+        ]
+        if len(same_file) > 1 and len(defined) == 1:
+            return defined[0]
         return same_file[0]
 
     package = symbol.path.parent
@@ -4315,17 +5029,37 @@ def _resolve_callee(repo: CodeIndex, name: str, symbol: Symbol, *, loose: bool) 
 def _enclosing_symbol(
     symbols: list[Symbol], def_ranges: dict[str, Range], range_: Range, *, exclude_id: str
 ) -> Symbol | None:
+    """The innermost callable or container whose byte range contains ``range_``.
+
+    Line-based containment cannot separate two definitions that share a line, so
+    positions are compared by byte offset (half-open). A symbol with no known
+    definition range is skipped instead of falling back to its name range: a
+    name range would masquerade as a body and produce a plausible-looking but
+    wrong owner.
+    """
+    span = (range_.start_byte, range_.end_byte)
     candidates: list[tuple[Symbol, Range]] = []
     for symbol in symbols:
-        if symbol.id == exclude_id:
+        if symbol.id == exclude_id or symbol.kind not in CALL_OWNER_KINDS:
             continue
-        body = def_ranges.get(symbol.id, symbol.range)
-        if body.start.line <= range_.start.line <= body.end.line:
+        body = def_ranges.get(symbol.id)
+        if body is None:
+            continue
+        if _span_contains((body.start_byte, body.end_byte), span):
             candidates.append((symbol, body))
     if not candidates:
         return None
-    # Innermost enclosing definition: deepest start, then tightest end.
-    return max(candidates, key=lambda item: (item[1].start.line, -item[1].end.line))[0]
+    # Innermost definition first (deepest start, then tightest end), then
+    # callables over containers, then a stable id so ties are not incidental.
+    return max(
+        candidates,
+        key=lambda item: (
+            item[1].start_byte,
+            -item[1].end_byte,
+            item[0].kind in FUNCTION_KINDS,
+            item[0].id,
+        ),
+    )[0]
 
 
 def _search_page(
@@ -4363,6 +5097,49 @@ def _search_page(
     return _page_from_extra([symbol for symbol, _ in ranked], limit=limit, offset=0)
 
 
+def _c_definition_ranges_for_symbols(
+    source: bytes,
+    root_node: Node,
+    wanted: dict[tuple[str, int], Symbol],
+    line_starts: Sequence[int] | None,
+) -> dict[str, Range]:
+    """Definition spans for C/C++ symbols using the extraction's own rules.
+
+    Extraction and this lookup both resolve declarations through
+    ``_c_resolved_declarations``, so a second declarator (``int a, b;``), a
+    destructor name or a class-scoped definition preview all match, and a symbol
+    whose description is not found keeps its name range instead of guessing.
+
+    The native single-name lookup is skipped here on purpose: a C/C++ name can be
+    described by a nested declarator the native ancestor walk cannot interpret.
+    """
+    ranges: dict[str, Range] = {}
+    if not wanted:
+        return ranges
+    state = _CFileState(source, root_node)
+
+    def visit(node: Node, container: str | None, scope_kind: str | None) -> None:
+        if len(ranges) >= len(wanted):
+            return
+        next_container = container
+        next_scope_kind = scope_kind
+        for record, kind, _container_name, opens in _c_resolved_declarations(
+            source, node, container, scope_kind, state
+        ):
+            symbol = wanted.get((kind, _node_start_byte(record.name_node)))
+            if symbol is not None and symbol.id not in ranges:
+                ranges[symbol.id] = _node_range(source, record.definition_node, line_starts)
+            if opens is not None:
+                next_container = record.name if container is None else f"{container}.{record.name}"
+                if opens != "container":
+                    next_scope_kind = opens
+        for child in _node_children(node):
+            visit(child, next_container, next_scope_kind)
+
+    visit(root_node, None, None)
+    return ranges
+
+
 def _definition_range(repo: CodeIndex, symbol: Symbol) -> Range | None:
     return _definition_ranges_for_symbols(repo, symbol.path, (symbol,)).get(symbol.id)
 
@@ -4374,18 +5151,33 @@ def _definition_ranges_for_symbols(
     *,
     source: str | None = None,
 ) -> dict[str, Range]:
+    return _definition_ranges_and_tree(repo, path, symbols, source=source)[0]
+
+
+def _definition_ranges_and_tree(
+    repo: CodeIndex,
+    path: Path,
+    symbols: Iterable[Symbol],
+    *,
+    source: str | None = None,
+) -> tuple[dict[str, Range], Node | None]:
+    """Definition ranges plus the parse they came from.
+
+    Callers that also need per-reference ownership reuse the same parse instead
+    of paying a second one: every source file is read and parsed once per request.
+    """
     symbols = tuple(symbols)
     if not symbols:
-        return {}
+        return {}, None
     from tree_sitter import Node
 
     if source is None:
         source = repo.storage.file_source(repo.root, path)
     if source is None:
-        return {}
+        return {}, None
     spec = _spec_for_path(path, repo.languages)
     if spec is None:
-        return {}
+        return {}, None
     source_bytes = source.encode("utf-8")
 
     wanted: dict[tuple[str, int], Symbol] = {
@@ -4399,6 +5191,9 @@ def _definition_ranges_for_symbols(
 
     # Locate a few names in native code instead of walking every AST node in
     # Python. Large outlines still benefit from one sequential traversal.
+    if spec.name in _C_LANGUAGE_NAMES:
+        return _c_definition_ranges_for_symbols(source_bytes, root_node, wanted, line_starts), root_node
+
     if isinstance(root_node, Node) and len(wanted) <= NATIVE_DEFINITION_MAX_SYMBOLS:
         for symbol in wanted.values():
             start = symbol.range.start_byte
@@ -4423,7 +5218,7 @@ def _definition_ranges_for_symbols(
             if match is not None:
                 ranges[symbol.id] = _node_range(source_bytes, match, line_starts)
         else:
-            return ranges
+            return ranges, root_node
         ranges.clear()
 
     def walk(node: Node) -> None:
@@ -4440,7 +5235,7 @@ def _definition_ranges_for_symbols(
             walk(child)
 
     walk(root_node)
-    return ranges
+    return ranges, root_node
 
 
 def _format_symbol_fields(symbol: Symbol, *, indent: int, range_: Range | None = None) -> list[str]:
