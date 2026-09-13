@@ -36,7 +36,10 @@ SCHEMA_VERSION = 5
 EXTRACTOR_REVISIONS: dict[str, str] = {
     "c": "c:1",
     "cpp": "cpp:1",
+    "javascript": "javascript:1",
     "kotlin": "kotlin:1",
+    "tsx": "tsx:1",
+    "typescript": "typescript:1",
 }
 # C/C++ header files are the one extension whose language is ambiguous. The
 # default stays C (unchanged behaviour); ``c_header_language`` in the meta table
@@ -682,13 +685,19 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
         name="typescript",
         extensions=(".ts", ".mts", ".cts"),
         definitions={
+            "abstract_class_declaration": "class",
+            "abstract_method_signature": "method",
             "class_declaration": "class",
             "enum_declaration": "enum",
             "function_declaration": "function",
+            "function_signature": "function",
             "generator_function_declaration": "function",
             "interface_declaration": "interface",
             "internal_module": "module",
             "method_definition": "method",
+            "method_signature": "method",
+            "module": "module",
+            "property_signature": "field",
             "type_alias_declaration": "type",
             "variable_declarator": "variable",
         },
@@ -706,13 +715,19 @@ LANGUAGES: tuple[LanguageSpec, ...] = (
         name="tsx",
         extensions=(".tsx",),
         definitions={
+            "abstract_class_declaration": "class",
+            "abstract_method_signature": "method",
             "class_declaration": "class",
             "enum_declaration": "enum",
             "function_declaration": "function",
+            "function_signature": "function",
             "generator_function_declaration": "function",
             "interface_declaration": "interface",
             "internal_module": "module",
             "method_definition": "method",
+            "method_signature": "method",
+            "module": "module",
+            "property_signature": "field",
             "type_alias_declaration": "type",
             "variable_declarator": "variable",
         },
@@ -3825,12 +3840,14 @@ def _extract_symbols_and_references(
                 source, path, language, node, container, scope_kind, line_starts, c_state
             )
         else:
-            single = _symbol_from_node(source, path, language, node, container, line_starts)
-            declared = (
-                [(single, "container" if single.kind in CONTAINER_KINDS else None)]
-                if single is not None
-                else []
-            )
+            declared = _extra_node_symbols(source, path, language, node, container, line_starts)
+            if declared is None:
+                single = _symbol_from_node(source, path, language, node, container, line_starts)
+                declared = (
+                    [(single, "container" if single.kind in CONTAINER_KINDS else None)]
+                    if single is not None
+                    else []
+                )
         next_container = container
         next_scope_kind = scope_kind
         next_in_function = in_function or any(symbol.kind in FUNCTION_KINDS for symbol, _ in declared)
@@ -4413,6 +4430,99 @@ def _js_declarator_kind(node: Node, default: str) -> str:
     if value is not None and _node_kind(value) in _JS_FUNCTION_VALUE_NODE_TYPES:
         return "function"
     return default
+
+
+# Nodes whose extraction is language specific and can yield several symbols.
+# The walk consults this table by (language, node kind) and falls back to the
+# ordinary single-symbol path on a miss, so languages without an entry never
+# build intermediate lists.
+_MULTI_SYMBOL_RESOLVERS: dict[tuple[str, str], Any] = {}
+
+
+def _extra_node_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    line_starts: Sequence[int] | None,
+) -> list[tuple[Symbol, str | None]] | None:
+    """Symbols a language-specific resolver owns for ``node``, or ``None``.
+
+    ``None`` means "no special case, use the default rule"; an empty list means
+    "this node declares nothing", which is how a resolver drops a node the
+    generic rule would misread.
+    """
+    resolver = _MULTI_SYMBOL_RESOLVERS.get((language.name, _node_kind(node)))
+    if resolver is None:
+        return None
+    return resolver(source, path, language, node, container, line_starts)
+
+
+def _js_binding_nodes(node: Node) -> list[Node]:
+    """Identifier nodes a JS/TS binding pattern declares, in source order.
+
+    Only the binding side is visited: a ``pair_pattern`` binds its value and an
+    ``assignment_pattern`` its left side, so ``{first, second: renamed}`` yields
+    ``first`` and ``renamed`` -- never the property key ``second`` -- and a
+    default value expression contributes no binding.
+    """
+    kind = _node_kind(node)
+    if kind in ("identifier", "shorthand_property_identifier_pattern"):
+        return [node]
+    if kind in ("object_pattern", "array_pattern", "rest_pattern"):
+        found: list[Node] = []
+        for child in _node_children(node):
+            found.extend(_js_binding_nodes(child))
+        return found
+    if kind == "pair_pattern":
+        value = _field_child(node, "value")
+        return [] if value is None else _js_binding_nodes(value)
+    if kind in ("object_assignment_pattern", "assignment_pattern"):
+        left = _field_child(node, "left")
+        return [] if left is None else _js_binding_nodes(left)
+    return []
+
+
+def _js_declarator_symbols(
+    source: bytes,
+    path: Path,
+    language: LanguageSpec,
+    node: Node,
+    container: str | None,
+    line_starts: Sequence[int] | None,
+) -> list[tuple[Symbol, str | None]] | None:
+    """One symbol per name bound by a destructuring declarator."""
+    name_node = node.child_by_field_name("name")
+    if name_node is None or _node_kind(name_node) not in ("object_pattern", "array_pattern"):
+        return None
+    symbols: list[tuple[Symbol, str | None]] = []
+    for bound in _js_binding_nodes(name_node):
+        name = _node_text(source, bound)
+        if not name or not _looks_like_symbol_name(name):
+            continue
+        range_ = _node_range(source, bound, line_starts)
+        symbols.append(
+            (
+                Symbol(
+                    id=_symbol_id(language.name, path, "variable", name, range_.start_byte),
+                    name=name,
+                    kind="variable",
+                    language=language.name,
+                    path=path,
+                    range=range_,
+                    signature=_signature(source, node),
+                    container=container,
+                ),
+                None,
+            )
+        )
+    return symbols
+
+
+_MULTI_SYMBOL_RESOLVERS.update(
+    {(name, "variable_declarator"): _js_declarator_symbols for name in _JS_LANGUAGE_NAMES}
+)
 
 
 def _definition_kind(source: bytes, language: LanguageSpec, node: Node) -> str | None:
