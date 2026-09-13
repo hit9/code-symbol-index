@@ -3986,6 +3986,9 @@ def _extract_symbols_and_references(
     references: list[Reference] = []
     bodies: list[_CallableBody] = []
     line_starts = _line_starts(source)
+    if (language.name in _C_LANGUAGE_NAMES and not include_references and not collect_bodies
+            and hasattr(root_node, 'named_children')):
+        return _c_write_symbols(source, root_node, path, language, line_starts), [], []
     lines = source.decode("utf-8", errors="replace").splitlines() if include_references else []
     # Hoisted out of the walk: both are constant for the file, and the walk visits
     # every node, so a per-node dict look-up would be paid tens of thousands of times.
@@ -4070,12 +4073,7 @@ def _extract_symbols_and_references(
             child_parent, child_grandparent = parent, grandparent
         else:
             child_parent, child_grandparent = node, parent
-        # C/C++ declaration nodes are named. A symbol-only write need not visit
-        # punctuation/keyword leaves; declaration handlers still see all children.
-        children = getattr(node, "named_children", None) if c_state is not None and not include_references else None
-        for child in children if children is not None else _node_children(node):
-            if c_state is not None and not include_references and getattr(child, 'child_count', 1) == 0:
-                continue  # C/C++ declarations own a name child; leaves cannot publish symbols.
+        for child in _node_children(node):
             walk(child, next_container, child_parent, child_grandparent, child_ctx, next_in_function, next_scope_kind)
 
     c_state = _CFileState(source, root_node) if language.name in _C_LANGUAGE_NAMES else None
@@ -4083,6 +4081,34 @@ def _extract_symbols_and_references(
     if language.name == "python":
         symbols.extend(_python_symbols(source, path, language, root_node, line_starts))
     return symbols, references, bodies
+
+
+def _c_write_symbols(source, root_node, path, language, line_starts):
+    """Symbol-only preorder walk without reference-context bookkeeping."""
+    state = _CFileState(source, root_node)
+    stack = [(root_node, None, None, False)]
+    symbols = []
+    while stack:
+        node, container, scope_kind, in_function = stack.pop()
+        child_container, child_scope, child_function = container, scope_kind, in_function
+        declared = (_c_node_symbols(source, path, language, node, container, scope_kind, line_starts, state)
+                    if node.type in _C_DECLARATION_NODE_TYPES else ())
+        for symbol, opens in declared:
+            if symbol.kind in FUNCTION_KINDS:
+                child_function = True
+            if in_function and symbol.kind in language.non_local_kinds:
+                continue
+            symbols.append(symbol)
+            if opens is not None:
+                child_container = symbol.name if container is None else f'{container}.{symbol.name}'
+                if opens != 'container':
+                    child_scope = opens
+        # Declaration handlers still see every child (including punctuation).
+        # Only traversal omits leaves: a declaration must own a name child.
+        for child in reversed(node.named_children):
+            if child.child_count:
+                stack.append((child, child_container, child_scope, child_function))
+    return symbols
 
 
 def _python_symbols(
