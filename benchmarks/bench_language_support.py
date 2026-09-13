@@ -167,10 +167,9 @@ def measure(
 ) -> dict:
     """Time ``command`` in both implementations, alternating the order.
 
-    ``rebuild`` prepares a fresh index before every measured run, which is what
-    an index or update case must do; otherwise the index is built once and the
-    case measures steady-state reads (including a refresh over an unchanged
-    index).
+    ``rebuild`` starts index commands with no database, but prepares a populated
+    database for update commands. Otherwise the index is built once and the
+    case measures steady-state reads (including an unchanged refresh).
     """
     times: dict[str, list[float]] = {key: [] for key in scripts}
     outputs: dict[str, str] = {}
@@ -182,7 +181,11 @@ def measure(
         for key in order:
             target = Path(str(db) + f"-{key}")
             if rebuild:
-                prepare(scripts[key], root, target)
+                if command == ["index"]:
+                    for suffix in ("", "-wal", "-shm"):
+                        Path(str(target) + suffix).unlink(missing_ok=True)
+                else:
+                    prepare(scripts[key], root, target)
             flags = ["--root", str(root), "--db", str(target)] if with_flags else []
             elapsed, output = run(scripts[key], [*command, *flags])
             times[key].append(elapsed)
