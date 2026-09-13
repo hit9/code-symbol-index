@@ -3851,6 +3851,10 @@ def _extract_symbols_and_references(
     bodies: list[_CallableBody] = []
     line_starts = _line_starts(source)
     lines = source.decode("utf-8", errors="replace").splitlines() if include_references else []
+    # Hoisted out of the walk: both are constant for the file, and the walk visits
+    # every node, so a per-node dict look-up would be paid tens of thousands of times.
+    body_node_types = _CALLABLE_BODY_NODE_TYPES.get(language.name)
+    has_multi_symbol_rules = language.name in _MULTI_SYMBOL_LANGUAGES
 
     def walk(
         node: Node,
@@ -3861,12 +3865,22 @@ def _extract_symbols_and_references(
         in_function: bool = False,
         scope_kind: str | None = None,
     ) -> None:
+        # Every node needs its kind: the declaration rule, the body rule, the
+        # reference rule and the transparency rule all branch on it, so it is
+        # resolved once instead of once per rule.
+        node_kind = _node_kind(node)
         if c_state is not None:
-            declared = _c_node_symbols(
-                source, path, language, node, container, scope_kind, line_starts, c_state
+            declared = (
+                _c_node_symbols(source, path, language, node, container, scope_kind, line_starts, c_state)
+                if node_kind in _C_DECLARATION_NODE_TYPES
+                else []
             )
         else:
-            declared = _extra_node_symbols(source, path, language, node, container, line_starts)
+            declared = (
+                _extra_node_symbols(source, path, language, node, container, line_starts)
+                if has_multi_symbol_rules
+                else None
+            )
             if declared is None:
                 single = _symbol_from_node(source, path, language, node, container, line_starts)
                 declared = (
@@ -3891,11 +3905,15 @@ def _extract_symbols_and_references(
                 if opens != "container":
                     next_scope_kind = opens
 
-        body = _callable_bodies(source, node, language, primary)
-        if body is not None:
-            bodies.append(body)
+        if body_node_types is not None and node_kind in body_node_types:
+            # The kind filter is the cheap part: only a plausible callable pays for
+            # the body look-up, and the kind test is what ``_callable_body_node``
+            # would have checked first anyway.
+            body = _callable_bodies(source, node, language, primary)
+            if body is not None:
+                bodies.append(body)
 
-        if include_references and _node_kind(node) in language.identifier_node_types:
+        if include_references and node_kind in language.identifier_node_types:
             references.append(
                 Reference(
                     symbol_id="",
@@ -3909,7 +3927,7 @@ def _extract_symbols_and_references(
             )
 
         child_ctx = _child_reference_context(node, parent, ctx, language) if include_references else ctx
-        if _node_kind(node) in language.transparent_node_types:
+        if node_kind in language.transparent_node_types:
             child_parent, child_grandparent = parent, grandparent
         else:
             child_parent, child_grandparent = node, parent
@@ -4733,6 +4751,9 @@ _MULTI_SYMBOL_RESOLVERS.update(
 )
 _MULTI_SYMBOL_RESOLVERS[("swift", "property_declaration")] = _swift_property_symbols
 _MULTI_SYMBOL_RESOLVERS[("kotlin", "property_declaration")] = _kotlin_property_symbols
+# Languages with at least one resolver, checked before building the (language,
+# kind) key for a node: most languages own no special case at all.
+_MULTI_SYMBOL_LANGUAGES = frozenset(name for name, _kind in _MULTI_SYMBOL_RESOLVERS)
 
 
 def _definition_kind(source: bytes, language: LanguageSpec, node: Node) -> str | None:
@@ -5739,6 +5760,66 @@ def _search_page(
     return _page_from_extra([symbol for symbol, _ in ranked], limit=limit, offset=0)
 
 
+def _c_native_definition_ranges(
+    source: bytes,
+    root_node: Node,
+    wanted: dict[tuple[str, int], Symbol],
+    line_starts: Sequence[int] | None,
+    state: _CFileState,
+) -> dict[str, Range] | None:
+    """Definition spans found by native descent, or ``None`` to traverse instead.
+
+    A result page holds few symbols, so each name is located in native code and its
+    ancestors are walked upwards. The enclosing scopes are rebuilt from those same
+    ancestors, which keeps a class member's ``method``/``constructor`` kind. ``None``
+    means the traversal has to decide: too many symbols at once, a stale byte
+    position, or a name whose resolved kind the reconstruction does not confirm.
+    """
+    from tree_sitter import Node
+
+    if not isinstance(root_node, Node) or len(wanted) > NATIVE_DEFINITION_MAX_SYMBOLS:
+        return None
+    ranges: dict[str, Range] = {}
+    for (kind, start), symbol in wanted.items():
+        if not 0 <= start < len(source):
+            return None
+        ancestors: list[Node] = []
+        node = root_node.descendant_for_byte_range(start, start + 1)
+        while node is not None:
+            ancestors.append(node)
+            node = node.parent
+        located: int | None = None
+        for index, ancestor in enumerate(ancestors):
+            if any(_node_start_byte(record.name_node) == start for record in _c_declarations(source, ancestor)):
+                located = index
+                break
+        if located is None:
+            return None
+        container: str | None = None
+        scope_kind: str | None = None
+        for ancestor in reversed(ancestors[located + 1 :]):
+            for record, _kind, _name, opens in _c_resolved_declarations(
+                source, ancestor, container, scope_kind, state
+            ):
+                if opens is not None:
+                    container = record.name if container is None else f"{container}.{record.name}"
+                    scope_kind = opens
+        matched = False
+        for record, resolved_kind, _name, _opens in _c_resolved_declarations(
+            source, ancestors[located], container, scope_kind, state
+        ):
+            if _node_start_byte(record.name_node) != start:
+                continue
+            if resolved_kind != kind:
+                return None
+            ranges[symbol.id] = _node_range(source, record.definition_node, line_starts)
+            matched = True
+            break
+        if not matched:
+            return None
+    return ranges
+
+
 def _c_definition_ranges_for_symbols(
     source: bytes,
     root_node: Node,
@@ -5752,13 +5833,16 @@ def _c_definition_ranges_for_symbols(
     destructor name or a class-scoped definition preview all match, and a symbol
     whose description is not found keeps its name range instead of guessing.
 
-    The native single-name lookup is skipped here on purpose: a C/C++ name can be
-    described by a nested declarator the native ancestor walk cannot interpret.
+    ``_c_native_definition_ranges`` answers a small lookup first, in native code;
+    the traversal below stays the reference for what it cannot confirm.
     """
     ranges: dict[str, Range] = {}
     if not wanted:
         return ranges
     state = _CFileState(source, root_node)
+    native = _c_native_definition_ranges(source, root_node, wanted, line_starts, state)
+    if native is not None:
+        return native
 
     def visit(node: Node, container: str | None, scope_kind: str | None) -> None:
         if len(ranges) >= len(wanted):

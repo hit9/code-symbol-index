@@ -102,6 +102,11 @@ def test_explicitly_called_nested_function_becomes_a_direct_edge(tmp_path: Path)
     index = CodeIndex(tmp_path).build()
 
     assert [node.symbol.name for node in index.callees("outer", language="python", exact_only=True).roots] == ["inner"]
+    # ``left`` is only reachable one level further: the graph expands through the
+    # real call edge instead of assuming that declaring ``inner`` calls it.
+    deeper = index.callees("outer", language="python", exact_only=True, depth=2)
+    assert [(node.symbol.name, node.depth) for node in deeper.roots] == [("inner", 1)]
+    assert [(child.symbol.name, child.depth) for child in deeper.roots[0].children] == [("left", 2)]
 
 
 def test_decorators_and_default_arguments_stay_with_the_outer_function(tmp_path: Path) -> None:

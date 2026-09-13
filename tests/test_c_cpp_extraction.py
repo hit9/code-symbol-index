@@ -327,3 +327,61 @@ def test_lf_and_crlf_sources_produce_the_same_symbols_and_edges(tmp_path: Path) 
     assert results[0] == results[1]
     assert results[0][1] == ["run"]
     assert results[0][2] == ["helper"]
+
+
+def test_native_definition_lookup_matches_the_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native descent must answer exactly what the AST traversal answers.
+
+    A result page asks for one name at a time, so the lookup locates it in native
+    code and rebuilds its scope from the ancestors. That shortcut is only allowed
+    to be a shortcut: every symbol of a corpus with multi declarators, nested
+    scopes, class members, out-of-class definitions and templates is compared with
+    the traversal it replaces.
+    """
+    (tmp_path / "widget.h").write_text(
+        "namespace demo {\n"
+        "inline namespace v1 {\n"
+        "class Widget {\n"
+        "public:\n"
+        "    Widget();\n"
+        "    ~Widget();\n"
+        "    int value() const;\n"
+        "    int a, b, c;\n"
+        "    struct Inner { int x; } inner;\n"
+        "};\n"
+        "struct Plain { int f; } plain, plain2;\n"
+        "typedef int (*Callback)(int, int);\n"
+        "int Widget::value() const { return 0; }\n"
+        "}  // namespace v1\n"
+        "}  // namespace demo\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "app.cpp").write_text(
+        "struct Node { int value; Node *next; } head, *tail;\n"
+        "template <typename T> struct Holder { T item; T get() const; };\n"
+        "template <typename T> T Holder<T>::get() const { return item; }\n"
+        "union Value { int i; float f; };\n"
+        "enum Mode { Off, On } mode, other_mode;\n"
+        "class Base { public: virtual void run(); virtual ~Base(); };\n"
+        "class Derived final : public Base { public: void run() override; };\n"
+        "void Base::run() {}\n"
+        "void Derived::run() {}\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(tmp_path, header_language="cpp").build()
+    symbols = index.search_symbols("", limit=500)
+    assert len(symbols) > 20
+
+    def no_native(*_args, **_kwargs):
+        return None
+
+    native = {symbol.id: code_symbol_index._definition_range(index, symbol) for symbol in symbols}
+    monkeypatch.setattr(code_symbol_index, "_c_native_definition_ranges", no_native)
+    walked = {symbol.id: code_symbol_index._definition_range(index, symbol) for symbol in symbols}
+
+    # Native descent answers the usual lookup instead of falling back every time...
+    assert any(range_ is not None for range_ in native.values())
+    # ...and never disagrees with the traversal it replaces.
+    assert native == walked
