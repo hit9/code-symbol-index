@@ -1785,6 +1785,40 @@ def test_cli_captured_progress_does_not_enable_storage_callbacks() -> None:
     assert progress._storage_progress is None
 
 
+def test_cli_write_progress_refreshes_one_line_and_bounds_output() -> None:
+    stream = _FakeStream(interactive=True)
+    progress = code_symbol_index._CliProgress(stream)
+    progress._write_progress('write_start', total=1000)
+    for done in range(1, 1001):
+        progress._write_progress('write_tick', done=done, total=1000)
+        progress._write_progress('commit_batch', done=done, total=1000)
+    assert len(stream.writes) == 101
+    assert stream.writes[0] == 'writing index... 0%'
+    assert stream.writes[50] == '\rwriting index... 50%'
+    assert stream.writes[-1] == '\rwriting index... 100%'
+    progress._write_progress('finalize', done=1000, total=1000)
+    assert ''.join(stream.writes).endswith('100%\ncommitting index...\n')
+    progress._write_progress('write_start', total=1)
+    assert stream.writes[-1] == 'writing index... 0%'
+
+
+def test_cli_write_progress_separates_partial_parse_and_stays_silent_in_capture() -> None:
+    stream = _FakeStream(interactive=True)
+    progress = code_symbol_index._CliProgress(stream)
+    progress('start', total=2)
+    progress('file', done=1, total=2)
+    progress._write_progress('write_start', total=1)
+    progress._write_progress('write_tick', done=1, total=1)
+    progress('finish', done=1, total=2)
+    output = ''.join(stream.writes)
+    assert '(50%)\nwriting index... 0%\rwriting index... 100%\nwarning:' in output
+    captured = _FakeStream(interactive=False)
+    progress = code_symbol_index._CliProgress(captured)
+    for event in ('write_start', 'write_tick', 'commit_batch', 'finalize'):
+        progress._write_progress(event, done=1, total=1)
+    assert captured.writes == []
+
+
 def _write_call_chain_fixture(tmp_path: Path) -> None:
     (tmp_path / "app" / "api").mkdir(parents=True)
     (tmp_path / "app" / "workers").mkdir(parents=True)

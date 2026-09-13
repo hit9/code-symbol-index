@@ -7198,20 +7198,39 @@ class _CliProgress:
         isatty = getattr(target, "isatty", None)
         self.interactive = bool(isatty()) if callable(isatty) else False
         self._last_bucket = -1
+        self._last_write_percent = -1
         self._line_open = False
         # Private CLI hook: preserve the public Repository callback protocol.
         self._storage_progress = self._write_progress if self.interactive else None
 
     def _write_progress(self, event: str, *, done: int = 0, total: int = 0) -> None:
+        if not self.interactive:
+            return
+        stream = self.stream if self.stream is not None else sys.stderr
+        if event in {"write_start", "write_tick", "commit_batch"}:
+            if event == "write_start":
+                self._last_write_percent = -1
+                if self._line_open:
+                    stream.write("\n")
+                    self._line_open = False
+            # Rows are counted by the existing writer; this is work completed,
+            # not a time estimate. Final transaction commit is a separate stage.
+            percent = min(100, max(0, done * 100 // total)) if total else 0
+            if percent <= self._last_write_percent:
+                return
+            self._last_write_percent = percent
+            prefix = "\r" if self._line_open else ""
+            stream.write(f"{prefix}writing index... {percent}%")
+            self._line_open = True
+            stream.flush()
+            return
         messages = {
             "delete_start": "removing old index entries...",
-            "write_start": "writing index...",
             "finalize": "committing index...",
         }
         message = messages.get(event)
         if message is None:
             return
-        stream = self.stream if self.stream is not None else sys.stderr
         if self._line_open:
             stream.write("\n")
             self._line_open = False
