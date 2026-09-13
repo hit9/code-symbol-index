@@ -1305,10 +1305,19 @@ class CodeIndex:
         if symbol is not None:
             return symbol
 
-        matches = self.search_symbols(query, kind=kind, language=language, path=path, exact_only=exact_only, limit=1)
-        if matches:
-            return matches[0]
-        raise SymbolNotFoundError(f"No symbol matched: {query}")
+        # A declaration and its definition share name, kind and scope. ``refs`` and
+        # ``impls`` resolve through this path, so the body wins here too instead of
+        # whichever row the search happened to return first.
+        matches = self.search_symbols(
+            query, kind=kind, language=language, path=path, exact_only=exact_only, limit=MAX_INSPECT_CANDIDATES + 1
+        )
+        if not matches:
+            raise SymbolNotFoundError(f"No symbol matched: {query}")
+        if len(matches) > 1:
+            preferred = _preferred_candidate(self, matches)
+            if preferred is not None:
+                return preferred
+        return matches[0]
 
     def _index_files(self, paths: Iterable[Path]) -> None:
         for relative_path in paths:
@@ -5045,11 +5054,19 @@ def _inspect_text(
     if not candidates:
         return _bounded_text(f"not_found:\n  query: {query}\n", options.max_total_chars)
     if len(candidates) > 1:
-        lines = ["ambiguous:", "  candidates:"]
-        ranges = _result_definition_ranges(repo, candidates[:MAX_INSPECT_CANDIDATES])
-        for candidate in candidates[:MAX_INSPECT_CANDIDATES]:
-            lines.extend(_format_relation_item(repo, candidate, indent=4, range_=ranges.get(candidate.id, candidate.range)))
-        return _bounded_text("\n".join(lines) + "\n", options.max_total_chars)
+        # Text and JSON must resolve the same target: a declaration and its
+        # definition are not an ambiguity, the definition is the answer.
+        preferred = _preferred_candidate(repo, candidates)
+        if preferred is not None:
+            candidates = [preferred]
+        else:
+            lines = ["ambiguous:", "  candidates:"]
+            ranges = _result_definition_ranges(repo, candidates[:MAX_INSPECT_CANDIDATES])
+            for candidate in candidates[:MAX_INSPECT_CANDIDATES]:
+                lines.extend(
+                    _format_relation_item(repo, candidate, indent=4, range_=ranges.get(candidate.id, candidate.range))
+                )
+            return _bounded_text("\n".join(lines) + "\n", options.max_total_chars)
 
     symbol = candidates[0]
     source = repo.storage.file_source(repo.root, symbol.path) or ""
@@ -5150,13 +5167,33 @@ def _defined_symbol_ids(repo: CodeIndex, candidates: Sequence[Symbol]) -> set[st
         by_path.setdefault(symbol.path, []).append(symbol)
     defined: set[str] = set()
     for path, group in by_path.items():
-        indexed = _parse_file(repo.root, path, repo.languages, include_references=False)
+        # The file's own stored language decides the parser, exactly as it does for
+        # every other read: parsing a C++ header as C yields an error tree whose
+        # bodies would mark the declaration as the owner and hide the definition.
+        indexed = _parse_file(
+            repo.root, path, repo.languages, include_references=False, language=_file_language(repo, path)
+        )
         if indexed is None:
             continue
         for symbol in group:
             if _owning_body(indexed.bodies, symbol) is not None:
                 defined.add(symbol.id)
     return defined
+
+
+def _preferred_candidate(repo: CodeIndex, candidates: Sequence[Symbol]) -> Symbol | None:
+    """The one candidate that has a body, when exactly one does.
+
+    A declaration and its definition share name, kind and scope, so the body is the
+    navigation target. Scopes are deliberately not compared here, because a
+    declaration and its definition legitimately live in different scopes (a Rust
+    trait method versus its impl, a Swift protocol member versus its conformance),
+    and indexing the declaration must not hide a target that used to resolve.
+    Anything less clear-cut stays ambiguous rather than guessing.
+    """
+    defined = _defined_symbol_ids(repo, candidates)
+    preferred = [candidate for candidate in candidates if candidate.id in defined]
+    return preferred[0] if len(preferred) == 1 else None
 
 
 def _resolve_inspect_symbol(
@@ -5175,18 +5212,10 @@ def _resolve_inspect_symbol(
     if not candidates:
         raise SymbolNotFoundError(f"No symbol matched: {query}")
     if len(candidates) > 1:
-        # One candidate has a body and the others are declarations: the definition
-        # is the navigation target. Scopes are deliberately not compared here,
-        # because a declaration and its definition legitimately live in different
-        # scopes (a Rust trait method versus its impl, a Swift protocol member
-        # versus its conformance), and indexing the declaration must not hide a
-        # target that used to resolve. Anything less clear-cut stays ambiguous
-        # rather than guessing between two definitions.
-        defined = _defined_symbol_ids(repo, candidates)
-        preferred = [candidate for candidate in candidates if candidate.id in defined]
-        if len(preferred) == 1:
-            return preferred[0]
-        raise SymbolNotFoundError(f"Ambiguous symbol: {query}")
+        preferred = _preferred_candidate(repo, candidates)
+        if preferred is None:
+            raise SymbolNotFoundError(f"Ambiguous symbol: {query}")
+        return preferred
     return candidates[0]
 
 
@@ -5558,7 +5587,7 @@ def _callers_for_symbol(
             trees_cache[path] = (tree, source.encode("utf-8") if source is not None else b"")
         tree, source_bytes = trees_cache[path]
         if tree is not None and source_bytes:
-            spec = _spec_for_path(path, repo.languages)
+            spec = _file_spec(repo, path)
             owner = (
                 _call_owner_at(tree, source_bytes, spec, reference.range.start_byte, reference.range.end_byte)
                 if spec is not None

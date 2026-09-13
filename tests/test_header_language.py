@@ -11,6 +11,20 @@ HEADER_CPP = "namespace demo { class Widget { public: int run(int v); int stop()
 CALLER_C = "int caller(void) { return helper(1); }\nint helper(int v) { return v; }\n"
 
 
+DECLARATION_AND_DEFINITION_CPP = (
+    "namespace demo {\n"
+    "inline namespace v1 {\n"
+    "class Widget {\n"
+    "public:\n"
+    "    int value() const;\n"
+    "    int a, b, c;\n"
+    "};\n"
+    "int Widget::value() const { return 0; }\n"
+    "}\n"
+    "}\n"
+)
+
+
 def _fixture(tmp_path: Path) -> Path:
     (tmp_path / "widget.h").write_text(HEADER_CPP, encoding="utf-8")
     (tmp_path / "app.c").write_text(CALLER_C, encoding="utf-8")
@@ -150,3 +164,35 @@ def test_invalid_header_language_is_rejected(tmp_path: Path, value: str) -> None
         CodeIndex(tmp_path, header_language=value + "x")
     # The supported values are accepted without error.
     CodeIndex(tmp_path, header_language=value)
+
+
+def test_definition_is_preferred_inside_a_cpp_header(tmp_path: Path, capsys) -> None:
+    """A header stored as C++ must also be re-read as C++ when a body decides.
+
+    The declaration and the out-of-class definition share name, kind and container,
+    so only the body tells them apart. Parsing the header with the default C parser
+    instead produces an error tree whose bodies point at the declaration, which used
+    to make ``inspect`` answer with the declaration and to hide the definition.
+    """
+    (tmp_path / "widget.h").write_text(DECLARATION_AND_DEFINITION_CPP, encoding="utf-8")
+    repo = Repository(tmp_path, create_index=True)
+    repo.refresh(header_language="cpp")
+    assert repo.storage.file_languages(["widget.h"]) == {"widget.h": "cpp"}
+
+    candidates = repo.search_symbols("value", language="cpp", exact_only=True)
+    assert [(symbol.kind, symbol.signature) for symbol in candidates] == [
+        ("method", "int value() const;"),
+        ("method", "int Widget::value() const { return 0; }"),
+    ]
+
+    inspection = repo.inspect("value", language="cpp", exact_only=True)
+    assert inspection.definition.signature == "int Widget::value() const { return 0; }"
+    # Ranges stay 0-based on the line, so the definition line is indexed directly.
+    lines = DECLARATION_AND_DEFINITION_CPP.splitlines()
+    assert lines[inspection.definition.range.start.line] == "int Widget::value() const { return 0; }"
+
+    # The text command resolves the same target as the object API and the JSON form.
+    assert main(["inspect", "Widget.value", "--path", "widget.h", "--root", str(tmp_path)]) == 0
+    printed = capsys.readouterr().out
+    assert "int Widget::value() const { return 0; }" in printed
+    assert not printed.startswith("ambiguous:")

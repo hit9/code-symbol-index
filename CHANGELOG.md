@@ -31,8 +31,12 @@
   declares it. Anonymous bodies still fence off their enclosing function.
 - When a declaration and a definition share a name, `inspect`, `refs`, `callers` and
   `callees` prefer the one with a body, including across scopes (a Rust trait method
-  and its impl, a Swift protocol member and its conformance). Two definitions stay an
-  ambiguity error.
+  and its impl, a Swift protocol member and its conformance), and the text, JSON and
+  object output of `inspect` all answer with that same target. Re-reading a header
+  honors the language its own row was stored with, so a C++ header is not re-parsed
+  as C when a body decides. Two definitions stay an ambiguity error for
+  `inspect`/`callers`/`callees`, while `refs`/`impls` keep their existing order
+  between equally valid matches.
 - Other languages, per the confirmed gaps in the validation record: Python indexes
   multi-target, chained and class-body bindings; Rust indexes trait and extern
   function declarations; TypeScript/TSX index interface members
