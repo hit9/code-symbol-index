@@ -5732,6 +5732,8 @@ def _callers_for_symbol(
     callers: list[Symbol] = []
     seen: set[str] = set()
     for reference in references:
+        if reference.reference_kind != 'call':
+            continue
         path = reference.path
         if path not in file_symbols_cache:
             file_symbols = repo.storage.symbols_in_file(path)
@@ -5776,7 +5778,7 @@ def _callees_for_symbol(
     range_: Range,
     *,
     limit: int,
-    ref_kinds: frozenset[str] | None = None,
+    ref_kinds: frozenset[str] | None = frozenset({'call'}),
     loose: bool = False,
 ) -> tuple[Symbol, ...]:
     if limit <= 0:

@@ -294,3 +294,17 @@ def test_query_tree_cache_is_bounded_and_cleared_after_failure(tmp_path, monkeyp
         fail(repo)
     assert c._PARSER_TLS.query_trees is None
     assert repo._name_filter is None
+
+
+def test_inspect_call_relations_exclude_function_value_reads(tmp_path):
+    (tmp_path / 'app.py').write_text(
+        'def target(): return 1\ndef holder(): return target\ndef caller(): return target()\n'
+    )
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    target = repo.best_symbol('target')
+    references = repo.refs('target').items
+    assert {ref.reference_kind for ref in references} == {'read', 'call'}
+    assert [s.name for s in c._callers_for_symbol(repo, target, references, limit=20)] == ['caller']
+    assert 'callees:\n  []' in repo.inspect_text('holder')
+    assert '  callees: 1\n' in repo.inspect_text('caller')
+    assert [n.symbol.name for n in repo.callers('target', depth=1).roots] == ['caller']
