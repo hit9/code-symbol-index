@@ -89,3 +89,72 @@ def test_many_nested_bodies_do_not_leak_calls_to_outer(tmp_path):
     repo = c.Repository(tmp_path, create_index=True).refresh()
     assert [n.symbol.name for n in repo.callees('outer', depth=1).roots] == ['other']
     assert len(repo.callers('target', depth=1, limit=100).roots) == 80
+
+
+@pytest.mark.parametrize('operation', ['refresh', 'update'])
+def test_stat_permission_error_preserves_existing_rows_and_reports_failure(tmp_path, operation):
+    file = tmp_path / 'app.h'
+    file.write_text('int target() { return 1; }\n')
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    before = [tuple(row) for row in repo.storage.connection.execute('SELECT * FROM symbols')]
+    stat = Path.stat
+    events = []
+    def denied(path, *args, **kwargs):
+        if path == file:
+            raise PermissionError('fixture')
+        return stat(path, *args, **kwargs)
+    def progress(event, **kwargs):
+        events.append((event, kwargs))
+    with mock.patch.object(Path, 'stat', denied):
+        if operation == 'refresh':
+            repo.refresh(header_language='cpp', progress=progress)
+            assert repo.last_header_language == ('cpp', 0, 1)
+        else:
+            repo.update(['app.h'], progress=progress)
+            assert repo.last_update_failed == ('app.h',)
+    assert [tuple(row) for row in repo.storage.connection.execute('SELECT * FROM symbols')] == before
+    assert events[-1][1]['done'] == 0 and events[-1][1]['total'] == 1
+
+
+def test_filtered_refresh_does_not_acknowledge_a_new_checkout(tmp_path):
+    (tmp_path / 'app.py').write_text('def target(): pass\n')
+    with mock.patch.object(c, '_git_state', return_value='old'):
+        repo = c.Repository(tmp_path, create_index=True).refresh()
+    baseline = repo.storage.meta_value('git_baseline')
+    with mock.patch.object(c, '_git_state', return_value='new'):
+        c.Repository(tmp_path, languages=['python']).refresh()
+        assert repo.storage.meta_value('git_baseline') == baseline
+        assert c._git_freshness(tmp_path, baseline) == 'changed'
+
+
+def test_unreadable_directory_aborts_refresh_before_deleting_rows(tmp_path):
+    (tmp_path / 'app.py').write_text('def target(): pass\n')
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    def unreadable_walk(root, *, onerror):
+        onerror(PermissionError('fixture directory'))
+        return iter(())
+    with mock.patch.object(c.os, 'walk', unreadable_walk), pytest.raises(PermissionError):
+        repo.refresh()
+    assert repo.search_symbols('target', exact_only=True)
+
+
+@pytest.mark.parametrize(('extension', 'source', 'name', 'declaration'), [
+    ('py', 'first, second = (\n 1,\n 2\n)\n', 'second', 'first, second = (\n 1,\n 2\n)'),
+    ('ts', 'const {first, second: renamed} = {\n first: 1, second: 2\n};\n', 'renamed',
+     '{first, second: renamed} = {\n first: 1, second: 2\n}'),
+    ('swift', 'struct Box {\n let first = 1, second = 2\n}\n', 'second', 'let first = 1, second = 2'),
+    ('kt', 'val (first, second) = Pair(1,2)\n', 'second', 'val (first, second) = Pair(1,2)'),
+])
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
+def test_multi_binding_preview_uses_full_declaration_in_both_paths(tmp_path, monkeypatch, extension, source, name, declaration, newline):
+    source = source.replace('\n', newline)
+    declaration = declaration.replace('\n', newline)
+    path = tmp_path / f'app.{extension}'
+    path.write_bytes(source.encode())
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    symbol = repo.best_symbol(name)
+    native = c._definition_range(repo, symbol)
+    monkeypatch.setattr(c, 'NATIVE_DEFINITION_MAX_SYMBOLS', 0)
+    assert c._definition_range(repo, symbol) == native
+    assert native is not None
+    assert source.encode()[native.start_byte:native.end_byte].decode() == declaration

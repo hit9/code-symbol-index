@@ -1382,7 +1382,8 @@ class CodeIndex:
         # directories (it had no specs yet), so it visited an order of magnitude
         # more directories than the scan itself needed.
         root_text = str(self.root)
-        for dirpath, dirnames, filenames in os.walk(root_text):
+        scan_errors: list[OSError] = []
+        for dirpath, dirnames, filenames in os.walk(root_text, onerror=scan_errors.append):
             relative_dir = os.path.relpath(dirpath, root_text)
             prefix = "" if relative_dir == "." else relative_dir.replace(os.sep, "/") + "/"
             specs = self._gitignore_specs_for_dir(prefix, has_gitignore=".gitignore" in filenames)
@@ -1399,6 +1400,8 @@ class CodeIndex:
                 path_text = prefix + filename
                 if self._should_index_text(path_text, specs):
                     yield Path(path_text)
+        if scan_errors:
+            raise scan_errors[0]  # An unreadable subtree is not evidence that its indexed files were deleted.
 
     def _should_index(self, relative_path: Path) -> bool:
         return self._should_index_text(relative_path.as_posix())
@@ -1577,11 +1580,15 @@ class Repository(CodeIndex):
 
         _emit_progress(progress_callback, "scan", done=0, total=0)
         current_files: dict[str, tuple[Path, os.stat_result]] = {}
+        unavailable_paths: set[str] = set()
         paths = list(self._iter_indexable_files())
         for path in paths:
             try:
                 stat = (self.root / path).stat()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
             except OSError:
+                unavailable_paths.add(path.as_posix())
                 continue
             current_files[path.as_posix()] = (path, stat)
 
@@ -1591,7 +1598,8 @@ class Repository(CodeIndex):
         deleted = [
             Path(path)
             for path in indexed_files
-            if path not in current_files and self._scan_covers_language(indexed_files[path]["language"])
+            if path not in current_files and path not in unavailable_paths
+            and self._scan_covers_language(indexed_files[path]["language"])
         ]
 
         to_index: list[Path] = []
@@ -1644,10 +1652,12 @@ class Repository(CodeIndex):
             indexed_files=indexed_results,
             progress=getattr(progress_callback, "_storage_progress", None),
             schema_version=SCHEMA_VERSION,
-            git_baseline=_git_baseline(self.root, git_before),
+            git_baseline=None if self.filtered_scan else _git_baseline(self.root, git_before),
         )
-        self._record_header_language_outcome(indexed_results, current_files, indexed_files, effective_header)
-        _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total)
+        self._record_header_language_outcome(
+            indexed_results, current_files, indexed_files, effective_header, unavailable_paths
+        )
+        _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total + len(unavailable_paths))
         return self
 
     def _record_header_language_outcome(
@@ -1656,6 +1666,7 @@ class Repository(CodeIndex):
         current_files: dict[str, tuple[Path, os.stat_result]],
         indexed_files: dict[str, sqlite3.Row],
         effective_header: str,
+        unavailable_paths: set[str],
     ) -> None:
         """Note how many stored header files actually moved to the new language.
 
@@ -1666,9 +1677,9 @@ class Repository(CodeIndex):
         published = {indexed_file.path for indexed_file in indexed_results}
         pending = [
             path
-            for path, (relative_path, _stat) in current_files.items()
+            for path in indexed_files
             if path[-2:].lower() == HEADER_EXTENSION
-            and path in indexed_files
+            and (path in current_files or path in unavailable_paths)
             and indexed_files[path]["language"] != effective_header
         ]
         converted = sum(1 for path in pending if Path(path) in published)
@@ -1710,11 +1721,23 @@ class Repository(CodeIndex):
         self._gitignore_specs.clear()
         self.header_language = None  # Another Repository may have changed the write setting.
         relative_paths = list(dict.fromkeys(self._relative_path(path) for path in _coerce_paths(paths)))
-        to_index = [
-            path
-            for path in relative_paths
-            if (self.root / path).is_file() and self._should_index(path)
-        ]
+        from stat import S_ISREG
+
+        to_index: list[Path] = []
+        removed: list[Path] = []
+        unavailable: list[Path] = []
+        for path in relative_paths:
+            if not self._should_index(path):
+                removed.append(path)
+                continue
+            try:
+                mode = (self.root / path).stat().st_mode
+            except (FileNotFoundError, NotADirectoryError):
+                removed.append(path)
+            except OSError:
+                unavailable.append(path)
+            else:
+                (to_index if S_ISREG(mode) else removed).append(path)
         total = len(to_index)
         _emit_progress(progress_callback, "start", done=0, total=total)
         indexed_results = self._parse_files(
@@ -1727,8 +1750,6 @@ class Repository(CodeIndex):
         # Deletion candidates are only the requested paths that are gone or no
         # longer indexable. A file that still exists but failed to read or parse
         # keeps its previous rows and revision instead of losing them here.
-        requested = set(to_index)
-        removed = [path for path in relative_paths if path not in requested]
         self.storage.replace_files(
             deleted_paths=removed,
             indexed_files=indexed_results,
@@ -1738,8 +1759,8 @@ class Repository(CodeIndex):
         self.last_update_updated = tuple(
             path.as_posix() for path in to_index if path in published
         )
-        self.last_update_failed = tuple(path.as_posix() for path in to_index if path not in published)
-        _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total)
+        self.last_update_failed = tuple(path.as_posix() for path in [*to_index, *unavailable] if path not in published)
+        _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total + len(unavailable))
         return self
 
     def _parse_files(
@@ -5937,6 +5958,30 @@ def _definition_ranges_for_symbols(
     return _definition_ranges_and_tree(repo, path, symbols, source=source)[0]
 
 
+def _definition_name_keys(
+    source: bytes, path: Path, spec: LanguageSpec, node: Node, line_starts: Sequence[int],
+) -> tuple[tuple[str, int], ...]:
+    extra = _extra_node_symbols(source, path, spec, node, None, line_starts)
+    if extra is not None:
+        return tuple((symbol.kind, symbol.range.start_byte) for symbol, _ in extra)
+    if spec.name == 'python' and _node_kind(node) == 'assignment':
+        parent = node.parent
+        while parent is not None and _node_kind(parent) not in ('class_definition', 'function_definition'):
+            parent = parent.parent
+        if parent is not None and _node_kind(parent) == 'function_definition':
+            return ()
+        symbols = _python_assignment_symbols(
+            source, path, spec, node, container=None, as_field=parent is not None, line_starts=line_starts,
+        )
+        return tuple((symbol.kind, symbol.range.start_byte) for symbol in symbols)
+    kind = _definition_kind(source, spec, node)
+    if kind is not None:
+        name = _name_node(node, spec)
+        if name is not None:
+            return ((kind, _node_start_byte(name)),)
+    return ()
+
+
 def _definition_ranges_and_tree(
     repo: CodeIndex,
     path: Path,
@@ -5977,6 +6022,14 @@ def _definition_ranges_and_tree(
     if spec.name in _C_LANGUAGE_NAMES:
         return _c_definition_ranges_for_symbols(source_bytes, root_node, wanted, line_starts), root_node
 
+    declaration_keys: dict[tuple[int, int, str], tuple[tuple[str, int], ...]] = {}
+
+    def name_keys(node: Node) -> tuple[tuple[str, int], ...]:
+        key = (_node_start_byte(node), _node_end_byte(node), _node_kind(node))
+        if key not in declaration_keys:
+            declaration_keys[key] = _definition_name_keys(source_bytes, path, spec, node, line_starts)
+        return declaration_keys[key]
+
     if isinstance(root_node, Node) and len(wanted) <= NATIVE_DEFINITION_MAX_SYMBOLS:
         for symbol in wanted.values():
             start = symbol.range.start_byte
@@ -5988,13 +6041,11 @@ def _definition_ranges_and_tree(
             match = None
             ambiguous = False
             while node is not None:
-                if _definition_kind(source_bytes, spec, node) == symbol.kind:
-                    name = _name_node(node, spec)
-                    if name is not None and _node_start_byte(name) == start:
-                        if match is not None:
-                            ambiguous = True
-                            break
-                        match = node
+                if (symbol.kind, start) in name_keys(node):
+                    if match is not None:
+                        ambiguous = True
+                        break
+                    match = node
                 node = node.parent
             if ambiguous:
                 break  # Preserve traversal order for nested grammar wrappers.
@@ -6007,13 +6058,10 @@ def _definition_ranges_and_tree(
     def walk(node: Node) -> None:
         if len(ranges) >= len(wanted):
             return
-        kind = _definition_kind(source_bytes, spec, node)
-        if kind is not None:
-            name_node = _name_node(node, spec)
-            if name_node is not None:
-                symbol = wanted.get((kind, _node_start_byte(name_node)))
-                if symbol is not None:
-                    ranges[symbol.id] = _node_range(source_bytes, node, line_starts)
+        for key in _definition_name_keys(source_bytes, path, spec, node, line_starts):
+            symbol = wanted.get(key)
+            if symbol is not None:
+                ranges[symbol.id] = _node_range(source_bytes, node, line_starts)
         for child in _node_children(node):
             walk(child)
 
