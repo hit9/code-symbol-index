@@ -1627,6 +1627,7 @@ class Repository(CodeIndex):
         to_index: list[Path] = []
         to_summarize: list[tuple[Path, os.stat_result]] = []
         rule_upgrades = 0
+        rule_upgrade_paths: set[str] = set()
         for path_text, (path, stat) in current_files.items():
             old = indexed_files.get(path_text)
             revision = self._write_revision(path_text)
@@ -1636,6 +1637,7 @@ class Repository(CodeIndex):
                 # Unchanged file whose persisted extraction rules moved: one-time
                 # re-parse, counted and reported separately from normal work.
                 rule_upgrades += 1
+                rule_upgrade_paths.add(path_text)
             if metadata_changed or needs_rules:
                 to_index.append(path)
                 continue
@@ -1675,6 +1677,7 @@ class Repository(CodeIndex):
             progress=getattr(progress_callback, "_storage_progress", None),
             schema_version=SCHEMA_VERSION,
             git_baseline=None if self.filtered_scan else _git_baseline(self.root, git_before),
+            rule_upgrade_paths=rule_upgrade_paths,
         )
         self._record_header_language_outcome(
             indexed_results, current_files, indexed_files, effective_header, unavailable_paths
@@ -2634,6 +2637,7 @@ class _Storage:
         progress: Any | None = None,
         git_baseline: str | None = None,
         summary_updates: Iterable[tuple[bytes, str]] = (),
+        rule_upgrade_paths: set[str] | None = None,
     ) -> None:
         # Nullable, additive schema-5 capabilities: no row rewrite or backfill.
         # Older writers use explicit columns and replace summaries with NULL.
@@ -2656,6 +2660,9 @@ class _Storage:
             progress("write_start", done=0, total=write_total)
 
         for file_chunk in _chunks(indexed_files, SQLITE_FILE_BATCH_SIZE):
+            unchanged = self._unchanged_upgrade_symbols(file_chunk, rule_upgrade_paths) if rule_upgrade_paths else set()
+            changed_files = ([file for file in file_chunk if file.path.as_posix() not in unchanged]
+                             if unchanged else file_chunk)
             file_rows = [
                 (
                     indexed_file.path.as_posix(),
@@ -2669,20 +2676,27 @@ class _Storage:
             ]
             symbol_rows = [
                 _symbol_row(symbol)
-                for indexed_file in file_chunk
+                for indexed_file in changed_files
                 for symbol in indexed_file.symbols
             ]
             fts_rows = [
                 _symbol_fts_row(symbol)
-                for indexed_file in file_chunk
+                for indexed_file in changed_files
                 for symbol in indexed_file.symbols
             ] if self.has_symbol_fts else []
             with self.connection:
                 _delete_paths_chunked(
                     self.connection,
-                    [indexed_file.path for indexed_file in file_chunk],
+                    [indexed_file.path for indexed_file in changed_files],
                     include_fts=self.has_symbol_fts,
                 )
+                if unchanged:
+                    placeholders = ','.join('?' for _ in unchanged)
+                    self.connection.execute(f'DELETE FROM refs WHERE path IN ({placeholders})', tuple(unchanged))
+                    # The equality checks complete this work without rewriting
+                    # identical symbol/FTS rows; metadata still advances below.
+                    write_done += sum(len(file.symbols) for file in file_chunk
+                                      if file.path.as_posix() in unchanged) * (2 if self.has_symbol_fts else 1)
                 self.connection.executemany(
                     """
                     INSERT OR REPLACE INTO files(path, language, mtime_ns, size, name_summary, extractor_revision)
@@ -2753,6 +2767,24 @@ class _Storage:
             if progress is not None:
                 progress("write_tick", done=write_done, total=write_total)
                 progress("finalize", done=write_done, total=write_total)
+
+    def _unchanged_upgrade_symbols(self, files: list[_IndexedFile], candidates: set[str]) -> set[str]:
+        """Compare only rule upgrades, in one bounded read per file batch."""
+        paths = [file.path.as_posix() for file in files if file.path.as_posix() in candidates]
+        if not paths:
+            return set()
+        previous: dict[str, dict[str, tuple]] = {path: {} for path in paths}
+        placeholders = ','.join('?' for _ in paths)
+        for row in self.connection.execute(
+            'SELECT id, name, kind, language, path, start_line, start_col, end_line, end_col, '
+            f'start_byte, end_byte, signature, container FROM symbols WHERE path IN ({placeholders})', paths,
+        ):
+            previous[row[4]][row[0]] = tuple(row)
+        return {
+            file.path.as_posix() for file in files
+            if file.path.as_posix() in previous
+            and previous[file.path.as_posix()] == {symbol.id: _symbol_row(symbol) for symbol in file.symbols}
+        }
 
     def search_symbols(
         self,

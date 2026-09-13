@@ -16,6 +16,27 @@ PY_SOURCE = "def target(): return 1\ndef caller(): return target()\n"
 GO_SOURCE = "package main\n\nfunc Target() int { return 1 }\n\nfunc Caller() int { return Target() }\n"
 
 
+@pytest.mark.parametrize('changed_symbols', [False, True])
+def test_rule_upgrade_only_rewrites_symbols_when_the_result_changes(tmp_path, changed_symbols, monkeypatch):
+    _write_python(tmp_path)
+    repo = Repository(tmp_path, create_index=True).refresh()
+    expected = [tuple(row) for row in repo.storage.connection.execute('SELECT * FROM symbols ORDER BY id')]
+    with repo.storage.connection:
+        repo.storage.connection.execute('UPDATE files SET extractor_revision = NULL')
+        if changed_symbols:
+            repo.storage.connection.execute("UPDATE symbols SET signature = signature || ' old'")
+    statements = []
+    repo.storage.connection.set_trace_callback(statements.append)
+    repo.refresh()
+    assert [tuple(row) for row in repo.storage.connection.execute('SELECT * FROM symbols ORDER BY id')] == expected
+    writes = [s for s in statements if s.startswith(('DELETE FROM symbols ', 'INSERT OR REPLACE INTO symbols'))]
+    assert bool(writes) == changed_symbols
+    assert repo.storage.files()['app.py']['extractor_revision'] == code_symbol_index.EXTRACTOR_REVISIONS['python']
+    assert repo.search_symbols('target', exact_only=True)
+    monkeypatch.setattr(code_symbol_index, '_parse_file', lambda *a, **kw: pytest.fail('repeated rule upgrade'))
+    repo.refresh()
+
+
 def _write_python(tmp_path: Path) -> Path:
     path = tmp_path / "app.py"
     path.write_text(PY_SOURCE, encoding="utf-8")
