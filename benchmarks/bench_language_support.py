@@ -248,10 +248,10 @@ def corpus_queries(corpus: str, names: list[str]) -> dict[str, list[str]]:
         return {
             "search": ["search", "large_0", "--limit", "20"],
             "search_late": ["search", "large_999", "--limit", "1"],
-            "inspect": ["inspect", "large_0"],
+            "inspect": ["inspect", "large_0", "--path", names[0]],
             "refs": ["refs", "large_0"],
-            "callers": ["callers", "large_0", "--depth", "1"],
-            "callees": ["callees", "large_caller_0", "--depth", "1"],
+            "callers": ["callers", "large_0", "--depth", "1", "--path", names[0]],
+            "callees": ["callees", "large_caller_0", "--depth", "1", "--path", names[0]],
         }
     return {
         "search": ["search", "caller_0", "--limit", "20"],
