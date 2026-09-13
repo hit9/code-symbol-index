@@ -330,6 +330,7 @@ def main() -> None:
             names = write_corpus(root, corpus)
             db = temp / f"{corpus}.sqlite"
             entry = {"files": len(names), "cases": {}}
+            report["corpora"][corpus] = entry
             if corpus in ("c_1k", "c_10k"):
                 entry["files"] = len(names) + 1
 
@@ -425,6 +426,9 @@ def main() -> None:
                 result = entry["cases"][name]
                 summary = "error" if "error" in result else f"{result['after_before']:.3f}x"
                 print(f"{corpus}.{name}: {summary}", flush=True)
+            # Keep row counts even for index-only runs, and retain upgrade-only
+            # cases without depending on a later query to flush the report.
+            args.output.write_text(json.dumps(report, indent=2) + "\n")
 
 
 if __name__ == "__main__":
