@@ -554,6 +554,27 @@ class _IndexedFile:
     # without registered rules and for rows written before the column existed.
     revision: str | None = None
 
+    def __reduce__(self):
+        # Process-pool results contain thousands of nested frozen dataclasses.
+        # Send plain rows instead, sharing this file's path/language on restore.
+        return _restore_indexed_file, (
+            self.path, self.language, self.mtime_ns, self.size,
+            tuple(_symbol_row(symbol) for symbol in self.symbols),
+            self.references, self.name_summary, self.bodies, self.revision,
+        )
+
+
+def _restore_indexed_file(path, language, mtime_ns, size, rows, references, name_summary, bodies, revision):
+    symbols = tuple(
+        Symbol(
+            id=row[0], name=row[1], kind=row[2], language=row[3], path=path,
+            range=Range(Position(row[5], row[6]), Position(row[7], row[8]), row[9], row[10]),
+            signature=row[11], container=row[12],
+        )
+        for row in rows
+    )
+    return _IndexedFile(path, language, mtime_ns, size, symbols, references, name_summary, bodies, revision)
+
 
 @dataclass(frozen=True, slots=True)
 class _CallableBody:
@@ -4864,8 +4885,7 @@ def _node_text(source: bytes, node: Node) -> str:
 
 def _signature(source: bytes, node: Node) -> str:
     text = _node_text(source, node).strip()
-    first_line = text.splitlines()[0] if text else ""
-    return first_line[:240]
+    return text[:240].splitlines()[0] if text else ""
 
 
 def _signature_at_name(source: bytes, node: Node, name_node: Node) -> str:

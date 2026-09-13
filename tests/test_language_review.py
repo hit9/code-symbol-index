@@ -1,4 +1,5 @@
 """Adversarial acceptance cases for the language-support change."""
+import pickle
 from pathlib import Path
 from unittest import mock
 
@@ -215,3 +216,13 @@ def test_candidate_body_lookup_matches_full_extraction_without_reextracting(tmp_
     assert expected and len(expected) < len(candidates)
     with mock.patch.object(c, '_parse_file', side_effect=AssertionError('full re-extraction')):
         assert c._defined_symbol_ids(repo, candidates) == expected
+
+
+@pytest.mark.parametrize('include_references', [False, True])
+def test_worker_result_serialization_preserves_all_metadata(tmp_path, include_references):
+    path = Path('app.cpp')
+    (tmp_path / path).write_text('namespace demo { struct Box { int run() { return target(); } }; }\n')
+    indexed = c._parse_file(tmp_path, path, include_references=include_references,
+                            collect_bodies=include_references)
+    assert indexed.symbols and indexed.revision
+    assert pickle.loads(pickle.dumps(indexed)) == indexed
