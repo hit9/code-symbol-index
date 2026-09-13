@@ -4074,6 +4074,8 @@ def _extract_symbols_and_references(
         # punctuation/keyword leaves; declaration handlers still see all children.
         children = getattr(node, "named_children", None) if c_state is not None and not include_references else None
         for child in children if children is not None else _node_children(node):
+            if c_state is not None and not include_references and getattr(child, 'child_count', 1) == 0:
+                continue  # C/C++ declarations own a name child; leaves cannot publish symbols.
             walk(child, next_container, child_parent, child_grandparent, child_ctx, next_in_function, next_scope_kind)
 
     c_state = _CFileState(source, root_node) if language.name in _C_LANGUAGE_NAMES else None
