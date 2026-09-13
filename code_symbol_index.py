@@ -964,10 +964,12 @@ def _name_query(method: Any) -> Any:
             return method(self, *args, **kwargs)
         self._name_summary_unavailable = False
         self._name_filter = _NameFilter(self)
+        self._language_cache = {}
         try:
             return method(self, *args, **kwargs)
         finally:
             self._name_filter = None
+            self._language_cache = None
     return query
 
 
@@ -1351,8 +1353,7 @@ class CodeIndex:
         """
         cache = self._language_cache
         if cache is None:
-            cache = {}
-            self._language_cache = cache
+            return self.storage.file_languages([relative_path.as_posix()]).get(relative_path.as_posix())
         key = relative_path.as_posix()
         if key not in cache:
             stored = self.storage.file_languages([key])
@@ -1704,6 +1705,7 @@ class Repository(CodeIndex):
             return self.refresh(progress=progress_callback)
 
         self._gitignore_specs.clear()
+        self.header_language = None  # Another Repository may have changed the write setting.
         relative_paths = list(dict.fromkeys(self._relative_path(path) for path in _coerce_paths(paths)))
         to_index = [
             path
@@ -5191,6 +5193,10 @@ def _preferred_candidate(repo: CodeIndex, candidates: Sequence[Symbol]) -> Symbo
     and indexing the declaration must not hide a target that used to resolve.
     Anything less clear-cut stays ambiguous rather than guessing.
     """
+    if (len(candidates) > MAX_INSPECT_CANDIDATES
+            or len({(candidate.name, candidate.language) for candidate in candidates}) != 1
+            or any(candidate.kind not in FUNCTION_KINDS for candidate in candidates)):
+        return None
     defined = _defined_symbol_ids(repo, candidates)
     preferred = [candidate for candidate in candidates if candidate.id in defined]
     return preferred[0] if len(preferred) == 1 else None
@@ -5586,8 +5592,11 @@ def _callers_for_symbol(
             def_ranges_cache[path] = ranges
             trees_cache[path] = (tree, source.encode("utf-8") if source is not None else b"")
         tree, source_bytes = trees_cache[path]
+        owner = None
+        body_known = False
         if tree is not None and source_bytes:
             spec = _file_spec(repo, path)
+            body_known = spec is not None and spec.name in _CALLABLE_BODY_NODE_TYPES
             owner = (
                 _call_owner_at(tree, source_bytes, spec, reference.range.start_byte, reference.range.end_byte)
                 if spec is not None
@@ -5597,7 +5606,10 @@ def _callers_for_symbol(
                 # The call sits in an anonymous callable's body: that body is an
                 # ownership boundary, and no public symbol stands for it.
                 continue
-        caller = _enclosing_symbol(file_symbols_cache[path], def_ranges_cache[path], reference.range, exclude_id=symbol.id)
+        caller = _enclosing_symbol(
+            file_symbols_cache[path], def_ranges_cache[path], reference.range, exclude_id=symbol.id,
+            owner_span=owner[0] if owner is not None else None, body_known=body_known,
+        )
         if caller is None or caller.id in seen:
             continue
         callers.append(caller)
@@ -5719,7 +5731,8 @@ def _resolve_callee(
 
 
 def _enclosing_symbol(
-    symbols: list[Symbol], def_ranges: dict[str, Range], range_: Range, *, exclude_id: str
+    symbols: list[Symbol], def_ranges: dict[str, Range], range_: Range, *, exclude_id: str,
+    owner_span: tuple[int, int] | None = None, body_known: bool = False,
 ) -> Symbol | None:
     """The innermost callable or container whose byte range contains ``range_``.
 
@@ -5729,11 +5742,13 @@ def _enclosing_symbol(
     name range would masquerade as a body and produce a plausible-looking but
     wrong owner.
     """
-    span = (range_.start_byte, range_.end_byte)
+    span = owner_span if owner_span is not None else (range_.start_byte, range_.end_byte)
     candidates: list[tuple[Symbol, Range]] = []
     for symbol in symbols:
         if symbol.id == exclude_id or symbol.kind not in CALL_OWNER_KINDS:
             continue
+        if body_known and owner_span is None and symbol.kind in FUNCTION_KINDS:
+            continue  # A default argument outside every callable body is not called by that function.
         body = def_ranges.get(symbol.id)
         if body is None:
             continue
