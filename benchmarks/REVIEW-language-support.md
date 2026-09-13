@@ -2,7 +2,8 @@
 
 ## Decision
 
-**Accepted, with one disclosed regression left to the maintainer.** The
+**Accepted, and released as 0.6.0.** The maintainer accepted the remaining
+fresh-index regression on C/C++-heavy sources described below. The
 correctness defects found during this review are fixed and regression-tested, and
 the write and query costs are now measured against a like-for-like baseline. One
 regression remains: a fresh index of C/C++-heavy sources is up to 8% slower
@@ -144,7 +145,7 @@ scale: the 1,001- and 10,001-file C corpora also gain 50% more symbols yet index
 29% and 11% *faster* than the baseline, because batching dominates at that size.
 Reducing it further would mean publishing fewer correct symbols. The remaining
 offsets that were found are about 1% each and cost more complexity than they save
-(see rejected list). This is left to the maintainer to accept or reject.
+(see rejected list). The maintainer accepted this regression for 0.6.0.
 
 ## Rule upgrade
 
