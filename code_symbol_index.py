@@ -83,6 +83,10 @@ DEFAULT_MAX_PENDING_FILES = 50
 HASHLINE_HASH_CHARS = 8
 MAX_INSPECT_CANDIDATES = 20
 SYMBOL_QUERY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
+# The id shape printed by text output: language:kind:name:path:start:end.
+TEXT_SYMBOL_ID_PATTERN = re.compile(
+    r"^(?P<language>[A-Za-z0-9_+#-]+):(?P<kind>[A-Za-z_]+):(?P<rest>.+):(?P<start>\d+):(?P<end>\d+)$"
+)
 API_FORMATS = ("object", "text", "json")
 ANCHOR_FORMATS = ("legacy", "explicit")
 _DEFAULT_PROGRESS = object()
@@ -1332,6 +1336,9 @@ class CodeIndex:
         exact_only: bool = False,
     ) -> Symbol:
         symbol = self.storage.get_symbol(query)
+        if symbol is not None:
+            return symbol
+        symbol = _symbol_from_text_id(self, query)
         if symbol is not None:
             return symbol
 
@@ -5175,11 +5182,17 @@ def _inspect_text(
     anchors: bool,
 ) -> str:
     anchor_format = _validate_anchor_format(options.anchor_format)
-    invalid_reason = _invalid_symbol_query_reason(query, repo.root)
-    if invalid_reason is not None:
-        return _bounded_text(f"invalid_input:\n  reason: {invalid_reason}\n", options.max_total_chars)
+    by_id = _symbol_from_text_id(repo, query)
+    if by_id is None:
+        invalid_reason = _invalid_symbol_query_reason(query, repo.root)
+        if invalid_reason is not None:
+            return _bounded_text(f"invalid_input:\n  reason: {invalid_reason}\n", options.max_total_chars)
 
-    candidates = _inspect_candidates(repo, query, kind=kind, language=language, path=path, exact_only=exact_only)
+    candidates = (
+        [by_id]
+        if by_id is not None
+        else _inspect_candidates(repo, query, kind=kind, language=language, path=path, exact_only=exact_only)
+    )
     if not candidates:
         return _bounded_text(f"not_found:\n  query: {query}\n", options.max_total_chars)
     if len(candidates) > 1:
@@ -5224,6 +5237,47 @@ def _inspect_text(
     lines.extend(_format_relation_section(repo, "references", references, options.max_references))
     lines.extend(_format_relation_section(repo, "implementors", implementors, options.max_implementors))
     return _bounded_text("\n".join(lines) + "\n", options.max_total_chars)
+
+
+def _symbol_from_text_id(repo: CodeIndex, query: str) -> Symbol | None:
+    """Resolve an id exactly as the text output prints it back to a symbol.
+
+    Every text result advertises ``language:kind:name:path:start:end``, so that
+    string has to be accepted as a query — otherwise the most precise handle the
+    tool hands out is the one thing it refuses, and the path inside it trips the
+    "paths are not supported" guard.
+    """
+    match = TEXT_SYMBOL_ID_PATTERN.match(query.strip())
+    if match is None:
+        return None
+    # A qualified name may carry colons (``Foo::bar``); a path is not expected to,
+    # so the last colon in the middle section separates name from path.
+    rest = match.group("rest")
+    if ":" not in rest:
+        return None
+    name, path = rest.rsplit(":", 1)
+    if not name or not path or "/" in name:
+        return None
+    candidates = repo.search_symbols(
+        name,
+        kind=match.group("kind"),
+        language=match.group("language"),
+        path=path,
+        exact_only=True,
+        limit=MAX_INSPECT_CANDIDATES + 1,
+    )
+    if not candidates:
+        return None
+    start = int(match.group("start"))
+    exact = [symbol for symbol in candidates if _display_line(symbol.range.start.line) == start]
+    if len(exact) == 1:
+        return exact[0]
+    # The printed range may be the definition range rather than the stored one,
+    # so a miss here falls back to the ordinary preference rules.
+    pool = exact or candidates
+    if len(pool) == 1:
+        return pool[0]
+    return _preferred_candidate(repo, pool)
 
 
 def _invalid_symbol_query_reason(query: str, root: Path) -> str | None:
@@ -5362,6 +5416,9 @@ def _resolve_inspect_symbol(
     path: str | Path | Iterable[str | Path] | None,
     exact_only: bool,
 ) -> Symbol:
+    by_id = _symbol_from_text_id(repo, query)
+    if by_id is not None:
+        return by_id
     invalid_reason = _invalid_symbol_query_reason(query, repo.root)
     if invalid_reason is not None:
         raise SymbolNotFoundError(invalid_reason)

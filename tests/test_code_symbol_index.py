@@ -1919,6 +1919,32 @@ def test_callers_cycle_terminates(tmp_path: Path) -> None:
     assert any(node.symbol.name == "b" for node in graph.roots)
 
 
+def test_callers_accept_the_printed_symbol_id(tmp_path: Path) -> None:
+    (tmp_path / "m.py").write_text(
+        "def a():\n    return b()\n\n"
+        "def b():\n    return 1\n",
+        encoding="utf-8",
+    )
+    code_symbol_index.index(tmp_path)
+    text = code_symbol_index.inspect_text("b", root=tmp_path)
+    printed_id = text.splitlines()[1].split("id: ", 1)[1]
+    assert "/" in printed_id or ".py" in printed_id
+
+    graph = code_symbol_index.callers(printed_id, root=tmp_path, depth=2)
+    assert graph.target.name == "b"
+    assert any(node.symbol.name == "a" for node in graph.roots)
+    # Line numbers drift as a file is edited; the rest of the id still resolves.
+    stale = printed_id.rsplit(":", 2)[0] + ":999:1001"
+    assert code_symbol_index.callers(stale, root=tmp_path, depth=2).target.name == "b"
+
+
+def test_plain_paths_are_still_rejected(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+    code_symbol_index.index(tmp_path)
+    with pytest.raises(code_symbol_index.SymbolNotFoundError):
+        code_symbol_index.callers("app.py", root=tmp_path)
+
+
 def test_callers_depth_is_bounded(tmp_path: Path) -> None:
     _write_call_chain_fixture(tmp_path)
     code_symbol_index.index(tmp_path)

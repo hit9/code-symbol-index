@@ -7,6 +7,15 @@
 - `callers`/`callees` accept `--max-depth` as an alias for `--depth`. Same range
   (1-6), same default, same behaviour.
 
+### Fixed
+
+- The symbol id printed by text output (`language:kind:name:path:start:end`) is
+  now accepted as a query by `inspect`, `callers`, `callees`, `refs` and `impls`.
+  Copying a printed id back into a command used to fail with "file and directory
+  paths are not supported" because of the path inside it. Stale line numbers still
+  resolve as long as the name, kind and path match; a bare file or directory path
+  is still rejected.
+
 ## 0.6.0 - 2026-09-13
 
 ### Added
