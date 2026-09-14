@@ -1,11 +1,6 @@
 # Changelog
 
-## 0.6.1 - 2026-09-13
-
-### Added
-
-- `callers`/`callees` accept `--max-depth` as an alias for `--depth`. Same range
-  (1-6), same default, same behaviour.
+## 0.6.2 - 2026-09-13
 
 ### Fixed
 
@@ -15,6 +10,13 @@
   paths are not supported" because of the path inside it. Stale line numbers still
   resolve as long as the name, kind and path match; a bare file or directory path
   is still rejected.
+
+## 0.6.1 - 2026-09-13
+
+### Added
+
+- `callers`/`callees` accept `--max-depth` as an alias for `--depth`. Same range
+  (1-6), same default, same behaviour.
 
 ## 0.6.0 - 2026-09-13
 
