@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1 - 2026-09-13
+
+### Added
+
+- `callers`/`callees` accept `--max-depth` as an alias for `--depth`. Same range
+  (1-6), same default, same behaviour.
+
 ## 0.6.0 - 2026-09-13
 
 ### Added

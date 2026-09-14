@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from tree_sitter import Node
 
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 SCHEMA_VERSION = 5
 
 # Extraction-rule revisions: one entry per language whose *persisted* symbols or
@@ -7441,7 +7441,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         _add_index_options(chain_parser)
         chain_parser.add_argument("query")
         _add_match_options(chain_parser)
-        chain_parser.add_argument("--depth", type=_depth, default=DEFAULT_CALL_DEPTH, help=f"Traversal depth (1-{MAX_CALL_DEPTH}).")
+        # ``--max-depth`` is a compatibility alias: the flag reads as the natural
+        # spelling when you think of the depth as a ceiling, so accept both.
+        chain_parser.add_argument(
+            "--depth",
+            "--max-depth",
+            dest="depth",
+            type=_depth,
+            default=DEFAULT_CALL_DEPTH,
+            help=f"Traversal depth (1-{MAX_CALL_DEPTH}). Alias: --max-depth.",
+        )
         chain_parser.add_argument("--limit", type=_positive_int, default=DEFAULT_CALL_FANOUT, help="Max neighbours expanded per node.")
         if direction == "callees":
             chain_parser.add_argument(
