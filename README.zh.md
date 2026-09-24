@@ -121,6 +121,41 @@ code-symbol-index install-skill --target claude --claude-dir ~/.claude --force
 
 安装后，代理将了解符号搜索、查看、引用、调用链、文件大纲、增量更新及索引状态检查等技能规则。
 
+### 其他编程代理
+
+`SKILL.md` 遵循开放的 [Agent Skills](https://agentskills.io) 格式，任何支持技能的代理都可以
+使用。`--codex-home` 与 `--claude-dir` 只用于设置基础目录，技能总是写入
+`<base>/skills/code-symbol-index/SKILL.md`。要为其他代理安装，把任一参数指向包含该代理
+`skills/` 文件夹的目录即可：
+
+```bash
+# 通用：<agent-dir>/skills/code-symbol-index/SKILL.md
+code-symbol-index install-skill --codex-home <agent-dir>
+```
+
+| 代理 | 用户级（所有项目） | 项目级（提交到仓库） |
+| --- | --- | --- |
+| GitHub Copilot（VS Code / CLI） | `--codex-home ~/.copilot` | `--codex-home .github` |
+| Cursor | `--codex-home ~/.cursor` | `--codex-home .cursor` |
+| Gemini CLI | `--codex-home ~/.gemini` | `--codex-home .gemini` |
+| OpenCode | `--codex-home ~/.config/opencode` | `--codex-home .opencode` |
+| 跨代理 `.agents/` 约定 | `--codex-home ~/.agents` | `--codex-home .agents` |
+
+项目级安装请在仓库根目录执行。以上路径在撰写本文时是准确的，但技能目录变化很快，请以代理文档中
+实际扫描的目录为准。不少代理（Copilot、Cursor、OpenCode 等）也会读取 `~/.claude/skills/` 或
+`.claude/skills/`，此时直接 `install-skill --target claude` 可能就够了。
+
+不支持技能的代理仍可使用本工具：把技能正文加入代理的指令文件（`AGENTS.md`、`.cursorrules`、
+`GEMINI.md`、`.github/copilot-instructions.md` 等）。先写到一个临时目录：
+
+```bash
+code-symbol-index install-skill --codex-home /tmp/csi
+cat /tmp/csi/skills/code-symbol-index/SKILL.md >> AGENTS.md
+```
+
+粘贴到普通指令文件时去掉 YAML front matter（两行 `---` 之间的部分）。代理只需要能在 `PATH`
+中找到 `code-symbol-index` CLI。
+
 ## CLI
 
 ```bash

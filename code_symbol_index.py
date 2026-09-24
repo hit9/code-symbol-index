@@ -94,7 +94,7 @@ CODEX_SKILL_NAME = "code-symbol-index"
 
 CODEX_SKILL = """---
 name: code-symbol-index
-description: Reach for this the moment a code-navigation question is structural rather than textual — "who calls this", "what does this call" (transitive callers/callees with entry-point grouping), "where is this used and how" (references classified as call/read/write/inherit/type), "where is this defined", "what's in this file", or "who implements this interface". It answers these precisely over an index, without the false positives and whole-file reads that grep forces. Prefer grep only for plain string/text search; use this whenever call graphs, reference kinds, or exact symbol resolution matter, especially in large repos. Commands: search, inspect, refs, callers, callees, impls, outline, status, index, update.
+description: Structural code navigation for a local repo through the `code-symbol-index` CLI, which answers from a tree-sitter symbol index instead of grep. Use it when the question is about code structure. Examples - who calls a function and from which HTTP route, worker, script or test (transitive callers); what a function calls further down (callees); where a symbol is used and how, with each use labelled call, read, write, inherit or type; where a class, function or method is defined, with only its source; what a file contains (outline); and which classes implement an interface, trait or base class. Also use it to trace an execution path, check what a change or rename would affect, find every place a field is written, or learn an unfamiliar or large codebase without reading whole files. Covers Python, JavaScript, TypeScript/TSX, Go, Rust, Java, C, C++, C#, Ruby, Swift, Kotlin and PHP. Use grep instead for plain text, string literals, comments or config values.
 ---
 
 # Code Symbol Index
@@ -103,10 +103,10 @@ Use `code-symbol-index` for bounded, indexed code navigation over a local reposi
 
 ## When to use this instead of grep
 
-- "Who calls X / what does X call" -> `callers` / `callees` (transitive, grouped by entry point). Grep cannot follow call chains.
-- "Where is X used, and how" -> `refs` (each hit classified `call`/`read`/`write`/`inherit`/`type`). Grep can't tell a call from an assignment.
+- "Who calls X / what does X call" / "how does a request reach X" -> `callers` / `callees` (transitive, grouped by entry point). Grep cannot follow call chains.
+- "Where is X used, and how" / "what breaks if I change X" / "who writes this field" -> `refs` (each hit classified `call`/`read`/`write`/`inherit`/`type`). Grep can't tell a call from an assignment.
 - "Where is X defined / what's in this file / who implements Y" -> `inspect` / `outline` / `impls`, precisely, without reading whole files.
-- Plain string search with no structural intent -> just use grep.
+- Plain string search with no structural intent (log messages, string literals, comments, config keys) -> just use grep.
 
 ## The fast path
 
@@ -165,7 +165,10 @@ Assume the index is usually `ready`. Just run the query you need (`search`, `ins
 - Line numbers are 1-based and ranges include both ends, matching `grep -n`,
   editors, tracebacks, and diffs — a line number can be carried between them
   unchanged. Edit anchors (`line:hash`) use the same numbering.
-- Queries are symbol names or prefixes, not natural language.
+- Queries are symbol names or prefixes, not natural language. A symbol id
+  printed by an earlier command (`language:kind:name:path:start:end`) is also
+  accepted, which pins `inspect`/`refs`/`callers`/`callees`/`impls` to exactly
+  that definition when a name is ambiguous.
 - Reference classification is syntactic (no type inference); treat `kind` as a
   strong hint, not a guarantee. Use `--all-kinds` if a reference seems missing.
 - `callers`/`callees` are syntactic and name-based (`confidence: low`): indirect

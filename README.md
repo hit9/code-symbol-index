@@ -128,6 +128,46 @@ Once installed, the agent will know the skill rules for symbol search,
 inspection, references, call chains, file outlines, incremental updates, and
 index status checks.
 
+### Other coding agents
+
+`SKILL.md` follows the open [Agent Skills](https://agentskills.io) format, so
+any agent that loads skills can use it. `--codex-home` and `--claude-dir` only
+set a base directory, and the skill is always written to
+`<base>/skills/code-symbol-index/SKILL.md`. To install for another agent, point
+either flag at the directory that contains that agent's `skills/` folder:
+
+```bash
+# Generic: <agent-dir>/skills/code-symbol-index/SKILL.md
+code-symbol-index install-skill --codex-home <agent-dir>
+```
+
+| Agent | User-level (all projects) | Project-level (commit it to the repo) |
+| --- | --- | --- |
+| GitHub Copilot (VS Code / CLI) | `--codex-home ~/.copilot` | `--codex-home .github` |
+| Cursor | `--codex-home ~/.cursor` | `--codex-home .cursor` |
+| Gemini CLI | `--codex-home ~/.gemini` | `--codex-home .gemini` |
+| OpenCode | `--codex-home ~/.config/opencode` | `--codex-home .opencode` |
+| Cross-agent `.agents/` convention | `--codex-home ~/.agents` | `--codex-home .agents` |
+
+Run project-level installs from the repository root. These paths were accurate
+when this was written, but skill locations change quickly, so check your agent's
+docs for the folder it scans. Several agents (Copilot, Cursor, OpenCode and
+others) also read `~/.claude/skills/` or `.claude/skills/`, so
+`install-skill --target claude` may be all you need.
+
+Agents without skill support can still use the tool: add the skill body to the
+agent's instruction file (`AGENTS.md`, `.cursorrules`, `GEMINI.md`,
+`.github/copilot-instructions.md`, ...). Write it to a scratch directory first:
+
+```bash
+code-symbol-index install-skill --codex-home /tmp/csi
+cat /tmp/csi/skills/code-symbol-index/SKILL.md >> AGENTS.md
+```
+
+Leave out the YAML front matter (the block between the `---` lines) when you
+paste it into a plain instruction file. The agent only needs the
+`code-symbol-index` CLI on its `PATH`.
+
 ## CLI
 
 ```bash

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Rewrote the bundled skill's `description` so agents pick the skill for more of
+  the questions it handles: tracing execution paths, checking what a change or
+  rename affects, finding field writes, and exploring unfamiliar codebases. It
+  now lists the supported languages and says when to use grep instead. The skill
+  body also notes that a printed symbol id can be passed back as a query.
+- README: added how to install the skill for agents other than Codex and Claude
+  (Copilot, Cursor, Gemini CLI, OpenCode, the `.agents/` convention), and how to
+  use it with agents that don't support skills.
+
 ## 0.6.2 - 2026-09-13
 
 ### Fixed
