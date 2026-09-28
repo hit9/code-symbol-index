@@ -128,6 +128,38 @@ Once installed, the agent will know the skill rules for symbol search,
 inspection, references, call chains, file outlines, incremental updates, and
 index status checks.
 
+### Optional automatic index updates after edits
+
+```bash
+code-symbol-index install-skill --with-hooks
+code-symbol-index install-skill --target claude --with-hooks
+# Add --force when replacing an existing skill with different contents.
+```
+
+No plugin is required. For Codex, installation merges a `PostToolUse` entry into
+`<codex-home>/hooks.json`, preserving existing configuration and avoiding duplicate
+entries. Review and trust it in Codex `/hooks`. For Claude, hooks are embedded in
+skill frontmatter and registered when the skill is invoked. Both run
+`code-symbol-index hook` from PATH; upgrade the CLI before enabling hooks.
+See [Codex hooks](https://learn.chatgpt.com/docs/hooks) and
+[Claude skill hooks](https://code.claude.com/docs/en/hooks#hooks-in-skills-and-agents).
+
+The handler reads JSON from stdin and updates only paths explicitly supplied by
+`Edit`, `Write`, or Codex `apply_patch`, including patch additions, deletions and
+moves. It searches upward from the event cwd for the nearest default index,
+stopping at a Git boundary. Updates stay inside that root, and hook processes
+for the same index are serialized. Missing indexes are skipped; old schemas
+require an explicit refresh. Hooks never initialize an index or scan the whole
+repository. Success is silent, version checks are disabled, and expected errors
+go to stderr with exit code 0. Installed hooks have a 10-second timeout; manually
+sync after a timeout or failed update.
+
+Shell commands, external editors, branch switches and custom `--db` indexes are
+not covered. Keep the existing `status --check` / `update` workflow as a fallback.
+To remove Claude hooks, reinstall the skill with `--force` without `--with-hooks`.
+For Codex, disable the hook in `/hooks` or remove its `code-symbol-index hook`
+entry from `hooks.json`; ordinary skill installation leaves independent hooks alone.
+
 ### Other coding agents
 
 `SKILL.md` follows the open [Agent Skills](https://agentskills.io) format, so

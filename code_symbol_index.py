@@ -2419,6 +2419,7 @@ def install_skill(
     codex_home: str | Path | None = None,
     claude_dir: str | Path | None = None,
     force: bool = False,
+    with_hooks: bool = False,
 ) -> Path:
     if target == "codex":
         base = Path(codex_home) if codex_home is not None else Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
@@ -2426,13 +2427,34 @@ def install_skill(
         base = Path(claude_dir) if claude_dir is not None else Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
     else:
         raise ValueError(f"unsupported skill target: {target}; expected codex or claude")
-    return _write_skill(base, force=force)
+    content = CODEX_SKILL.rstrip() + "\n"
+    hook = {"matcher": "^(Edit|Write|apply_patch)$", "hooks": [
+        {"type": "command", "command": "code-symbol-index hook", "timeout": 10},
+    ]}
+    hook_config = None
+    hook_file = base / "hooks.json"
+    if with_hooks and target == "claude":
+        # JSON is also valid YAML; keep the shared skill body unchanged.
+        header, body = content.split("\n---\n", 1)
+        content = header + "\nhooks: " + json.dumps({"PostToolUse": [hook]}) + "\n---\n" + body
+    elif with_hooks:
+        hook_config = json.loads(hook_file.read_text(encoding="utf-8")) if hook_file.exists() else {}
+        if not isinstance(hook_config, dict) or not isinstance(hook_config.get("hooks", {}), dict):
+            raise ValueError(f"invalid hook configuration: {hook_file}")
+        entries = hook_config.setdefault("hooks", {}).setdefault("PostToolUse", [])
+        if not isinstance(entries, list):
+            raise ValueError(f"invalid PostToolUse configuration: {hook_file}")
+        if hook not in entries:
+            entries.append(hook)
+    path = _write_skill(base, force=force, content=content)
+    if hook_config is not None:
+        hook_file.write_text(json.dumps(hook_config, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
-def _write_skill(base: Path, *, force: bool) -> Path:
+def _write_skill(base: Path, *, force: bool, content: str) -> Path:
     skill_dir = base / "skills" / CODEX_SKILL_NAME
     skill_file = skill_dir / "SKILL.md"
-    content = CODEX_SKILL.rstrip() + "\n"
     if skill_file.exists():
         existing = skill_file.read_text(encoding="utf-8")
         if existing == content:
@@ -2442,6 +2464,83 @@ def _write_skill(base: Path, *, force: bool) -> Path:
     skill_dir.mkdir(parents=True, exist_ok=True)
     skill_file.write_text(content, encoding="utf-8")
     return skill_file
+
+
+def _hook_paths(event: dict) -> list[str]:
+    if event.get("hook_event_name") != "PostToolUse":
+        return []
+    tool_input = event.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return []
+    if event.get("tool_name") in {"Edit", "Write"}:
+        path = tool_input.get("file_path")
+        return [path] if isinstance(path, str) and path else []
+    if event.get("tool_name") == "apply_patch":
+        patch = tool_input.get("command")
+        if isinstance(patch, str) and patch.startswith("*** Begin Patch\n"):
+            return [line.split(": ", 1)[1] for line in patch.splitlines()
+                    if line.startswith(("*** Add File: ", "*** Update File: ",
+                                        "*** Delete File: ", "*** Move to: "))]
+    return []
+
+
+def _run_hook() -> int:
+    """Best-effort, quiet maintenance of an existing index after file edits."""
+    try:
+        event = json.load(sys.stdin)
+        if not isinstance(event, dict):
+            raise ValueError("expected a hook event object")
+        paths = _hook_paths(event)
+        if not paths:
+            return 0
+        cwd = event.get("cwd")
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+            raise ValueError("hook cwd must be an absolute path")
+        cwd = Path(cwd).resolve()
+        root = None
+        for candidate in (cwd, *cwd.parents):
+            if (candidate / DEFAULT_INDEX_DIR / DEFAULT_INDEX_DB).is_file():
+                root = candidate
+                break
+            if (candidate / ".git").exists():
+                break
+        if root is None:
+            return 0
+        relative_paths = []
+        for name in paths:
+            path = (cwd / name).resolve()
+            if path.is_relative_to(root):
+                relative = path.relative_to(root)
+                if relative.parts and relative.parts[0] != DEFAULT_INDEX_DIR:
+                    relative_paths.append(relative)
+        if not relative_paths:
+            return 0
+        # Serialize hook processes before reading/parsing, not only at SQLite commit.
+        with (root / DEFAULT_INDEX_DIR / "hook.lock").open("a+b") as lock:
+            if os.name == "nt":
+                import msvcrt
+
+                if lock.tell() == 0:
+                    lock.write(b"\0")
+                    lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            repo = Repository(root)
+            try:
+                if repo.storage.schema_version() != SCHEMA_VERSION:
+                    raise ValueError("index schema is outdated; run code-symbol-index index explicitly")
+                repo.update(relative_paths)
+                if repo.last_update_failed:
+                    raise ValueError(f"could not update {len(repo.last_update_failed)} file(s)")
+            finally:
+                repo.storage.connection.close()
+    except (OSError, ValueError, TypeError, sqlite3.Error, IndexNotFoundError) as exc:
+        print(f"code-symbol-index hook: {exc}", file=sys.stderr)
+    return 0
 
 
 def clean(root: str | Path = ".") -> None:
@@ -7549,6 +7648,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     install_skill_parser.add_argument("--codex-home", help="Codex home directory. Defaults to $CODEX_HOME or ~/.codex.")
     install_skill_parser.add_argument("--claude-dir", help="Claude config directory. Defaults to $CLAUDE_CONFIG_DIR or ~/.claude.")
     install_skill_parser.add_argument("--force", action="store_true", help="Overwrite an existing skill.")
+    install_skill_parser.add_argument("--with-hooks", action="store_true", help="Enable automatic incremental updates after agent file edits.")
+
+    subparsers.add_parser("hook", help="Process a PostToolUse JSON event from stdin (existing indexes only).")
 
     languages = subparsers.add_parser("languages", help="Print configured languages with available parsers.")
     languages.set_defaults(command="languages")
@@ -7682,6 +7784,9 @@ class _UpdateCheck:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if raw_args == ["hook"]:
+        return _run_hook()  # No network version check or normal CLI output in hooks.
     update_check = _UpdateCheck.start()
     try:
         raw_args = list(sys.argv[1:] if argv is None else argv)
@@ -7701,6 +7806,7 @@ def main(argv: list[str] | None = None) -> int:
             "update",
             "clean",
             "install-skill",
+            "hook",
             "languages",
             "version",
         }
@@ -7719,8 +7825,15 @@ def main(argv: list[str] | None = None) -> int:
             clean(args.root)
             return 0
         if args.command == "install-skill":
-            path = install_skill(target=args.target, codex_home=args.codex_home, claude_dir=args.claude_dir, force=args.force)
+            try:
+                path = install_skill(target=args.target, codex_home=args.codex_home, claude_dir=args.claude_dir,
+                                     force=args.force, with_hooks=args.with_hooks)
+            except ValueError as exc:
+                print(f"cannot install skill: {exc}", file=sys.stderr)
+                return 2
             print(f"installed {args.target} skill: {path}")
+            if args.with_hooks and args.target == "codex":
+                print(f"installed hooks: {path.parents[2] / 'hooks.json'}; review and trust them with Codex /hooks")
             return 0
         if args.command == "status":
             payload = _index_status(

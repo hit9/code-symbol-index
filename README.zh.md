@@ -121,6 +121,34 @@ code-symbol-index install-skill --target claude --claude-dir ~/.claude --force
 
 安装后，代理将了解符号搜索、查看、引用、调用链、文件大纲、增量更新及索引状态检查等技能规则。
 
+### 可选：编辑后自动更新索引
+
+```bash
+code-symbol-index install-skill --with-hooks
+code-symbol-index install-skill --target claude --with-hooks
+# 已安装过不同内容的 skill 时，加 --force
+```
+
+无需插件。Codex 将 `PostToolUse` 配置合并到 `<codex-home>/hooks.json`，
+保留已有配置，重复安装不会重复添加；首次安装后在 Codex `/hooks` 中审阅并信任。
+Claude 将 hooks 写入 skill 的 YAML frontmatter，调用该 skill 后注册。
+两端均执行 PATH 中的 `code-symbol-index hook`，请先升级 CLI 到支持该命令的版本。
+参见 [Codex hooks](https://learn.chatgpt.com/docs/hooks) 和
+[Claude skill hooks](https://code.claude.com/docs/en/hooks#hooks-in-skills-and-agents)。
+
+Hook 从 stdin 读取事件，仅处理 `Edit`、`Write` 和 Codex `apply_patch` 明确提供的
+路径，包括 patch 中的新增、删除和移动。它从事件工作目录向上寻找最近的默认索引，
+到 Git 仓库边界为止；仅更新该索引内的文件，同仓库 hook 进程串行执行。
+缺少索引时跳过，旧 schema 提示手动刷新，不自动初始化或全仓扫描。
+正常运行不输出内容、不检查新版本；可预期的错误写入 stderr 并以 0 退出，
+安装配置的超时为 10 秒。超时或更新失败时仍需手动同步。
+
+Shell、外部编辑器、切换分支的修改，以及自定义 `--db` 索引不在覆盖范围，
+原有 `status --check` / `update` 工作流仍然适用。
+关闭 Claude hooks 可用不带 `--with-hooks` 的安装命令加 `--force` 重装 skill；
+关闭 Codex hooks 请在 `/hooks` 禁用，或从 `hooks.json` 删除调用
+`code-symbol-index hook` 的条目。普通 skill 安装不会移除独立的 Codex hooks。
+
 ### 其他编程代理
 
 `SKILL.md` 遵循开放的 [Agent Skills](https://agentskills.io) 格式，任何支持技能的代理都可以
