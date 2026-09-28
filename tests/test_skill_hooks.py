@@ -182,3 +182,11 @@ def test_cli_installs_hooks(tmp_path, capsys):
     assert csi.main(["install-skill", "--with-hooks", "--codex-home", str(tmp_path)]) == 0
     assert "/hooks" in capsys.readouterr().out
     assert (tmp_path / "hooks.json").exists()
+
+
+def test_wizolt_edit_path(tmp_path, monkeypatch):
+    (tmp_path / "app.py").write_text("old_name = 1\n")
+    init(tmp_path)
+    (tmp_path / "app.py").write_text("wizolt_updated = 2\n")
+    invoke(monkeypatch, tmp_path, "Edit", {"path": "app.py", "edits": []})
+    assert names(tmp_path) == {"wizolt_updated"}

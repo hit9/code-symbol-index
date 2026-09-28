@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Accept the `path` field from Wizolt Edit hooks alongside Claude Code's
+  `file_path`, so edits update the existing symbol index.
+
 ## 0.6.4 - 2026-09-27
 
 ### Added

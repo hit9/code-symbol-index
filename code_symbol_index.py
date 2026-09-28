@@ -2473,7 +2473,7 @@ def _hook_paths(event: dict) -> list[str]:
     if not isinstance(tool_input, dict):
         return []
     if event.get("tool_name") in {"Edit", "Write"}:
-        path = tool_input.get("file_path")
+        path = tool_input.get("file_path", tool_input.get("path"))
         return [path] if isinstance(path, str) and path else []
     if event.get("tool_name") == "apply_patch":
         patch = tool_input.get("command")
