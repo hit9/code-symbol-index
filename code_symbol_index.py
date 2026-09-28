@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from tree_sitter import Node
 
 
-__version__ = "0.6.4"
+__version__ = "0.6.5"
 SCHEMA_VERSION = 5
 
 # Extraction-rule revisions: one entry per language whose *persisted* symbols or
