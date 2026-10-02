@@ -65,6 +65,34 @@ code-symbol-index --version
 code-symbol-index index --root /path/to/repo
 ```
 
+`index` 在缺少索引时建立索引；后续运行扫描目录，仅重新解析变化文件或提取规则
+已过期的文件。开始一次仓库导航时刷新一次，文件未变化时直接连续查询。
+已知修改路径时用 `update path/to/file.py`；切换分支或修改范围不明确时再次运行
+`index`。查询的 `--sync` 标志会在查询前执行相同的增量刷新。
+
+`index` 的 JSON 结果保留 `index`、`root`，并报告本次完成的工作：
+
+```json
+{
+  "index": "/path/to/repo/.code-symbol-index/index.sqlite",
+  "root": "/path/to/repo",
+  "complete": false,
+  "counts": {"updated": 2, "removed": 1, "failed": 1, "unchanged": 120},
+  "updated": ["src/app.py", "src/new.py"],
+  "removed": ["src/old.py"],
+  "failed": ["src/unreadable.py"],
+  "paths_truncated": false
+}
+```
+
+每类路径默认最多列出 50 项，可用 `index --max-result-files N` 调整，0 表示仅看
+数量。数量始终完整，`paths_truncated` 表示省略了部分路径。`complete` 只表示本次
+扫描范围内没有文件失败，不代表文件系统的原子快照，也不保证筛选范围外的文件最新。
+`unchanged` 统计无需重新解析的文件，包括仅修复名称摘要元数据的文件。
+失败文件保留旧条目；修复后对这些路径执行 `update`，或再次运行 `index`。
+为兼容原有行为，部分失败仍返回退出码 0，必须检查 `complete` 和 `failed`。
+`update` 也会将移除的路径单独列在 `removed` 中，与 `updated` 区分。
+
 检查已索引的工具是否可用：
 
 ```bash
@@ -140,11 +168,15 @@ Hook 从 stdin 读取事件，仅处理 `Edit`、`Write` 和 Codex `apply_patch`
 路径，包括 patch 中的新增、删除和移动。它从事件工作目录向上寻找最近的默认索引，
 到 Git 仓库边界为止；仅更新该索引内的文件，同仓库 hook 进程串行执行。
 缺少索引时跳过，旧 schema 提示手动刷新，不自动初始化或全仓扫描。
-正常运行不输出内容、不检查新版本；可预期的错误写入 stderr 并以 0 退出，
+处理器通过 stdout 返回 PostToolUse `hookSpecificOutput.additionalContext` JSON，
+在 agent 上下文中确认本次编辑已更新或移除的路径，并单独列出失败项；路径清单有上限。
+agent 可以跳过已确认路径的重复 `update`。静默或退出码 0 本身不代表更新成功，
+未确认的路径仍需手动同步。可预期的错误同时写入 stderr，并以 0 退出；不检查新版本。
 安装配置的超时为 10 秒。超时或更新失败时仍需手动同步。
 
 Shell、外部编辑器、切换分支的修改，以及自定义 `--db` 索引不在覆盖范围，
-原有 `status --check` / `update` 工作流仍然适用。
+已知路径用 `update`，范围不明确用 `index`，需要当前文件的查询可加 `--sync`。
+`status --check` 仍是只读检查。
 关闭 Claude hooks 可用不带 `--with-hooks` 的安装命令加 `--force` 重装 skill；
 关闭 Codex hooks 请在 `/hooks` 禁用，或从 `hooks.json` 删除调用
 `code-symbol-index hook` 的条目。普通 skill 安装不会移除独立的 Codex hooks。
@@ -573,6 +605,11 @@ print(repo.search_text("Tool"))
 print(repo.inspect_text("Tool"))
 print(repo.outline_text("src/app.py"))
 ```
+
+`Repository.refresh()` 完成后，`last_refresh_updated`、`last_refresh_removed`、
+`last_refresh_failed` 提供完整路径元组，`last_refresh_unchanged` 提供无需重新解析的
+文件数量。`update(paths)` 的对应结果为 `last_update_updated`、`last_update_removed`、
+`last_update_failed`。结果在写入完成后记录；抛出异常表示本次调用未完成。
 
 刷新和更新接受可选的任务进度回调：
 

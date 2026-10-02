@@ -27,6 +27,12 @@ def init(root):
     repo.storage.connection.close()
 
 
+def hook_result(stdout):
+    output = json.loads(stdout)["hookSpecificOutput"]
+    assert output["hookEventName"] == "PostToolUse"
+    return json.loads(output["additionalContext"].splitlines()[0].split(": ", 1)[1])
+
+
 def test_codex_merge_and_idempotence(tmp_path):
     config = {"description": "keep", "hooks": {"Stop": [], "PostToolUse": [
         {"matcher": "Write", "hooks": [{"type": "command", "command": "echo custom"}]}]}}
@@ -81,10 +87,16 @@ def test_write_and_edit_only_selected_file(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(csi._UpdateCheck, "start", lambda: pytest.fail("network update check"))
     invoke(monkeypatch, tmp_path, "Edit")
     assert names(tmp_path) == {"new_name", "untouched"}
-    assert capsys.readouterr().out == ""
+    captured = capsys.readouterr()
+    result = hook_result(captured.out)
+    assert result["complete"]
+    assert result["updated"] == ["app.py"]
+    assert result["counts"] == {"updated": 1, "removed": 0, "failed": 0}
+    assert result["root"] == str(tmp_path)
+    assert captured.err == ""
 
 
-def test_patch_add_delete_move(tmp_path, monkeypatch):
+def test_patch_add_delete_move(tmp_path, monkeypatch, capsys):
     (tmp_path / "old.py").write_text("old_name = 1\n")
     (tmp_path / "deleted.py").write_text("deleted_name = 1\n")
     init(tmp_path)
@@ -95,6 +107,10 @@ def test_patch_add_delete_move(tmp_path, monkeypatch):
     patch = "*** Begin Patch\n*** Update File: old.py\n*** Move to: new.py\n@@\n-old_name = 1\n+moved_name = 1\n*** Delete File: deleted.py\n*** Add File: added.py\n+added_name = 1\n*** End Patch"
     invoke(monkeypatch, tmp_path, "apply_patch", {"command": patch})
     assert names(tmp_path) == {"moved_name", "added_name"}
+    result = hook_result(capsys.readouterr().out)
+    assert result["complete"]
+    assert set(result["updated"]) == {"new.py", "added.py"}
+    assert set(result["removed"]) == {"old.py", "deleted.py"}
 
 
 def test_subdirectory_and_outside_path(tmp_path, monkeypatch):
@@ -124,7 +140,10 @@ def test_nested_git_boundary(tmp_path, monkeypatch):
 def test_invalid_event_is_nonblocking(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
     assert csi.main(["hook"]) == 0
-    assert "hook:" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "hook:" in captured.err
+    context = json.loads(captured.out)["hookSpecificOutput"]["additionalContext"]
+    assert "did not confirm" in context
 
 
 def test_old_schema_never_refreshes(tmp_path, monkeypatch, capsys):
@@ -164,7 +183,10 @@ def test_concurrent_hook_processes(tmp_path):
     for process in processes:
         stdout, stderr = process.communicate(timeout=15)
         assert process.returncode == 0
-        assert stdout == stderr == ""
+        assert stderr == ""
+        result = hook_result(stdout)
+        assert result["complete"]
+        assert result["counts"] == {"updated": 1, "removed": 0, "failed": 0}
     assert names(tmp_path) == {f"symbol_{i}" for i in range(4)}
 
 
@@ -190,3 +212,37 @@ def test_wizolt_edit_path(tmp_path, monkeypatch):
     (tmp_path / "app.py").write_text("wizolt_updated = 2\n")
     invoke(monkeypatch, tmp_path, "Edit", {"path": "app.py", "edits": []})
     assert names(tmp_path) == {"wizolt_updated"}
+
+
+def test_partial_failure_confirms_only_successful_paths(tmp_path, monkeypatch, capsys):
+    (tmp_path / "good.py").write_text("old_good = 1\n")
+    (tmp_path / "bad.py").write_text("old_bad = 1\n")
+    init(tmp_path)
+    (tmp_path / "good.py").write_text("new_good = 1\n")
+    (tmp_path / "bad.py").write_bytes(b"\xff\x00broken")
+    patch = "*** Begin Patch\n*** Update File: good.py\n*** Update File: bad.py\n*** End Patch"
+    invoke(monkeypatch, tmp_path, "apply_patch", {"command": patch})
+    captured = capsys.readouterr()
+    result = hook_result(captured.out)
+    assert not result["complete"]
+    assert result["updated"] == ["good.py"]
+    assert result["failed"] == ["bad.py"]
+    assert "could not update 1 file(s)" in captured.err
+    assert names(tmp_path) == {"new_good", "old_bad"}
+
+
+def test_hook_confirmation_is_bounded(tmp_path, monkeypatch, capsys):
+    init(tmp_path)
+    monkeypatch.setattr(csi, "MAX_WORKERS", 1)
+    count = csi.DEFAULT_MAX_RESULT_FILES + 1
+    paths = [f"file_{i}.py" for i in range(count)]
+    for i, path in enumerate(paths):
+        (tmp_path / path).write_text(f"symbol_{i} = 1\n")
+    patch = "*** Begin Patch\n" + "".join(f"*** Add File: {path}\n" for path in paths) + "*** End Patch"
+    invoke(monkeypatch, tmp_path, "apply_patch", {"command": patch})
+    result = hook_result(capsys.readouterr().out)
+    assert result["complete"]
+    assert result["counts"]["updated"] == count
+    assert len(result["updated"]) == csi.DEFAULT_MAX_RESULT_FILES
+    assert result["paths_truncated"]
+    assert names(tmp_path) == {f"symbol_{i}" for i in range(count)}

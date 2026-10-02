@@ -80,6 +80,7 @@ DEFAULT_MAX_IMPLEMENTORS = 50
 DEFAULT_MAX_IMPORTS = 40
 DEFAULT_MAX_OUTLINE_SYMBOLS = 200
 DEFAULT_MAX_PENDING_FILES = 50
+DEFAULT_MAX_RESULT_FILES = 50
 HASHLINE_HASH_CHARS = 8
 MAX_INSPECT_CANDIDATES = 20
 SYMBOL_QUERY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
@@ -99,50 +100,63 @@ description: Structural code navigation for a local repo through the `code-symbo
 
 # Code Symbol Index
 
-Use `code-symbol-index` for bounded, indexed code navigation over a local repository. Reach for it whenever a question is about *structure* — call graphs, references, definitions, implementations — not plain text. It resolves symbols precisely over an index, avoiding grep's false positives and whole-file reads.
+Use `code-symbol-index` for bounded, indexed code navigation over a local repository. Reach for it whenever a question is about *structure* — call graphs, references, definitions, implementations — not plain text. It returns syntactic candidates; confirm ambiguous names and dynamic calls in source before relying on them for a change.
 
 ## When to use this instead of grep
 
 - "Who calls X / what does X call" / "how does a request reach X" -> `callers` / `callees` (transitive, grouped by entry point). Grep cannot follow call chains.
 - "Where is X used, and how" / "what breaks if I change X" / "who writes this field" -> `refs` (each hit classified `call`/`read`/`write`/`inherit`/`type`). Grep can't tell a call from an assignment.
-- "Where is X defined / what's in this file / who implements Y" -> `inspect` / `outline` / `impls`, precisely, without reading whole files.
+- "Where is X defined / what's in this file / who implements Y" -> `inspect` / `outline` / `impls`, without reading whole files.
 - Plain string search with no structural intent (log messages, string literals, comments, config keys) -> just use grep.
 
-## The fast path
+## Setup & freshness
 
-Assume the index is usually `ready`. Just run the query you need (`search`, `inspect`, `refs`, `callers`, `callees`, `impls`, `outline`) — most commands print a clear hint if the index is missing or stale, so you rarely need a separate `status` check first. Only fall into the setup path below when a command reports the index is missing.
+- At the start of a repository navigation session, check `status --root <repo>`
+  if you do not know whether an index exists. Ask before initializing a missing
+  index unless the user already authorized it.
+- For an existing index, run `index --root <repo>` once before the first query.
+  This scans the directory and only re-parses changed files or outdated extraction
+  rules; it is not a full rebuild. Routine maintenance of an existing index does
+  not need repeated approval, unless the user or repository instructions say otherwise.
+- After known edits, run `update src/app.py src/lib.py --root <repo>`. Include
+  deleted paths and both sides of a move. Skip this only for the same edits and
+  paths explicitly confirmed by a successful `code-symbol-index` hook result.
+  Hook exit code 0 or silence alone is not confirmation. Retry failed or
+  unconfirmed paths with `update`; do not repeat updates already confirmed.
+- After a branch switch, a Git freshness warning, or changes with unknown paths
+  (including Shell or external-editor changes), run `index --root <repo>` again.
+  Consecutive queries without intervening changes use the index directly.
+- Check write results: `index` reports `complete`, `counts`, `updated`, `removed`,
+  and `failed`. A partial failure keeps old entries and retains exit code 0 for
+  compatibility. Fix the failed files and retry; do not treat the index as fully
+  current merely because the command exited successfully. Lists are bounded;
+  `paths_truncated` means some paths are omitted. Increase `--max-result-files`
+  on the next `index` if you need more detail.
+- For a query that must include current filesystem changes, use its `--sync`
+  flag (the same incremental refresh before querying) and check stderr for
+  failures. For a read-only check, use `status --check --root <repo>`.
 
-## Setup & freshness (only when needed)
-
-1. Check index state with a cheap read-only status:
-   `code-symbol-index status --root <repo>`
-2. If status is `missing`, ask the user before initializing the index:
-   `code-symbol-index index --root <repo>`
-3. If status is `ready`, use the indexed tools directly.
-4. If freshness matters, check staleness without refreshing:
-   `code-symbol-index status --root <repo> --check`
-   If status is `stale` with `reason: files changed after last index update`, keep using the indexed tools after syncing known changes.
-   If `pending_files` are listed or you edited files in this turn, run incremental update for those exact paths:
-   `code-symbol-index update src/app.py --root <repo>`
-   Incremental update is expected to be fast even in large repositories. Do not ask for approval for incremental updates of known changed paths.
-   If changed paths are unknown, ask before refreshing the whole index:
-   `code-symbol-index index --root <repo>`
+Ordinary queries only check Git HEAD/branch, not uncommitted edits. A plain
+`ready` status with `pending_changes: unknown` does not prove files are current.
+`status --check` compares size and mtime, not content hashes, and its
+`pending_files` list can be incomplete. Hooks cover explicit Edit/Write/apply_patch
+paths, not Shell, external editors, branch switches, or custom `--db` indexes.
 
 ## Query reference
 
-5. Search symbols by exact name or prefix:
+1. Search symbols by exact name or prefix:
    `code-symbol-index search Tool Agent --root <repo> --limit 20`
    Use filters when needed:
    `code-symbol-index search Tool --root <repo> --kind class,function --path src --exact-only`
-6. Inspect a symbol:
+2. Inspect a symbol:
    `code-symbol-index inspect Tool --root <repo>`
    Use source anchors before edits:
    `code-symbol-index inspect Tool --root <repo> --anchors`
-7. Outline a file:
+3. Outline a file:
    `code-symbol-index outline src/app.py --root <repo>`
    For a local class/function outline:
    `code-symbol-index outline src/app.py --root <repo> --symbol Tool`
-8. Find references or implementation candidates:
+4. Find references or implementation candidates:
    `code-symbol-index refs Tool --root <repo>`
    `code-symbol-index impls Greeter --root <repo>`
    Each reference is classified by behavior (`kind`): `call`, `read`, `write`,
@@ -153,7 +167,7 @@ Assume the index is usually `ready`. Just run the query you need (`search`, `ins
    `code-symbol-index refs Tool --root <repo> --ref-kind call,write`
    `code-symbol-index refs Tool --root <repo> --all-kinds`
    `inspect` reports a `reference_kinds` breakdown in its summary.
-9. Trace transitive call chains to locate real execution paths:
+5. Trace transitive call chains to locate real execution paths:
    `code-symbol-index callers handle_job --root <repo> --depth 3`
    `code-symbol-index callees handle_job --root <repo> --depth 3`
    `callers` groups reachable entry points by type (http_route / worker /
@@ -179,12 +193,7 @@ Assume the index is usually `ready`. Just run the query you need (`search`, `ins
   ...). Pass `--loose` to include those lower-precision matches.
 - Use `outline` for file paths.
 - Use `--json` only when structured data is needed; readable text is preferred for LLM context.
-- Do not refresh the whole index automatically during ordinary status checks.
-- After each round of edits, sync the index for the files you changed:
-  `code-symbol-index update src/app.py src/lib.py --root <repo>`
-  This is expected to be fast, including in large repositories, and keeps indexed tools usable after edits.
-- Only ask before full-index refresh:
-  `code-symbol-index index --root <repo>`
+- Status checks are read-only; use `index` or `update` for maintenance.
 """
 
 DEFAULT_EXCLUDES = (
@@ -1570,7 +1579,14 @@ class Repository(CodeIndex):
         # whose new symbols were written, and paths whose previous rows were kept
         # because the file could not be read or parsed.
         self.last_update_updated: tuple[str, ...] = ()
+        self.last_update_removed: tuple[str, ...] = ()
         self.last_update_failed: tuple[str, ...] = ()
+        # Results of the completed refresh, computed from its existing scan and
+        # parse results without a second directory walk.
+        self.last_refresh_updated: tuple[str, ...] = ()
+        self.last_refresh_removed: tuple[str, ...] = ()
+        self.last_refresh_failed: tuple[str, ...] = ()
+        self.last_refresh_unchanged = 0
         # (header language, converted, pending) of the last refresh.
         self.last_header_language: tuple[str, int, int] = (DEFAULT_HEADER_LANGUAGE, 0, 0)
 
@@ -1702,6 +1718,13 @@ class Repository(CodeIndex):
         self._record_header_language_outcome(
             indexed_results, current_files, indexed_files, effective_header, unavailable_paths
         )
+        published = {indexed_file.path.as_posix() for indexed_file in indexed_results}
+        self.last_refresh_updated = tuple(sorted(published))
+        self.last_refresh_removed = tuple(sorted(path.as_posix() for path in deleted))
+        self.last_refresh_failed = tuple(sorted(
+            unavailable_paths | {path.as_posix() for path in to_index if path.as_posix() not in published}
+        ))
+        self.last_refresh_unchanged = len(current_files) - len(to_index)
         _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total + len(unavailable_paths))
         return self
 
@@ -1804,6 +1827,7 @@ class Repository(CodeIndex):
         self.last_update_updated = tuple(
             path.as_posix() for path in to_index if path in published
         )
+        self.last_update_removed = tuple(path.as_posix() for path in removed)
         self.last_update_failed = tuple(path.as_posix() for path in [*to_index, *unavailable] if path not in published)
         _emit_progress(progress_callback, "finish", done=len(indexed_results), total=total + len(unavailable))
         return self
@@ -2485,7 +2509,7 @@ def _hook_paths(event: dict) -> list[str]:
 
 
 def _run_hook() -> int:
-    """Best-effort, quiet maintenance of an existing index after file edits."""
+    """Best-effort maintenance, with confirmation for the paths actually updated."""
     try:
         event = json.load(sys.stdin)
         if not isinstance(event, dict):
@@ -2534,13 +2558,52 @@ def _run_hook() -> int:
                 if repo.storage.schema_version() != SCHEMA_VERSION:
                     raise ValueError("index schema is outdated; run code-symbol-index index explicitly")
                 repo.update(relative_paths)
+                result = _write_result(
+                    repo, updated=repo.last_update_updated, removed=repo.last_update_removed,
+                    failed=repo.last_update_failed,
+                )
+                _hook_feedback(
+                    "code-symbol-index hook result (paths relative to root): " + json.dumps(result)
+                    + "\nThe listed updated/removed paths are confirmed for this edit; do not repeat their update."
+                    + " Retry failed or unconfirmed paths before relying on their index entries."
+                )
                 if repo.last_update_failed:
-                    raise ValueError(f"could not update {len(repo.last_update_failed)} file(s)")
+                    print(f"code-symbol-index hook: could not update {len(repo.last_update_failed)} file(s)",
+                          file=sys.stderr)
             finally:
                 repo.storage.connection.close()
     except (OSError, ValueError, TypeError, sqlite3.Error, IndexNotFoundError) as exc:
         print(f"code-symbol-index hook: {exc}", file=sys.stderr)
+        _hook_feedback(f"code-symbol-index hook did not confirm an index update: {exc}")
     return 0
+
+
+def _hook_feedback(context: str) -> None:
+    # PostToolUse plain stdout is not model-visible in all supported agents.
+    _print_json({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}})
+
+
+def _write_result(
+    repo: Repository,
+    *,
+    updated: tuple[str, ...],
+    removed: tuple[str, ...],
+    failed: tuple[str, ...],
+    unchanged: int | None = None,
+    limit: int = DEFAULT_MAX_RESULT_FILES,
+) -> dict[str, Any]:
+    paths = {"updated": updated, "removed": removed, "failed": failed}
+    counts = {kind: len(values) for kind, values in paths.items()}
+    if unchanged is not None:
+        counts["unchanged"] = unchanged
+    return {
+        "index": str(Path(repo.storage.db_path)),
+        "root": str(repo.root),
+        "complete": not failed,
+        "counts": counts,
+        **{kind: list(values[:limit]) for kind, values in paths.items()},
+        "paths_truncated": any(len(values) > limit for values in paths.values()),
+    }
 
 
 def clean(root: str | Path = ".") -> None:
@@ -7635,6 +7698,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     index_parser = subparsers.add_parser("index", help="Refresh the on-disk code-symbol-index index.")
     _add_index_options(index_parser)
+    index_parser.add_argument(
+        "--max-result-files", type=_non_negative_int, default=DEFAULT_MAX_RESULT_FILES,
+        help="Max paths per result list (updated/removed/failed); counts are always complete.",
+    )
 
     update_parser = subparsers.add_parser("update", help="Incrementally update indexed files.")
     _add_index_options(update_parser)
@@ -7883,13 +7950,18 @@ def main(argv: list[str] | None = None) -> int:
                     f"header language for future writes is {header_language}: "
                     f"converted {converted} header files\n"
                 )
-            _print_json({"index": str(Path(repo.storage.db_path)), "root": str(repo.root)})
+            _print_json(_write_result(
+                repo, updated=repo.last_refresh_updated, removed=repo.last_refresh_removed,
+                failed=repo.last_refresh_failed, unchanged=repo.last_refresh_unchanged,
+                limit=args.max_result_files,
+            ))
         elif args.command == "update":
             repo.update(args.paths)
             payload = {
                 "index": str(Path(repo.storage.db_path)),
                 "root": str(repo.root),
                 "updated": list(repo.last_update_updated),
+                "removed": list(repo.last_update_removed),
             }
             if repo.last_update_failed:
                 # Never report a failed path as updated: its previous rows stand.

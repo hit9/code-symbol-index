@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The bundled skill refreshes an existing index once at the start of repository
+  navigation, updates known edits, and refreshes again after branch switches or
+  changes with unknown paths. It explains incremental `index` behavior, Git-only
+  freshness hints, partial failures, and syntactic navigation limits.
+- `index` JSON now includes `complete`, `counts`, `updated`, `removed`, `failed`,
+  and `paths_truncated`. Path lists default to 50 entries each, adjustable with
+  `--max-result-files`; counts cover the complete scan scope. Partial failures
+  retain exit code 0 and old index entries. Refresh results are also available on
+  the returned Repository. No additional directory scan or schema change.
+- Edit hooks now confirm updated/removed paths through PostToolUse
+  `additionalContext` and report failures separately, allowing agents to skip
+  duplicate updates only for confirmed edits. Hooks remain best-effort and
+  return 0. `update` also reports removed paths separately in its JSON result.
+
 ## 0.6.5 - 2026-09-28
 
 ### Fixed

@@ -67,6 +67,37 @@ Build or refresh the index:
 code-symbol-index index --root /path/to/repo
 ```
 
+`index` creates a missing index; subsequent runs scan the directory and only
+re-parse changed files or outdated extraction rules. Start a navigation session
+with one refresh, then query directly until files change. After known edits, use
+`update path/to/file.py`; after a branch switch or edits with unknown paths, run
+`index` again. A query's `--sync` flag performs the same refresh before querying.
+
+The `index` JSON result keeps `index` and `root` and reports the work completed:
+
+```json
+{
+  "index": "/path/to/repo/.code-symbol-index/index.sqlite",
+  "root": "/path/to/repo",
+  "complete": false,
+  "counts": {"updated": 2, "removed": 1, "failed": 1, "unchanged": 120},
+  "updated": ["src/app.py", "src/new.py"],
+  "removed": ["src/old.py"],
+  "failed": ["src/unreadable.py"],
+  "paths_truncated": false
+}
+```
+
+Each path list defaults to at most 50 entries; `index --max-result-files N`
+changes that limit (0 returns counts only). Counts always cover the whole run;
+`paths_truncated` indicates omitted paths. `complete` means no file failed in
+this run's scan scope, not an atomic filesystem snapshot or a guarantee about
+files excluded by filters. `unchanged` counts files that did not need parsing,
+even if their name-summary metadata was repaired. Failed files keep their old
+entries: fix them and retry `update` on those paths or run `index` again.
+For compatibility partial failures still exit 0; check `complete` and `failed`,
+not just the exit code. `update` also reports `removed` separately from `updated`.
+
 Check whether indexed tools are available:
 
 ```bash
@@ -150,12 +181,17 @@ moves. It searches upward from the event cwd for the nearest default index,
 stopping at a Git boundary. Updates stay inside that root, and hook processes
 for the same index are serialized. Missing indexes are skipped; old schemas
 require an explicit refresh. Hooks never initialize an index or scan the whole
-repository. Success is silent, version checks are disabled, and expected errors
-go to stderr with exit code 0. Installed hooks have a 10-second timeout; manually
-sync after a timeout or failed update.
+repository. The handler returns a bounded result through PostToolUse
+`hookSpecificOutput.additionalContext` JSON on stdout, confirming updated/removed
+paths for that edit and listing failures separately. The agent can skip a repeated
+`update` for confirmed paths. Silence or exit code 0 alone is not confirmation;
+unconfirmed paths still need manual synchronization. Expected errors also go to
+stderr with exit code 0, and version checks are disabled. Installed hooks have a
+10-second timeout; sync after a timeout or failed update.
 
 Shell commands, external editors, branch switches and custom `--db` indexes are
-not covered. Keep the existing `status --check` / `update` workflow as a fallback.
+not covered. Use `update` for known paths, `index` for unknown changes, or a query's
+`--sync` flag when current files must be included. `status --check` is read-only.
 To remove Claude hooks, reinstall the skill with `--force` without `--with-hooks`.
 For Codex, disable the hook in `/hooks` or remove its `code-symbol-index hook`
 entry from `hooks.json`; ordinary skill installation leaves independent hooks alone.
@@ -637,6 +673,13 @@ print(repo.search_text("Tool"))
 print(repo.inspect_text("Tool"))
 print(repo.outline_text("src/app.py"))
 ```
+
+After `Repository.refresh()`, `last_refresh_updated`, `last_refresh_removed`,
+and `last_refresh_failed` contain the complete path tuples;
+`last_refresh_unchanged` is the count of files that did not need parsing.
+After `update(paths)`, the corresponding path tuples are `last_update_updated`,
+`last_update_removed`, and `last_update_failed`. Results are recorded after the
+write completes; an exception means that call did not complete.
 
 Refresh and update accept an optional progress callback:
 
