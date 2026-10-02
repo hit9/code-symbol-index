@@ -323,3 +323,66 @@ bound performance on large file-count repositories or shared mounts.
 The follow-up suite passed 248 tests on Python 3.13.13, including failed parsing
 with usable Git metadata, invalidated summaries, and the production prefix/age
 defaults together. The earlier five-version matrix predates these fixes.
+
+## Reference prefilter source reuse
+
+Baseline: `53217ec`. A matching file smaller than the first 1 MiB read is decoded
+once and passed directly to reference extraction. Both single-name references and
+batched caller expansion use it. Larger files keep the streaming prefilter and
+normal reader; source is not retained across queries. The write path still reads
+files normally. No schema or persisted-data change.
+
+Environment: Python 3.14.7, Linux 6.8 aarch64, local temporary storage. Each query
+case runs in 12 independent CLI processes per variant, alternating order, with
+warm filesystem and bytecode caches. Both implementation modules are copied to
+the same temporary storage. Source files age past the production one-second
+summary guard before indexing; stored name summaries are checked for equality.
+Every query's stdout and all common indexed rows match the baseline.
+
+Two independent runs, median CLI milliseconds (before → after):
+
+| Corpus / query | Run 1 | Run 2 |
+| --- | ---: | ---: |
+| Dense / refs, all 1000 hits | 117.28 → 111.42 | 115.98 → 109.94 |
+| Dense / refs, limit 1 | 58.90 → 59.70 | 58.64 → 58.61 |
+| Dense / callers, depth 2 | 72.46 → 70.42 | 72.97 → 72.43 |
+| Sparse / refs, all 10 hits | 69.70 → 69.32 | 65.87 → 65.63 |
+| Sparse / refs, limit 1 | 61.09 → 61.29 | 58.79 → 59.37 |
+| Sparse / callers, depth 2 | 71.00 → 71.02 | 71.50 → 71.43 |
+| Large / refs, all 4 hits | 102.75 → 102.74 | 101.56 → 100.41 |
+| Large / refs, limit 1 | 82.39 → 82.75 | 78.32 → 79.52 |
+| Large / callers, depth 2 | 176.89 → 176.79 | 178.53 → 179.60 |
+
+Dense and sparse each have 1000 small files plus a definition file. Large has four
+files over 1 MiB plus the definition. Dense full-reference latency improves
+**5.0% and 5.2%**, with the new version faster in all 12 paired samples of each
+run. This is a gain for scanning many matching small files, not a claim that every
+query is 5% faster. Early results, sparse hits and large files are broadly
+unchanged; their small timing differences do not establish consistent gains or
+regressions. Cold caches, p95 and real-world repository latency were not measured.
+
+Write guard, 11 alternating independent samples per variant:
+
+| Fixture / operation | Before ms | After ms |
+| --- | ---: | ---: |
+| Small / new index | 64.40 | 64.33 |
+| Small / unchanged index | 56.78 | 56.41 |
+| Small / update one | 56.98 | 56.84 |
+| Small / update two | 57.49 | 57.30 |
+| Large / new index | 212.88 | 210.71 |
+| Large / unchanged index | 57.16 | 56.66 |
+| Large / update one | 94.05 | 93.93 |
+| Large / update two | 191.96 | 191.64 |
+
+No write regression observed in these fixtures. All raw timing samples, exact
+dependency versions and the measured candidate's source hash are saved in
+[reference-read-results.json](reference-read-results.json). Reproduce:
+
+```sh
+.venv/bin/python benchmarks/bench_reference_reads.py --baseline 53217ec --samples 12 --output /tmp/reference-reads.json
+CODE_SYMBOL_INDEX_NO_UPDATE_CHECK=1 .venv/bin/python benchmarks/bench_restart.py --baseline 53217ec --samples 11 --write-only --fixture all --output /tmp/reference-write-guard.json
+```
+
+487 tests pass, covering single-read candidates, live edits on a reused repository,
+UTF-8/CRLF ranges, binary rejection, chunk boundaries, large-file fallback, caller
+graph equality and existing indexing behavior. Lint passes.

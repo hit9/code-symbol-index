@@ -1,3 +1,4 @@
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -220,10 +221,11 @@ def test_batched_call_graph_matches_individual_queries(tmp_path, depth, limit, m
 
     with mock.patch.object(c, "_direct_callers_batch", side_effect=individual):
         expected = graph()
-    with mock.patch.object(c, "_file_contains_pattern", wraps=c._file_contains_pattern) as scans:
+    with mock.patch.object(c, "_read_matching_source", wraps=c._read_matching_source) as scans:
         actual = graph()
     assert actual == expected
-    assert scans.call_count <= 3 * 2 * max(depth - 1, 0)
+    batched_scans = sum(isinstance(call.args[1], re.Pattern) for call in scans.call_args_list)
+    assert batched_scans <= 3 * 2 * max(depth - 1, 0)
     (tmp_path / "entries.py").write_text("def changed_entry():\n    branch_0()\n")
     repo.update([Path("entries.py")])
     with mock.patch.object(c, "_direct_callers_batch", side_effect=individual):
@@ -240,9 +242,10 @@ def test_batch_prefilter_preserves_chunk_boundary_matches(tmp_path, monkeypatch)
     for needle in needles:
         for padding in range(15):
             path.write_bytes(b" " * padding + needle + b" tail")
-            assert c._file_contains_pattern(path, pattern, max(map(len, needles)) - 1)
+            assert c._read_matching_source(path, pattern, max(map(len, needles)) - 1)[0]
+            assert c._read_matching_source(path, needle, len(needle) - 1)[0]
     path.write_bytes(b"aXb completely unrelated")
-    assert not c._file_contains_pattern(path, pattern, max(map(len, needles)) - 1)
+    assert not c._read_matching_source(path, pattern, max(map(len, needles)) - 1)[0]
 
 
 def test_native_ranges_handle_live_shortened_name_and_wide_results(tmp_path):

@@ -32,6 +32,11 @@ queries skip unchanged files (see [File name summaries](#file-name-summaries)); 
 repositories still pay for filesystem scanning and candidate parsing — see
 [measured query and indexing results](benchmarks/REPORT.md).
 
+Reference prefilters reuse a matching file's contents for immediate parsing when
+the complete file fits in the first read (less than 1 MiB). Larger files keep the
+chunked prefilter and normal text reader. Contents are not cached across queries;
+the next query reads live source again.
+
 ## Install
 
 Install the CLI as a uv tool:

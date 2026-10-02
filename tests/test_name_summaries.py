@@ -21,7 +21,7 @@ def fixture_repo(tmp_path):
 
 def test_unchanged_negative_skips_open_and_edit_is_seen_on_reused_repository(tmp_path):
     repo = fixture_repo(tmp_path)
-    with mock.patch.object(c, '_file_contains_bytes', wraps=c._file_contains_bytes) as reads:
+    with mock.patch.object(c, '_read_matching_source', wraps=c._read_matching_source) as reads:
         assert repo.refs('target').items == ()
     assert all(call.args[0].name != 'b.py' for call in reads.call_args_list)
     (tmp_path / 'b.py').write_text('def caller():\n    return target()\n')

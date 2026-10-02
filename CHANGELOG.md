@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Reference and batched-caller queries reuse matching source files smaller than
+  the 1 MiB scan chunk, avoiding a second read immediately before parsing.
+  Larger files retain the streaming prefilter and normal reader. UTF-8/binary
+  checks and live reads on subsequent queries are preserved; no write or schema
+  changes. Reproducible comparisons are in `benchmarks/bench_reference_reads.py`.
 - The bundled skill refreshes an existing index once at the start of repository
   navigation, updates known edits, and refreshes again after branch switches or
   changes with unknown paths. It explains incremental `index` behavior, Git-only

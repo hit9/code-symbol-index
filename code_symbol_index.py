@@ -1981,7 +1981,10 @@ class Repository(CodeIndex):
         references: list[Reference] = []
         skipped = 0
         for path in paths:
-            if not self._name_filter.may_contain(path, (needle,)) or not _file_contains_bytes(self.root / path, needle):
+            if not self._name_filter.may_contain(path, (needle,)):
+                continue
+            matched, source = _read_matching_source(self.root / path, needle, len(needle) - 1)
+            if not matched:
                 continue
             indexed_file = _parse_file(
                 self.root,
@@ -1989,6 +1992,7 @@ class Repository(CodeIndex):
                 self.languages,
                 reference_name=symbol.name,
                 language=self._stored_language(path),
+                source_text=source,
             )
             if indexed_file is None:
                 continue
@@ -3639,6 +3643,7 @@ def _parse_file(
     language: str | None = None,
     header_language: str | None = None,
     collect_bodies: bool = True,
+    source_text: str | None = None,
 ) -> _IndexedFile | None:
     full_path = root / relative_path
     spec = None
@@ -3657,7 +3662,8 @@ def _parse_file(
 
     try:
         stat = full_path.stat()
-        source_text = _read_text_file(full_path)
+        if source_text is None:
+            source_text = _read_text_file(full_path)
     except (OSError, UnicodeDecodeError, BinaryFileError):
         return None
 
@@ -3725,36 +3731,32 @@ def _read_text_file(path: Path) -> str:
     return (sample + remainder).decode("utf-8")
 
 
-def _file_contains_bytes(path: Path, needle: bytes) -> bool:
-    if not needle:
-        return True
+def _read_matching_source(
+    path: Path, needle: bytes | re.Pattern[bytes], overlap: int,
+) -> tuple[bool, str | None]:
+    """Prefilter references and reuse a complete first chunk for immediate parsing.
 
-    overlap = len(needle) - 1
+    Matched larger files return (True, None) for the normal text reader. Never
+    accumulate scanned chunks or retain source between files or query requests.
+    """
     previous = b""
+    first = True
     try:
         with path.open("rb") as file:
             while chunk := file.read(FILE_SCAN_CHUNK_SIZE):
                 window = previous + chunk
-                if needle in window:
-                    return True
+                matched = needle in window if isinstance(needle, bytes) else needle.search(window) is not None
+                if matched:
+                    if first and len(chunk) < FILE_SCAN_CHUNK_SIZE:
+                        if b"\x00" in chunk[:TEXT_SAMPLE_BYTES]:
+                            return False, None
+                        return True, chunk.decode("utf-8")
+                    return True, None
                 previous = window[-overlap:] if overlap else b""
-    except OSError:
-        return False
-    return False
-
-
-def _file_contains_pattern(path: Path, pattern: re.Pattern[bytes], overlap: int) -> bool:
-    previous = b""
-    try:
-        with path.open("rb") as file:
-            while chunk := file.read(FILE_SCAN_CHUNK_SIZE):
-                window = previous + chunk
-                if pattern.search(window) is not None:
-                    return True
-                previous = window[-overlap:] if overlap else b""
-    except OSError:
-        return False
-    return False
+                first = False
+    except (OSError, UnicodeDecodeError):
+        return False, None
+    return False, None
 
 
 _PARSER_TLS = threading.local()
@@ -5777,7 +5779,10 @@ def _direct_callers_batch(repo: Repository, symbols: list[Symbol], *, limit: int
         pattern = re.compile(b"|".join(re.escape(needle) for needle in needles))
         overlap = max(map(len, needles)) - 1
         for path in repo.storage.file_paths(language=language):
-            if not name_filter.may_contain(path, needles) or not _file_contains_pattern(repo.root / path, pattern, overlap):
+            if not name_filter.may_contain(path, needles):
+                continue
+            matched, source = _read_matching_source(repo.root / path, pattern, overlap)
+            if not matched:
                 continue
             indexed = _parse_file(
                 repo.root,
@@ -5785,6 +5790,7 @@ def _direct_callers_batch(repo: Repository, symbols: list[Symbol], *, limit: int
                 repo.languages,
                 reference_name=names,
                 language=repo._stored_language(path),
+                source_text=source,
             )
             if indexed is None:
                 continue
