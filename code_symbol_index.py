@@ -1781,10 +1781,12 @@ class Repository(CodeIndex):
         progress: Any = _DEFAULT_PROGRESS,
     ) -> Repository:
         progress_callback = self.progress if progress is _DEFAULT_PROGRESS else progress
-        if paths is None:
-            return self.refresh(progress=progress_callback)
-        if self.storage.schema_version() != SCHEMA_VERSION:
-            return self.refresh(progress=progress_callback)
+        if paths is None or self.storage.schema_version() != SCHEMA_VERSION:
+            self.refresh(progress=progress_callback)
+            self.last_update_updated = self.last_refresh_updated
+            self.last_update_removed = self.last_refresh_removed
+            self.last_update_failed = self.last_refresh_failed
+            return self
 
         self._gitignore_specs.clear()
         self.header_language = None  # Another Repository may have changed the write setting.

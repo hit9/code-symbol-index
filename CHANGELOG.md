@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- `update` now reports actual updated, removed, and failed paths when it falls
+  back to a full refresh, including outdated schema rebuilds and Python calls
+  without paths. Previous update results no longer leak into these reports.
+
 ### Changed
 
 - Reference and batched-caller queries reuse matching source files smaller than

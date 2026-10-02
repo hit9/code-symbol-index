@@ -121,3 +121,39 @@ def test_update_reports_removed_paths_separately(tmp_path, capsys):
     result = json.loads(capsys.readouterr().out)
     assert result["updated"] == []
     assert result["removed"] == ["app.py"]
+
+
+@pytest.mark.parametrize("outdated_schema", [False, True])
+def test_update_full_refresh_reports_failures_and_resets_results(tmp_path, outdated_schema):
+    (tmp_path / "good.py").write_text("def good(): pass\n")
+    repo = c.Repository(tmp_path, create_index=True).refresh()
+    try:
+        repo.update(["good.py"])
+        (tmp_path / "bad.py").write_bytes(b"\xffbroken")
+        if outdated_schema:
+            repo.storage.set_schema_version(-1)
+        repo.update(["bad.py"] if outdated_schema else None)
+        assert repo.last_update_failed == ("bad.py",)
+        assert repo.last_update_updated == (("good.py",) if outdated_schema else ())
+
+        (tmp_path / "bad.py").unlink()
+        (tmp_path / "good.py").unlink()
+        repo.update()
+        assert repo.last_update_failed == repo.last_update_updated == ()
+        assert repo.last_update_removed == ("good.py",)
+    finally:
+        repo.storage.connection.close()
+
+
+def test_cli_update_reports_schema_rebuild_failure(tmp_path, capsys):
+    (tmp_path / "good.py").write_text("def good(): pass\n")
+    run_index(tmp_path, capsys)
+    repo = c.Repository(tmp_path)
+    repo.storage.set_schema_version(-1)
+    repo.storage.connection.close()
+    (tmp_path / "bad.py").write_bytes(b"\xffbroken")
+    assert c.main(["update", "bad.py", "--root", str(tmp_path)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["updated"] == ["good.py"]
+    assert result["removed"] == []
+    assert result["failed"] == ["bad.py"]
